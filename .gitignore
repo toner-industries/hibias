@@ -1,0 +1,5 @@
+spotify-player/
+
+/target
+**/*.rs.bk
+Cargo.lock

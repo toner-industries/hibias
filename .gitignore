@@ -1,5 +1,6 @@
 spotify-player/
+hifi.toml
+hifi-auth.json
 
 /target
 **/*.rs.bk
-Cargo.lock

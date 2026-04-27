@@ -19,6 +19,7 @@ pub struct Playback {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
+    pub id: Option<String>,
     pub name: String,
     pub duration_ms: u64,
     pub artists: Vec<Artist>,
@@ -33,6 +34,26 @@ pub struct Artist {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Album {
     pub name: String,
+    #[serde(default)]
+    pub images: Vec<Image>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Image {
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl Album {
+    /// Pick a reasonable mid-size cover (~300px) — Spotify returns descending sizes.
+    pub fn cover_url(&self) -> Option<&str> {
+        let mid = self
+            .images
+            .iter()
+            .min_by_key(|i| (i.width.unwrap_or(640) as i32 - 300).abs());
+        mid.or_else(|| self.images.first()).map(|i| i.url.as_str())
+    }
 }
 
 impl SpotifyClient {

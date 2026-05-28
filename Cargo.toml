@@ -14,12 +14,11 @@ librespot-connect = "0.8"
 librespot-core = "0.8"
 librespot-playback = { version = "0.8", default-features = false, features = ["native-tls", "rodio-backend"] }
 open = "5"
-parking_lot = "0.12"
 rand = "0.9"
 ratatui = "0.29"
 ratatui-image = "8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "http2", "charset", "form"] }
-rustfft = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

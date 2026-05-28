@@ -1,6 +1,7 @@
 spotify-player/
 hifi.toml
 hifi-auth.json
+hifi.log.sqlite*
 
 /target
 **/*.rs.bk

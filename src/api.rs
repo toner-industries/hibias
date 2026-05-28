@@ -1,13 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde::Deserialize;
+use serde_json::json;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::auth::Auth;
+use crate::log;
 
 const BASE: &str = "https://api.spotify.com/v1";
 
 pub struct SpotifyClient {
     http: reqwest::Client,
     auth: Auth,
+    device_id: OnceLock<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -15,27 +20,74 @@ pub struct Playback {
     pub is_playing: bool,
     pub progress_ms: Option<u64>,
     pub item: Option<Track>,
+    #[serde(default)]
+    pub context: Option<Context>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Context {
+    pub uri: String,
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
     pub id: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
     pub name: String,
+    #[serde(default)]
     pub duration_ms: u64,
+    #[serde(default)]
     pub artists: Vec<Artist>,
     pub album: Album,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artist {
+    #[serde(default)]
+    pub uri: Option<String>,
     pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Album {
+    #[serde(default)]
+    pub uri: Option<String>,
     pub name: String,
     #[serde(default)]
+    pub artists: Vec<Artist>,
+    #[serde(default)]
     pub images: Vec<Image>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Playlist {
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub owner: Option<PlaylistOwner>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaylistOwner {
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Device {
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicesPayload {
+    #[serde(default)]
+    devices: Vec<Device>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,12 +108,65 @@ impl Album {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchResults {
+    pub tracks: Vec<Track>,
+    pub albums: Vec<Album>,
+    pub artists: Vec<Artist>,
+    pub playlists: Vec<Playlist>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchPayload {
+    #[serde(default)]
+    tracks: Option<Page<Track>>,
+    #[serde(default)]
+    albums: Option<Page<Album>>,
+    #[serde(default)]
+    artists: Option<Page<Artist>>,
+    #[serde(default)]
+    playlists: Option<Page<Playlist>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Page<T> {
+    #[serde(default = "Vec::new")]
+    items: Vec<Option<T>>,
+}
+
+impl<T> Page<T> {
+    fn into_items(self) -> Vec<T> {
+        self.items.into_iter().flatten().collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistTracksPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<PlaylistTrackItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistTrackItem {
+    #[serde(default)]
+    track: Option<Track>,
+}
+
 impl SpotifyClient {
     pub fn new(auth: Auth) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             auth,
+            device_id: OnceLock::new(),
         })
+    }
+
+    pub fn set_device_id(&self, id: String) {
+        let _ = self.device_id.set(id);
+    }
+
+    fn device_id(&self) -> Option<&str> {
+        self.device_id.get().map(String::as_str)
     }
 
     async fn bearer(&self) -> Result<String> {
@@ -69,57 +174,175 @@ impl SpotifyClient {
     }
 
     pub async fn get_playback(&self) -> Result<Option<Playback>> {
-        let resp = self
+        let url = format!("{BASE}/me/player");
+        let req = self
             .http
-            .get(format!("{BASE}/me/player"))
-            .header("Authorization", self.bearer().await?)
-            .send()
-            .await
-            .context("GET /me/player")?;
-        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (status, body) = send_logged(req, "GET", &url, None).await?;
+        if status == reqwest::StatusCode::NO_CONTENT || body.is_empty() {
             return Ok(None);
         }
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry = retry_after_secs(&resp).unwrap_or(30);
-            anyhow::bail!(RateLimited(retry));
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET /me/player: {status}: {body}");
-        }
-        let pb: Playback = resp.json().await.context("parse /me/player body")?;
+        let pb: Playback = serde_json::from_str(&body).context("parse /me/player body")?;
         Ok(Some(pb))
     }
 
     pub async fn play(&self) -> Result<()> {
-        self.put_command("play").await
+        self.put_play(None).await
+    }
+
+    pub async fn get_devices(&self) -> Result<Vec<Device>> {
+        let url = format!("{BASE}/me/player/devices");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let page: DevicesPayload = serde_json::from_str(&body).context("parse /me/player/devices")?;
+        Ok(page.devices)
+    }
+
+    /// Tell Spotify to route playback to a given device (without starting playback).
+    pub async fn transfer_playback(&self, device_id: &str, play: bool) -> Result<()> {
+        let url = format!("{BASE}/me/player");
+        let body = json!({ "device_ids": [device_id], "play": play });
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?)
+            .json(&body);
+        send_logged(req, "PUT", &url, Some(&body.to_string()))
+            .await
+            .map(|_| ())
     }
 
     pub async fn pause(&self) -> Result<()> {
-        self.put_command("pause").await
+        let url = with_device(&format!("{BASE}/me/player/pause"), self.device_id());
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        send_logged(req, "PUT", &url, None).await.map(|_| ())
     }
 
-    async fn put_command(&self, cmd: &str) -> Result<()> {
-        let resp = self
-            .http
-            .put(format!("{BASE}/me/player/{cmd}"))
-            .header("Authorization", self.bearer().await?)
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .with_context(|| format!("PUT /me/player/{cmd}"))?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry = retry_after_secs(&resp).unwrap_or(30);
-            anyhow::bail!(RateLimited(retry));
-        }
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PUT /me/player/{cmd}: {status}: {body}");
-        }
-        Ok(())
+    pub async fn play_uris(&self, uris: &[String]) -> Result<()> {
+        self.put_play(Some(json!({ "uris": uris }))).await
     }
+
+    pub async fn play_context(&self, context_uri: &str, offset_uri: Option<&str>) -> Result<()> {
+        let body = match offset_uri {
+            Some(u) => json!({ "context_uri": context_uri, "offset": { "uri": u } }),
+            None => json!({ "context_uri": context_uri }),
+        };
+        self.put_play(Some(body)).await
+    }
+
+    async fn put_play(&self, body: Option<serde_json::Value>) -> Result<()> {
+        let url = with_device(&format!("{BASE}/me/player/play"), self.device_id());
+        let mut req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?);
+        let body_str = match &body {
+            Some(b) => {
+                req = req.json(b);
+                Some(b.to_string())
+            }
+            None => {
+                req = req.header("Content-Length", "0");
+                None
+            }
+        };
+        send_logged(req, "PUT", &url, body_str.as_deref())
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn search(&self, q: &str) -> Result<SearchResults> {
+        let url = format!(
+            "{BASE}/search?q={}&type=track,album,artist,playlist&limit=8",
+            urlencoding::encode(q)
+        );
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let payload: SearchPayload =
+            serde_json::from_str(&body).context("parse /search body")?;
+        Ok(SearchResults {
+            tracks: payload.tracks.map(Page::into_items).unwrap_or_default(),
+            albums: payload.albums.map(Page::into_items).unwrap_or_default(),
+            artists: payload.artists.map(Page::into_items).unwrap_or_default(),
+            playlists: payload.playlists.map(Page::into_items).unwrap_or_default(),
+        })
+    }
+
+    pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        let fields = urlencoding::encode(
+            "items(track(name,uri,id,artists(name),album(name,images)))",
+        );
+        let url = format!("{BASE}/playlists/{playlist_id}/tracks?limit=100&fields={fields}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let page: PlaylistTracksPage =
+            serde_json::from_str(&body).context("parse playlist tracks")?;
+        Ok(page.items.into_iter().filter_map(|i| i.track).collect())
+    }
+}
+
+pub(crate) fn with_device(url: &str, device_id: Option<&str>) -> String {
+    match device_id {
+        Some(id) if !id.is_empty() => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}device_id={}", urlencoding::encode(id))
+        }
+        _ => url.to_string(),
+    }
+}
+
+async fn send_logged(
+    req: reqwest::RequestBuilder,
+    method: &'static str,
+    url: &str,
+    body_json: Option<&str>,
+) -> Result<(reqwest::StatusCode, String)> {
+    let req_id = log::next_request_id();
+    log::api_req(req_id, method, url, body_json);
+    let started = Instant::now();
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let latency = started.elapsed().as_millis() as i64;
+            log::api_err(req_id, latency, &format!("{e:#}"));
+            return Err(e).with_context(|| format!("{method} {url}"));
+        }
+    };
+    let status = resp.status();
+    let latency = started.elapsed().as_millis() as i64;
+
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry = retry_after_secs(&resp).unwrap_or(30);
+        log::api_resp(
+            req_id,
+            status.as_u16(),
+            latency,
+            Some(&format!("rate-limited; retry-after={retry}s")),
+        );
+        anyhow::bail!(RateLimited(retry));
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    log::api_resp(req_id, status.as_u16(), latency, Some(&body_text));
+
+    if !status.is_success() {
+        anyhow::bail!("{method} {url}: {status}: {body_text}");
+    }
+    Ok((status, body_text))
 }
 
 #[derive(Debug)]
@@ -140,4 +363,119 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_payload_filters_null_items() {
+        // Regression: Spotify pads playlists.items with `null` for editorial
+        // playlists third-party apps can't access. We must drop those rather
+        // than failing the whole parse.
+        let body = r#"{
+            "tracks": { "items": [
+                {"id":"t1","uri":"spotify:track:t1","name":"T1","duration_ms":1000,
+                 "artists":[{"name":"A"}],
+                 "album":{"name":"Alb","images":[]}}
+            ]},
+            "albums": { "items": [
+                null,
+                {"uri":"spotify:album:a1","name":"Alb1","artists":[]}
+            ]},
+            "artists": { "items": [
+                {"uri":"spotify:artist:x","name":"X"}
+            ]},
+            "playlists": { "items": [
+                null,
+                {"uri":"spotify:playlist:p1","name":"P1","owner":{"display_name":"o"}},
+                null
+            ]}
+        }"#;
+        let payload: SearchPayload = serde_json::from_str(body).expect("must parse");
+        let results = SearchResults {
+            tracks: payload.tracks.map(Page::into_items).unwrap_or_default(),
+            albums: payload.albums.map(Page::into_items).unwrap_or_default(),
+            artists: payload.artists.map(Page::into_items).unwrap_or_default(),
+            playlists: payload.playlists.map(Page::into_items).unwrap_or_default(),
+        };
+        assert_eq!(results.tracks.len(), 1);
+        assert_eq!(results.albums.len(), 1);
+        assert_eq!(results.albums[0].uri.as_deref(), Some("spotify:album:a1"));
+        assert_eq!(results.artists.len(), 1);
+        assert_eq!(results.playlists.len(), 1);
+        assert_eq!(results.playlists[0].uri, "spotify:playlist:p1");
+    }
+
+    #[test]
+    fn search_payload_missing_sections_default_to_empty() {
+        let body = r#"{ "tracks": { "items": [] } }"#;
+        let p: SearchPayload = serde_json::from_str(body).unwrap();
+        assert!(p.albums.is_none());
+        assert!(p.artists.is_none());
+        assert!(p.playlists.is_none());
+    }
+
+    #[test]
+    fn playback_parses_with_context() {
+        let body = r#"{
+            "is_playing": true,
+            "progress_ms": 1234,
+            "item": {
+                "id":"t1","uri":"spotify:track:t1","name":"T","duration_ms":1000,
+                "artists":[{"name":"A"}],
+                "album":{"name":"Alb","images":[]}
+            },
+            "context": {
+                "uri":"spotify:playlist:abc",
+                "type":"playlist",
+                "href":"...",
+                "external_urls":{}
+            }
+        }"#;
+        let pb: Playback = serde_json::from_str(body).unwrap();
+        assert!(pb.is_playing);
+        let ctx = pb.context.expect("context present");
+        assert_eq!(ctx.uri, "spotify:playlist:abc");
+        assert_eq!(ctx.kind, "playlist");
+    }
+
+    #[test]
+    fn playback_parses_without_context() {
+        let body = r#"{
+            "is_playing": false,
+            "item": {
+                "id":"t1","name":"T","duration_ms":0,
+                "artists":[],
+                "album":{"name":"Alb","images":[]}
+            }
+        }"#;
+        let pb: Playback = serde_json::from_str(body).unwrap();
+        assert!(!pb.is_playing);
+        assert!(pb.context.is_none());
+    }
+
+    #[test]
+    fn with_device_appends_query() {
+        let out = with_device("https://api.spotify.com/v1/me/player/play", Some("abc"));
+        assert_eq!(
+            out,
+            "https://api.spotify.com/v1/me/player/play?device_id=abc"
+        );
+    }
+
+    #[test]
+    fn with_device_appends_to_existing_query() {
+        let out = with_device("https://x.test/path?q=1", Some("dev/1"));
+        assert_eq!(out, "https://x.test/path?q=1&device_id=dev%2F1");
+    }
+
+    #[test]
+    fn with_device_no_id_is_passthrough() {
+        let out = with_device("https://x.test/path", None);
+        assert_eq!(out, "https://x.test/path");
+        let out = with_device("https://x.test/path", Some(""));
+        assert_eq!(out, "https://x.test/path");
+    }
 }

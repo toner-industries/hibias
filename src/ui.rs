@@ -13,9 +13,10 @@ use crate::{AppState, Mode, SearchState};
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
-    let title = match &state.device_name {
-        Some(name) => format!(" hifi · device: {name} "),
-        None => " hifi ".to_string(),
+    let title = match (&state.device_name, &state.streaming_failed) {
+        (Some(name), _) => format!(" hifi · device: {name} "),
+        (None, None) => " hifi · starting device... ".to_string(),
+        (None, Some(_)) => " hifi · streaming unavailable ".to_string(),
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -83,6 +84,11 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
             Color::Yellow,
         ));
     }
+    if let Some(msg) = &state.streaming_failed {
+        if state.error.is_none() {
+            return Some((format!("⚠ streaming disabled: {msg}"), Color::Yellow));
+        }
+    }
     state
         .error
         .as_ref()
@@ -112,8 +118,12 @@ fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {
 
 fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
     let Some(pb) = &state.playback else {
-        let p = Paragraph::new("Nothing playing.\n\nStart a track on any Spotify device,\nor pick this one in the Connect picker.")
-            .alignment(Alignment::Left);
+        let msg = if state.device_name.is_none() && state.streaming_failed.is_none() {
+            "Connecting to Spotify...\n\nStarting the 'hifi' Connect device — this usually takes a couple of seconds."
+        } else {
+            "Nothing playing.\n\nStart a track on any Spotify device,\nor pick this one in the Connect picker."
+        };
+        let p = Paragraph::new(msg).alignment(Alignment::Left);
         f.render_widget(p, area);
         return;
     };

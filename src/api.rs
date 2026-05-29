@@ -237,6 +237,17 @@ impl SpotifyClient {
             .map(|_| ())
     }
 
+    pub async fn seek_to(&self, position_ms: u64) -> Result<()> {
+        let base = format!("{BASE}/me/player/seek?position_ms={position_ms}");
+        let url = with_device(&base, self.device_id());
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        send_logged(req, "PUT", &url, None).await.map(|_| ())
+    }
+
     pub async fn pause(&self) -> Result<()> {
         let url = with_device(&format!("{BASE}/me/player/pause"), self.device_id());
         let req = self

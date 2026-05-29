@@ -27,7 +27,6 @@ mod ui;
 use api::{Context as PlaybackContext, Playback, RateLimited, SearchResults, SpotifyClient, Track};
 use keys::ModeMask;
 
-#[derive(Default)]
 pub struct AppState {
     pub playback: Option<Playback>,
     pub last_poll: Option<Instant>,
@@ -53,6 +52,35 @@ pub struct AppState {
     /// Queries the user has searched for previously, most-recent-first.
     /// Persisted to `hifi-recent.json` so it survives restarts.
     pub recent_queries: Vec<String>,
+    /// True until the user takes a local action OR we observe an
+    /// actively-playing track. While true, paused/empty polled playback is
+    /// ignored so the recently-played seed isn't clobbered by whatever stale
+    /// state `/me/player` happens to return at boot.
+    pub boot: bool,
+    /// Background streaming startup status. None = still starting; Some(Ok)
+    /// after Spirc is registered; Some(Err) on failure.
+    pub streaming_failed: Option<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            playback: None,
+            last_poll: None,
+            error: None,
+            rate_limited_until: None,
+            art: None,
+            current_track_id: None,
+            device_name: None,
+            mode: Mode::default(),
+            last_local_action_ms: 0,
+            device_present: None,
+            recent_tracks: Vec::new(),
+            recent_queries: Vec::new(),
+            boot: true,
+            streaming_failed: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -150,48 +178,50 @@ async fn main() -> Result<()> {
         eprintln!("(no image protocol detected — album art will be skipped)");
     }
 
-    eprintln!("Starting Connect device 'hifi'...");
-    let device_name = match streaming::start("hifi").await {
-        Ok(s) => {
-            log::note(
-                "connect device started",
-                Some(&format!("name={} id={}", s.device_name, s.device_id)),
-            );
-            client.set_device_id(s.device_id.clone());
-            // Spirc::new returns before Spotify's Connect cloud has registered us.
-            // Wait until our device appears in /me/player/devices before
-            // transferring; otherwise transfer_playback 404s "Device not found".
-            let client_bg = client.clone();
-            let device_id_bg = s.device_id.clone();
-            tokio::spawn(async move {
-                wait_then_transfer(&client_bg, &device_id_bg).await;
-            });
-            Some(s.device_name)
-        }
-        Err(e) => {
-            eprintln!("warning: streaming disabled: {e:#}");
-            log::error("streaming::start", &format!("{e:#}"));
-            None
-        }
-    };
-
     let recent_queries = recent::load_queries();
     let state = Arc::new(Mutex::new(AppState {
-        device_name,
         recent_queries,
         ..Default::default()
     }));
 
-    if let Ok(pb) = client.get_playback().await {
-        apply_playback(&state, &art_loader, pb).await;
+    // Start the Connect device in the background so we can render the TUI
+    // immediately — librespot's Spirc handshake usually takes a couple of
+    // seconds and we don't want to block the screen on it.
+    {
+        let client_bg = client.clone();
+        let state_bg = state.clone();
+        tokio::spawn(async move {
+            match streaming::start("hifi").await {
+                Ok(s) => {
+                    log::note(
+                        "connect device started",
+                        Some(&format!("name={} id={}", s.device_name, s.device_id)),
+                    );
+                    client_bg.set_device_id(s.device_id.clone());
+                    {
+                        let mut g = state_bg.lock().await;
+                        g.device_name = Some(s.device_name.clone());
+                    }
+                    wait_then_transfer(&client_bg, &s.device_id).await;
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    log::error("streaming::start", &msg);
+                    let mut g = state_bg.lock().await;
+                    g.streaming_failed = Some(msg);
+                }
+            }
+        });
     }
 
-    // Kick off a recently-played fetch in the background so the search
-    // overlay has something to show on first open. Soft-fail — the most
-    // common cause is the user hasn't re-authed with the new scope yet.
+    // Kick off a recently-played fetch in the background. Doubles as:
+    //   (a) the "Recently played" section in the search overlay, and
+    //   (b) the initial now-playing display, so users don't see a stale
+    //       track from whatever device /me/player happened to return at boot.
     {
         let c = client.clone();
         let s = state.clone();
+        let a = art_loader.clone();
         tokio::spawn(async move {
             match c.get_recently_played(20).await {
                 Ok(tracks) => {
@@ -199,13 +229,44 @@ async fn main() -> Result<()> {
                         "recently_played loaded",
                         Some(&format!("count={}", tracks.len())),
                     );
-                    let mut g = s.lock().await;
-                    g.recent_tracks = tracks;
+                    let first = tracks.first().cloned();
+                    {
+                        let mut g = s.lock().await;
+                        g.recent_tracks = tracks;
+                    }
+                    if let Some(t) = first {
+                        let synth = Playback {
+                            is_playing: false,
+                            progress_ms: Some(0),
+                            item: Some(t),
+                            context: None,
+                            timestamp: None,
+                        };
+                        apply_playback_force(&s, &a, Some(synth)).await;
+                    }
                 }
-                Err(e) => log::note(
-                    "recently_played unavailable",
-                    Some(&format!("{e:#} (likely missing scope — run `just reauth`)")),
-                ),
+                Err(e) => {
+                    log::note(
+                        "recently_played unavailable",
+                        Some(&format!("{e:#} (likely missing scope — run `just reauth`)")),
+                    );
+                    // Fall back to /me/player so users without the new scope
+                    // still see *something* (paused, last-known) instead of
+                    // an empty screen. Still routed through the boot guard
+                    // via force=true: it's our deliberate seed.
+                    if let Ok(Some(pb)) = c.get_playback().await {
+                        log::note(
+                            "boot seed via /me/player fallback",
+                            pb.item.as_ref().map(|t| t.name.as_str()),
+                        );
+                        let mut seed = pb;
+                        // Always show as paused — we don't actually know what's
+                        // happening on whichever device this came from.
+                        seed.is_playing = false;
+                        seed.timestamp = None;
+                        apply_playback_force(&s, &a, Some(seed)).await;
+                    }
+                }
             }
         });
     }
@@ -359,6 +420,7 @@ async fn run(
                         }
                         KeyAction::Stay => {}
                         KeyAction::TogglePlayback => toggle_playback(&client, &state).await,
+                        KeyAction::Seek(delta_ms) => seek_relative(&client, &state, delta_ms).await,
                         KeyAction::EnterSearch => enter_search(&client, &state).await,
                         KeyAction::SearchInputChanged => kick_search(&client, &state).await,
                         KeyAction::PlaySelection => {
@@ -462,7 +524,11 @@ enum KeyAction {
     EnterSearch,
     SearchInputChanged,
     PlaySelection,
+    /// Seek the current track by ±N milliseconds.
+    Seek(i64),
 }
+
+const SEEK_STEP_MS: i64 = 10_000;
 
 /// What hitting Enter on the current selection means.
 #[derive(Debug)]
@@ -474,7 +540,7 @@ enum SelectionAction {
 
 async fn dispatch_key(
     code: KeyCode,
-    _mods: KeyModifiers,
+    mods: KeyModifiers,
     state: &Mutex<AppState>,
 ) -> KeyAction {
     let mut s = state.lock().await;
@@ -482,6 +548,8 @@ async fn dispatch_key(
         Mode::NowPlaying => match code {
             KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
             KeyCode::Char(' ') => KeyAction::TogglePlayback,
+            KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => KeyAction::Seek(-SEEK_STEP_MS),
+            KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => KeyAction::Seek(SEEK_STEP_MS),
             KeyCode::Char('/') => KeyAction::EnterSearch,
             KeyCode::Char('?') => {
                 s.mode = Mode::Help;
@@ -821,6 +889,7 @@ async fn play_selection(
             log::mode_change("search", "now_playing");
             s.mode = Mode::NowPlaying;
             s.last_local_action_ms = ts;
+            s.boot = false;
             synth_template.map(|mut pb| {
                 pb.timestamp = Some(ts);
                 pb
@@ -984,6 +1053,14 @@ pub fn now_unix_ms() -> u64 {
 /// session, with a stale timestamp).
 pub fn should_accept(s: &AppState, incoming: Option<&Playback>) -> bool {
     let local = s.last_local_action_ms;
+    // Boot mode: accept any non-empty payload so we display *something*
+    // (a "Nothing playing" screen is the worst possible outcome). Reject
+    // empty 204s — those are the well-known race where /me/player hasn't
+    // caught up to our transfer yet. The recently-played seed (applied
+    // via force=true) still wins because it lands before the first poll.
+    if s.boot {
+        return incoming.is_some();
+    }
     match incoming {
         Some(pb) => {
             // Accept if Spotify's state is at least as new as our last action.
@@ -1005,17 +1082,38 @@ async fn apply_playback(
     art_loader: &Arc<art::ArtLoader>,
     pb: Option<Playback>,
 ) {
+    apply_playback_inner(state, art_loader, pb, false).await
+}
+
+/// Apply playback bypassing `should_accept` — used for our own
+/// synthesized seed (e.g. the recently-played track shown at startup),
+/// which would otherwise be filtered out by the boot guard.
+async fn apply_playback_force(
+    state: &Arc<Mutex<AppState>>,
+    art_loader: &Arc<art::ArtLoader>,
+    pb: Option<Playback>,
+) {
+    apply_playback_inner(state, art_loader, pb, true).await
+}
+
+async fn apply_playback_inner(
+    state: &Arc<Mutex<AppState>>,
+    art_loader: &Arc<art::ArtLoader>,
+    pb: Option<Playback>,
+    force: bool,
+) {
     // Skip stale data so we don't overwrite freshly-synthesized local state
     // (see should_accept).
-    {
+    if !force {
         let s = state.lock().await;
         if !should_accept(&s, pb.as_ref()) {
             log::note(
                 "apply_playback: ignored stale poll",
                 Some(&format!(
-                    "polled_ts={:?} local_ts={}",
+                    "polled_ts={:?} local_ts={} boot={}",
                     pb.as_ref().and_then(|p| p.timestamp),
-                    s.last_local_action_ms
+                    s.last_local_action_ms,
+                    s.boot,
                 )),
             );
             return;
@@ -1032,6 +1130,7 @@ async fn apply_playback(
         .and_then(|t| t.album.cover_url())
         .map(|s| s.to_string());
 
+    let has_track = pb.as_ref().and_then(|p| p.item.as_ref()).is_some();
     let needs_art_fetch = {
         let mut s = state.lock().await;
         let prev = s.current_track_id.clone();
@@ -1040,6 +1139,11 @@ async fn apply_playback(
         s.error = None;
         s.rate_limited_until = None;
         s.current_track_id = new_track_id.clone();
+        // First displayed track ends the boot phase — subsequent polls go
+        // through the normal `should_accept` freshness checks.
+        if has_track {
+            s.boot = false;
+        }
         new_track_id.is_some() && prev != new_track_id
     };
 
@@ -1111,10 +1215,77 @@ async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
             s.last_poll = Some(now_instant);
             s.error = None;
             s.last_local_action_ms = ts;
+            s.boot = false;
         }
         Err(e) => {
             let msg = format!("{e:#}");
             log::error("toggle_playback", &msg);
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
+        }
+    }
+}
+
+async fn seek_relative(
+    client: &SpotifyClient,
+    state: &Mutex<AppState>,
+    delta_ms: i64,
+) {
+    // Compute the target position from the currently-displayed value (which
+    // already includes elapsed time when playing), clamped to track duration.
+    let (target_ms, was_playing) = {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("seek_relative: skipped (rate-limited)", None);
+            return;
+        }
+        if s.device_present == Some(false) {
+            log::error(
+                "seek_relative: skipped (device offline)",
+                "librespot Spirc is no longer registered with Spotify Connect",
+            );
+            return;
+        }
+        let Some(pb) = s.playback.as_ref() else {
+            return;
+        };
+        let Some(track) = pb.item.as_ref() else {
+            return;
+        };
+        let cur = displayed_progress_for_toggle(&s) as i64;
+        let raw = cur + delta_ms;
+        let clamped = raw.clamp(0, track.duration_ms as i64);
+        (clamped as u64, pb.is_playing)
+    };
+    log::note(
+        "seek_relative",
+        Some(&format!("delta_ms={delta_ms} target_ms={target_ms}")),
+    );
+    let result = client.seek_to(target_ms).await;
+    let mut s = state.lock().await;
+    match result {
+        Ok(()) => {
+            let ts = now_unix_ms();
+            if let Some(p) = s.playback.as_mut() {
+                p.progress_ms = Some(target_ms);
+                p.timestamp = Some(ts);
+                p.is_playing = was_playing;
+            }
+            s.last_poll = Some(Instant::now());
+            s.error = None;
+            s.last_local_action_ms = ts;
+            s.boot = false;
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("seek_relative", &msg);
             if is_device_not_found(&msg) {
                 s.device_present = Some(false);
                 s.error = Some(DEVICE_OFFLINE_MSG.to_string());
@@ -1195,9 +1366,18 @@ mod tests {
         }
     }
 
+    /// All the steady-state should_accept tests assume we're past the
+    /// initial boot phase (the boot guard is exercised separately below).
+    fn steady_state() -> AppState {
+        AppState {
+            boot: false,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn should_accept_rejects_polled_older_than_local_action() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = 10_000;
         // Polled ts is older — stale data from prior session.
         assert!(!should_accept(&s, Some(&pb_with_ts(Some(5_000), "stale"))));
@@ -1205,21 +1385,21 @@ mod tests {
 
     #[test]
     fn should_accept_accepts_polled_newer_than_local_action() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = 10_000;
         assert!(should_accept(&s, Some(&pb_with_ts(Some(20_000), "fresh"))));
     }
 
     #[test]
     fn should_accept_accepts_polled_equal_timestamp() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = 10_000;
         assert!(should_accept(&s, Some(&pb_with_ts(Some(10_000), "same"))));
     }
 
     #[test]
     fn should_accept_rejects_missing_timestamp_when_we_recently_acted() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = now_unix_ms();
         // Spotify omitted the timestamp — treat as 0, older than our action.
         assert!(!should_accept(&s, Some(&pb_with_ts(None, "no-ts"))));
@@ -1227,15 +1407,15 @@ mod tests {
 
     #[test]
     fn should_accept_accepts_when_no_prior_local_action() {
-        let s = AppState::default();
-        // last_local_action_ms == 0 (default) — accept anything.
+        let s = steady_state();
+        // last_local_action_ms == 0 — accept anything in steady state.
         assert!(should_accept(&s, Some(&pb_with_ts(Some(0), "first"))));
         assert!(should_accept(&s, None));
     }
 
     #[test]
     fn should_accept_rejects_none_right_after_play() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = now_unix_ms();
         // 204 No Content right after a play — librespot hasn't reported yet.
         assert!(!should_accept(&s, None));
@@ -1243,10 +1423,37 @@ mod tests {
 
     #[test]
     fn should_accept_accepts_none_after_long_idle() {
-        let mut s = AppState::default();
+        let mut s = steady_state();
         s.last_local_action_ms = now_unix_ms().saturating_sub(120_000); // 2 min ago
         // Plenty of time has passed; trust that nothing is playing.
         assert!(should_accept(&s, None));
+    }
+
+    // --- boot-phase gating ----------------------------------------------
+
+    #[test]
+    fn should_accept_boot_accepts_paused_polled() {
+        // Booting and we have nothing displayed — accept any payload, even a
+        // paused one. Better to show "wrong" stale state than empty screen.
+        let s = AppState::default();
+        let mut pb = pb_with_ts(Some(0), "old");
+        pb.is_playing = false;
+        assert!(should_accept(&s, Some(&pb)));
+    }
+
+    #[test]
+    fn should_accept_boot_rejects_none() {
+        // 204 No Content right after transfer — librespot hasn't reported.
+        let s = AppState::default();
+        assert!(!should_accept(&s, None));
+    }
+
+    #[test]
+    fn should_accept_boot_accepts_playing_polled() {
+        let s = AppState::default();
+        let mut pb = pb_with_ts(Some(0), "live");
+        pb.is_playing = true;
+        assert!(should_accept(&s, Some(&pb)));
     }
 
     #[test]

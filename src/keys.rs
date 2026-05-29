@@ -23,9 +23,10 @@ pub struct Hotkey {
 }
 
 pub const HOTKEYS: &[Hotkey] = &[
-    Hotkey { key: "space",  action: "play / pause",    modes: ModeMask::NOW_PLAYING },
-    Hotkey { key: "/",      action: "search",          modes: ModeMask::NOW_PLAYING },
-    Hotkey { key: "?",      action: "help",            modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "space",      action: "play / pause",    modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "shift ←/→",  action: "seek ±10s",       modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "/",          action: "search",          modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "?",          action: "help",            modes: ModeMask::NOW_PLAYING },
     Hotkey { key: "↑ / ↓",  action: "move selection",  modes: ModeMask::SEARCH },
     Hotkey { key: "enter",  action: "play selection",  modes: ModeMask::SEARCH },
     Hotkey { key: "esc",    action: "close / back",    modes: ModeMask::SEARCH.or(ModeMask::HELP) },

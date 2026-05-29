@@ -10,7 +10,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use std::{
     io::{self, Stdout},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
@@ -23,7 +23,7 @@ mod log;
 mod streaming;
 mod ui;
 
-use api::{Playback, RateLimited, SearchResults, SpotifyClient, Track};
+use api::{Context as PlaybackContext, Playback, RateLimited, SearchResults, SpotifyClient, Track};
 use keys::ModeMask;
 
 #[derive(Default)]
@@ -36,6 +36,11 @@ pub struct AppState {
     pub current_track_id: Option<String>,
     pub device_name: Option<String>,
     pub mode: Mode,
+    /// Unix ms of the last local action (play/pause). When `/me/player`
+    /// returns data with an older timestamp than this, we treat it as stale
+    /// — librespot frequently fails to report state to Spotify Connect, so
+    /// `/me/player` keeps serving whichever device reported last.
+    pub last_local_action_ms: u64,
 }
 
 #[derive(Default)]
@@ -288,11 +293,12 @@ async fn run(
                         KeyAction::EnterSearch => enter_search(&client, &state).await,
                         KeyAction::SearchInputChanged => kick_search(&client, &state).await,
                         KeyAction::PlaySelection => {
-                            play_selection(&client, &state).await;
-                            // Spotify needs ~200-500ms after a play to report it
-                            // via /me/player. Poll a few times so the now-playing
-                            // UI updates within ~1.5s instead of after the next
-                            // 5s tick.
+                            play_selection(&client, &state, &art_loader).await;
+                            // After a play, also poll /me/player briefly so we
+                            // can pick up Spotify's view *if* it actually
+                            // updates (it may not — librespot frequently fails
+                            // to report state). Stale polls are silently
+                            // dropped by apply_playback's should_accept check.
                             let c = client.clone();
                             let s = state.clone();
                             let a = art_loader.clone();
@@ -300,13 +306,7 @@ async fn run(
                                 for _ in 0..6 {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
                                     if let Ok(pb) = c.get_playback().await {
-                                        let has_item = pb.as_ref()
-                                            .and_then(|p| p.item.as_ref())
-                                            .is_some();
                                         apply_playback(&s, &a, pb).await;
-                                        if has_item {
-                                            break;
-                                        }
                                     }
                                 }
                             });
@@ -659,48 +659,121 @@ async fn kick_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) 
     }
 }
 
-async fn play_selection(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) {
-    let action = {
+async fn play_selection(
+    client: &Arc<SpotifyClient>,
+    state: &Arc<Mutex<AppState>>,
+    art_loader: &Arc<art::ArtLoader>,
+) {
+    // 1. Resolve action and capture the synth template now, while search
+    //    state is still in AppState. We finalize its timestamp later (after
+    //    a successful play) so it matches `last_local_action_ms` exactly.
+    let (action, synth_template) = {
         let s = state.lock().await;
         let Mode::Search(search) = &s.mode else {
             return;
         };
-        resolve_selection(search)
-    };
-
-    let result = match action {
-        Some(PlayAction::Track(ref uri)) => {
-            log::note("play_selection: track", Some(uri));
-            client.play_uris(&[uri.clone()]).await
-        }
-        Some(PlayAction::Context { ref uri, ref offset }) => {
-            log::note(
-                "play_selection: context",
-                Some(&format!(
-                    "uri={uri} offset={}",
-                    offset.as_deref().unwrap_or("-")
-                )),
-            );
-            client.play_context(uri, offset.as_deref()).await
-        }
-        None => {
+        let Some(action) = resolve_selection(search) else {
             log::note("play_selection: nothing selected", None);
             return;
+        };
+        let template = synth_template_for(&action, search);
+        (action, template)
+    };
+
+    let action_desc = match &action {
+        PlayAction::Track(u) => format!("track: {u}"),
+        PlayAction::Context { uri, offset } => {
+            format!("context: uri={uri} offset={}", offset.as_deref().unwrap_or("-"))
+        }
+    };
+    log::note("play_selection", Some(&action_desc));
+
+    let result = match &action {
+        PlayAction::Track(uri) => client.play_uris(&[uri.clone()]).await,
+        PlayAction::Context { uri, offset } => {
+            client.play_context(uri, offset.as_deref()).await
         }
     };
 
-    let mut s = state.lock().await;
-    match result {
+    // 2. On success: use a SINGLE timestamp for both last_local_action_ms
+    //    and synth.timestamp so should_accept doesn't reject our own synth.
+    let synth_to_apply = match &result {
         Ok(()) => {
+            let ts = now_unix_ms();
+            let mut s = state.lock().await;
             s.error = None;
             log::mode_change("search", "now_playing");
             s.mode = Mode::NowPlaying;
+            s.last_local_action_ms = ts;
+            synth_template.map(|mut pb| {
+                pb.timestamp = Some(ts);
+                pb
+            })
         }
         Err(e) => {
             log::error("play_selection", &format!("{e:#}"));
+            let mut s = state.lock().await;
             s.error = Some(format!("{e:#}"));
+            None
+        }
+    };
+
+    if let Some(pb) = synth_to_apply {
+        log::note(
+            "play_selection: applying synthetic playback",
+            pb.item.as_ref().map(|t| t.name.as_str()),
+        );
+        apply_playback(state, art_loader, Some(pb)).await;
+    }
+}
+
+/// Build a Playback template for the user's selection. Timestamp is filled
+/// in later by `play_selection` (after the play succeeds) so it matches the
+/// `last_local_action_ms` value the same call sets.
+fn synth_template_for(action: &PlayAction, search: &SearchState) -> Option<Playback> {
+    let template = |item: Track, context: Option<PlaybackContext>| Playback {
+        is_playing: true,
+        progress_ms: Some(0),
+        item: Some(item),
+        context,
+        timestamp: None, // filled in by caller
+    };
+    match action {
+        PlayAction::Track(uri) => Some(template(find_track_by_uri(search, uri)?, None)),
+        PlayAction::Context { uri, offset } => {
+            // "Skip to track within current playlist": we know which track is
+            // starting. Album/playlist/artist plays without an offset don't
+            // have specific track info; let polled data handle them.
+            let off = offset.as_deref()?;
+            let track = find_track_by_uri(search, off)?;
+            Some(template(
+                track,
+                Some(PlaybackContext {
+                    uri: uri.clone(),
+                    kind: "playlist".into(),
+                }),
+            ))
         }
     }
+}
+
+fn find_track_by_uri(search: &SearchState, uri: &str) -> Option<Track> {
+    if let Some(ctx) = &search.in_context {
+        if let Some(t) = ctx
+            .tracks
+            .iter()
+            .find(|t| t.uri.as_deref() == Some(uri))
+            .cloned()
+        {
+            return Some(t);
+        }
+    }
+    search
+        .results
+        .tracks
+        .iter()
+        .find(|t| t.uri.as_deref() == Some(uri))
+        .cloned()
 }
 
 #[derive(Debug)]
@@ -751,11 +824,58 @@ fn resolve_selection(s: &SearchState) -> Option<PlayAction> {
     None
 }
 
+pub fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Decide whether to accept incoming playback data over our current state.
+/// Rejects polled data older than our last local action — librespot frequently
+/// fails to push state updates to Spotify Connect, so `/me/player` keeps
+/// returning whichever device reported last (often something from a prior
+/// session, with a stale timestamp).
+pub fn should_accept(s: &AppState, incoming: Option<&Playback>) -> bool {
+    let local = s.last_local_action_ms;
+    match incoming {
+        Some(pb) => {
+            // Accept if Spotify's state is at least as new as our last action.
+            // Missing timestamps are treated as 0 (never trust them over a
+            // recent local action).
+            pb.timestamp.unwrap_or(0) >= local
+        }
+        None => {
+            // Spotify reports no active session. Only believe it if our last
+            // local action wasn't recent — otherwise it's the well-known 204
+            // we get right after a play because librespot hasn't reported.
+            now_unix_ms().saturating_sub(local) > 60_000
+        }
+    }
+}
+
 async fn apply_playback(
     state: &Arc<Mutex<AppState>>,
     art_loader: &Arc<art::ArtLoader>,
     pb: Option<Playback>,
 ) {
+    // Skip stale data so we don't overwrite freshly-synthesized local state
+    // (see should_accept).
+    {
+        let s = state.lock().await;
+        if !should_accept(&s, pb.as_ref()) {
+            log::note(
+                "apply_playback: ignored stale poll",
+                Some(&format!(
+                    "polled_ts={:?} local_ts={}",
+                    pb.as_ref().and_then(|p| p.timestamp),
+                    s.last_local_action_ms
+                )),
+            );
+            return;
+        }
+    }
+
     let new_track_id = pb
         .as_ref()
         .and_then(|p| p.item.as_ref())
@@ -821,10 +941,13 @@ async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
     let mut s = state.lock().await;
     match result {
         Ok(()) => {
+            let ts = now_unix_ms();
             if let Some(p) = s.playback.as_mut() {
                 p.is_playing = !was_playing;
+                p.timestamp = Some(ts);
             }
             s.error = None;
+            s.last_local_action_ms = ts;
         }
         Err(e) => {
             log::error("toggle_playback", &format!("{e:#}"));
@@ -861,6 +984,130 @@ mod tests {
         let mut s = SearchState::new(None);
         s.results = results;
         s
+    }
+
+    fn pb_with_ts(ts: Option<u64>, name: &str) -> Playback {
+        Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:x", name)),
+            context: None,
+            timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn should_accept_rejects_polled_older_than_local_action() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = 10_000;
+        // Polled ts is older — stale data from prior session.
+        assert!(!should_accept(&s, Some(&pb_with_ts(Some(5_000), "stale"))));
+    }
+
+    #[test]
+    fn should_accept_accepts_polled_newer_than_local_action() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = 10_000;
+        assert!(should_accept(&s, Some(&pb_with_ts(Some(20_000), "fresh"))));
+    }
+
+    #[test]
+    fn should_accept_accepts_polled_equal_timestamp() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = 10_000;
+        assert!(should_accept(&s, Some(&pb_with_ts(Some(10_000), "same"))));
+    }
+
+    #[test]
+    fn should_accept_rejects_missing_timestamp_when_we_recently_acted() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = now_unix_ms();
+        // Spotify omitted the timestamp — treat as 0, older than our action.
+        assert!(!should_accept(&s, Some(&pb_with_ts(None, "no-ts"))));
+    }
+
+    #[test]
+    fn should_accept_accepts_when_no_prior_local_action() {
+        let s = AppState::default();
+        // last_local_action_ms == 0 (default) — accept anything.
+        assert!(should_accept(&s, Some(&pb_with_ts(Some(0), "first"))));
+        assert!(should_accept(&s, None));
+    }
+
+    #[test]
+    fn should_accept_rejects_none_right_after_play() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = now_unix_ms();
+        // 204 No Content right after a play — librespot hasn't reported yet.
+        assert!(!should_accept(&s, None));
+    }
+
+    #[test]
+    fn should_accept_accepts_none_after_long_idle() {
+        let mut s = AppState::default();
+        s.last_local_action_ms = now_unix_ms().saturating_sub(120_000); // 2 min ago
+        // Plenty of time has passed; trust that nothing is playing.
+        assert!(should_accept(&s, None));
+    }
+
+    #[test]
+    fn synth_template_for_track_omits_timestamp() {
+        let search = search_state_with_results(SearchResults {
+            tracks: vec![track("spotify:track:abc", "T1")],
+            ..Default::default()
+        });
+        let action = PlayAction::Track("spotify:track:abc".into());
+        let synth = synth_template_for(&action, &search).expect("synth must build");
+        assert!(synth.is_playing);
+        assert_eq!(synth.item.as_ref().unwrap().name, "T1");
+        assert_eq!(synth.progress_ms, Some(0));
+        assert!(synth.context.is_none());
+        // Timestamp is filled in by play_selection AFTER the play call,
+        // so it matches last_local_action_ms exactly.
+        assert!(synth.timestamp.is_none());
+    }
+
+    #[test]
+    fn synth_template_for_in_context_includes_playlist_context() {
+        let mut s = SearchState::new(Some(InContext {
+            playlist_uri: "spotify:playlist:pl".into(),
+            tracks: vec![track("spotify:track:in0", "in0")],
+            filtered: vec![0],
+        }));
+        s.selected = 0;
+        let action = PlayAction::Context {
+            uri: "spotify:playlist:pl".into(),
+            offset: Some("spotify:track:in0".into()),
+        };
+        let synth = synth_template_for(&action, &s).expect("synth must build");
+        assert_eq!(synth.item.as_ref().unwrap().name, "in0");
+        let ctx = synth.context.expect("context expected");
+        assert_eq!(ctx.uri, "spotify:playlist:pl");
+        assert_eq!(ctx.kind, "playlist");
+    }
+
+    #[test]
+    fn synth_template_for_context_without_offset_is_none() {
+        // Album/playlist/artist play with no specific track — we don't have
+        // enough info to synthesize; polled data (if any) takes over.
+        let search = search_state_with_results(SearchResults::default());
+        let action = PlayAction::Context {
+            uri: "spotify:album:a".into(),
+            offset: None,
+        };
+        assert!(synth_template_for(&action, &search).is_none());
+    }
+
+    #[test]
+    fn synth_with_matching_timestamp_is_accepted() {
+        // The exact case that broke first time: synth and last_local_action
+        // share a timestamp; should_accept must accept (>= comparison).
+        let ts = now_unix_ms();
+        let mut s = AppState::default();
+        s.last_local_action_ms = ts;
+        let mut synth = pb_with_ts(Some(ts), "POWER");
+        synth.is_playing = true;
+        assert!(should_accept(&s, Some(&synth)));
     }
 
     #[test]

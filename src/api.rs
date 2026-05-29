@@ -22,6 +22,11 @@ pub struct Playback {
     pub item: Option<Track>,
     #[serde(default)]
     pub context: Option<Context>,
+    /// ms since epoch when Spotify last updated this state. Used to detect
+    /// stale responses: when librespot doesn't report state, /me/player keeps
+    /// returning whichever device reported last, with this timestamp frozen.
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -75,6 +75,14 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
             ));
         }
     }
+    // Surface a persistent warning when the librespot device has dropped off
+    // Spotify Connect — without it the user just sees mysterious 404s.
+    if state.device_present == Some(false) && state.error.is_none() {
+        return Some((
+            "⚠ Connect device 'hifi' is offline — restart hifi to reconnect".to_string(),
+            Color::Yellow,
+        ));
+    }
     state
         .error
         .as_ref()
@@ -204,7 +212,11 @@ fn render_search_overlay(f: &mut Frame, area: Rect, s: &SearchState) {
     render_search_input(f, layout[0], s);
     let total = visible_total(s);
     let hint = if s.input.is_empty() {
-        "type to search · ↑/↓ to move · enter to play · esc to close".to_string()
+        if total == 0 {
+            "type to search · esc to close".to_string()
+        } else {
+            "type to search · ↑/↓ to pick · enter to play / re-run · esc to close".to_string()
+        }
     } else if total == 0 {
         format!("no results for \"{}\"", s.input)
     } else {
@@ -244,6 +256,40 @@ fn render_search_input(f: &mut Frame, area: Rect, s: &SearchState) {
 fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
     let mut lines: Vec<Line> = Vec::new();
     let mut row = 0usize;
+
+    // Empty input → show only the two "recents" sections; the live search
+    // sections below would all be empty anyway.
+    if s.input.is_empty() {
+        if s.recent_queries.is_empty() && s.recent_tracks.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  start typing to search Spotify",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            push_section(
+                &mut lines,
+                "Recent searches",
+                s.recent_queries.iter().map(|q| format!("  {q}")),
+                &mut row,
+                s.selected,
+            );
+            push_section(
+                &mut lines,
+                "Recently played",
+                s.recent_tracks.iter().map(|t| {
+                    format!(
+                        "  {} — {}",
+                        t.name,
+                        t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                }),
+                &mut row,
+                s.selected,
+            );
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
 
     if let Some(ctx) = &s.in_context {
         if !ctx.filtered.is_empty() {
@@ -349,6 +395,9 @@ fn styled_row(label: String, selected: bool) -> Line<'static> {
 }
 
 fn visible_total(s: &SearchState) -> usize {
+    if s.input.is_empty() {
+        return s.recent_queries.len() + s.recent_tracks.len();
+    }
     let in_ctx = s.in_context.as_ref().map(|c| c.filtered.len()).unwrap_or(0);
     in_ctx
         + s.results.tracks.len()

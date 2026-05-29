@@ -35,7 +35,8 @@ pub async fn start(device_name: &str) -> Result<Streaming> {
     let connect_config = ConnectConfig {
         name: device_name.to_string(),
         device_type: DeviceType::Computer,
-        initial_volume: 32_768,
+        // Default to 100% — the user controls volume via their system mixer.
+        initial_volume: u16::MAX,
         is_group: false,
         disable_volume: false,
         volume_steps: 64,

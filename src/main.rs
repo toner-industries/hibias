@@ -20,6 +20,7 @@ mod art;
 mod auth;
 mod keys;
 mod log;
+mod recent;
 mod streaming;
 mod ui;
 
@@ -41,6 +42,17 @@ pub struct AppState {
     /// — librespot frequently fails to report state to Spotify Connect, so
     /// `/me/player` keeps serving whichever device reported last.
     pub last_local_action_ms: u64,
+    /// `None` = never probed; `Some(true)` = our device id is in `/me/player/devices`;
+    /// `Some(false)` = probe succeeded but our id is missing. When `false`,
+    /// the librespot Spirc session has lost its Connect cloud registration
+    /// and play/pause will 404 until the user restarts the app.
+    pub device_present: Option<bool>,
+    /// Recently played tracks fetched from /me/player/recently-played.
+    /// Shown in the search overlay when the input is empty.
+    pub recent_tracks: Vec<Track>,
+    /// Queries the user has searched for previously, most-recent-first.
+    /// Persisted to `hifi-recent.json` so it survives restarts.
+    pub recent_queries: Vec<String>,
 }
 
 #[derive(Default)]
@@ -71,10 +83,18 @@ pub struct SearchState {
     pub results: SearchResults,
     pub selected: usize,
     pub in_context: Option<InContext>,
+    /// Snapshot copied from AppState when search opens — shown only when
+    /// `input` is empty so it doesn't fight the live search results.
+    pub recent_queries: Vec<String>,
+    pub recent_tracks: Vec<Track>,
 }
 
 impl SearchState {
-    fn new(in_context: Option<InContext>) -> Self {
+    fn new(
+        in_context: Option<InContext>,
+        recent_queries: Vec<String>,
+        recent_tracks: Vec<Track>,
+    ) -> Self {
         Self {
             input: String::new(),
             cursor: 0,
@@ -85,7 +105,14 @@ impl SearchState {
             results: SearchResults::default(),
             selected: 0,
             in_context,
+            recent_queries,
+            recent_tracks,
         }
+    }
+
+    /// Whether the "empty input" view (recents) is what the user sees right now.
+    pub fn showing_recents(&self) -> bool {
+        self.input.is_empty()
     }
 }
 
@@ -148,13 +175,39 @@ async fn main() -> Result<()> {
         }
     };
 
+    let recent_queries = recent::load_queries();
     let state = Arc::new(Mutex::new(AppState {
         device_name,
+        recent_queries,
         ..Default::default()
     }));
 
     if let Ok(pb) = client.get_playback().await {
         apply_playback(&state, &art_loader, pb).await;
+    }
+
+    // Kick off a recently-played fetch in the background so the search
+    // overlay has something to show on first open. Soft-fail — the most
+    // common cause is the user hasn't re-authed with the new scope yet.
+    {
+        let c = client.clone();
+        let s = state.clone();
+        tokio::spawn(async move {
+            match c.get_recently_played(20).await {
+                Ok(tracks) => {
+                    log::note(
+                        "recently_played loaded",
+                        Some(&format!("count={}", tracks.len())),
+                    );
+                    let mut g = s.lock().await;
+                    g.recent_tracks = tracks;
+                }
+                Err(e) => log::note(
+                    "recently_played unavailable",
+                    Some(&format!("{e:#} (likely missing scope — run `just reauth`)")),
+                ),
+            }
+        });
     }
 
     let mut terminal = setup_terminal()?;
@@ -197,6 +250,7 @@ async fn run(
     // Surfaces "device drops out of active state" issues that some other
     // Spotify TUIs miss.
     let dev_client = client.clone();
+    let dev_state = state.clone();
     let dev_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -223,6 +277,21 @@ async fn run(
                         .collect::<Vec<_>>()
                         .join(" | ");
                     log::note("devices probe", Some(&summary));
+                    // Update our "is the librespot device still registered?"
+                    // flag. Only meaningful once we've actually started a
+                    // device (our_id is set).
+                    if let Some(id) = our_id {
+                        let now_present = devs.iter().any(|d| d.id.as_deref() == Some(id.as_str()));
+                        let mut s = dev_state.lock().await;
+                        let was_present = s.device_present;
+                        s.device_present = Some(now_present);
+                        if was_present == Some(true) && !now_present {
+                            log::error(
+                                "device dropped",
+                                "librespot Spirc lost its Connect cloud registration",
+                            );
+                        }
+                    }
                 }
                 Err(e) => log::note("devices probe failed", Some(&format!("{e:#}"))),
             }
@@ -395,6 +464,14 @@ enum KeyAction {
     PlaySelection,
 }
 
+/// What hitting Enter on the current selection means.
+#[derive(Debug)]
+enum SelectionAction {
+    /// Re-run search with this query (selected a row from "Recent searches").
+    PromoteQuery(String),
+    Play(PlayAction),
+}
+
 async fn dispatch_key(
     code: KeyCode,
     _mods: KeyModifiers,
@@ -433,7 +510,16 @@ async fn dispatch_key(
                 }
                 KeyAction::Stay
             }
-            KeyCode::Enter => KeyAction::PlaySelection,
+            KeyCode::Enter => match resolve_full_selection(search) {
+                Some(SelectionAction::PromoteQuery(q)) => {
+                    search.input = q.clone();
+                    search.cursor = q.chars().count();
+                    refilter_in_context(search);
+                    KeyAction::SearchInputChanged
+                }
+                Some(SelectionAction::Play(_)) => KeyAction::PlaySelection,
+                None => KeyAction::Stay,
+            },
             KeyCode::Backspace => {
                 if search.cursor > 0 {
                     let byte = char_idx_to_byte(&search.input, search.cursor - 1);
@@ -478,6 +564,9 @@ async fn dispatch_key(
 }
 
 fn visible_row_count(s: &SearchState) -> usize {
+    if s.showing_recents() {
+        return s.recent_queries.len() + s.recent_tracks.len();
+    }
     let mut n = 0;
     if let Some(c) = &s.in_context {
         n += c.filtered.len();
@@ -534,7 +623,9 @@ async fn enter_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>)
             tracks: Vec::new(),
             filtered: Vec::new(),
         });
-        s.mode = Mode::Search(SearchState::new(in_context));
+        let queries = s.recent_queries.clone();
+        let tracks = s.recent_tracks.clone();
+        s.mode = Mode::Search(SearchState::new(in_context, queries, tracks));
     }
 
     if let Some(uri) = context_uri {
@@ -610,6 +701,10 @@ async fn kick_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) 
                     results.artists.len(),
                     results.playlists.len()
                 );
+                let any_hits = !results.tracks.is_empty()
+                    || !results.albums.is_empty()
+                    || !results.artists.is_empty()
+                    || !results.playlists.is_empty();
                 let mut s = state_task.lock().await;
                 if let Mode::Search(search) = &mut s.mode {
                     if my_id >= search.applied_id && my_id == search.request_id {
@@ -622,6 +717,10 @@ async fn kick_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) 
                             "search results applied",
                             Some(&format!("id={my_id} q={q:?} {counts}")),
                         );
+                        if any_hits {
+                            recent::push_query(&mut s.recent_queries, &q);
+                            recent::save_queries(&s.recent_queries);
+                        }
                     } else {
                         log::note(
                             "search results dropped (stale)",
@@ -669,12 +768,29 @@ async fn play_selection(
     //    a successful play) so it matches `last_local_action_ms` exactly.
     let (action, synth_template) = {
         let s = state.lock().await;
+        if s.device_present == Some(false) {
+            log::error(
+                "play_selection: skipped (device offline)",
+                "librespot Spirc is no longer registered with Spotify Connect",
+            );
+            return;
+        }
         let Mode::Search(search) = &s.mode else {
             return;
         };
-        let Some(action) = resolve_selection(search) else {
-            log::note("play_selection: nothing selected", None);
-            return;
+        let resolved = resolve_full_selection(search);
+        let action = match resolved {
+            Some(SelectionAction::Play(a)) => a,
+            Some(SelectionAction::PromoteQuery(_)) => {
+                // PromoteQuery is handled in dispatch_key before
+                // PlaySelection is requested; defensive guard.
+                log::note("play_selection: skipped (promote-query selection)", None);
+                return;
+            }
+            None => {
+                log::note("play_selection: nothing selected", None);
+                return;
+            }
         };
         let template = synth_template_for(&action, search);
         (action, template)
@@ -711,9 +827,15 @@ async fn play_selection(
             })
         }
         Err(e) => {
-            log::error("play_selection", &format!("{e:#}"));
+            let msg = format!("{e:#}");
+            log::error("play_selection", &msg);
             let mut s = state.lock().await;
-            s.error = Some(format!("{e:#}"));
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
             None
         }
     };
@@ -768,9 +890,17 @@ fn find_track_by_uri(search: &SearchState, uri: &str) -> Option<Track> {
             return Some(t);
         }
     }
-    search
+    if let Some(t) = search
         .results
         .tracks
+        .iter()
+        .find(|t| t.uri.as_deref() == Some(uri))
+        .cloned()
+    {
+        return Some(t);
+    }
+    search
+        .recent_tracks
         .iter()
         .find(|t| t.uri.as_deref() == Some(uri))
         .cloned()
@@ -780,6 +910,22 @@ fn find_track_by_uri(search: &SearchState, uri: &str) -> Option<Track> {
 enum PlayAction {
     Track(String),
     Context { uri: String, offset: Option<String> },
+}
+
+fn resolve_full_selection(s: &SearchState) -> Option<SelectionAction> {
+    if s.showing_recents() {
+        let mut idx = s.selected;
+        if idx < s.recent_queries.len() {
+            return Some(SelectionAction::PromoteQuery(s.recent_queries[idx].clone()));
+        }
+        idx -= s.recent_queries.len();
+        if idx < s.recent_tracks.len() {
+            let uri = s.recent_tracks[idx].uri.clone()?;
+            return Some(SelectionAction::Play(PlayAction::Track(uri)));
+        }
+        return None;
+    }
+    resolve_selection(s).map(SelectionAction::Play)
 }
 
 fn resolve_selection(s: &SearchState) -> Option<PlayAction> {
@@ -919,12 +1065,20 @@ async fn apply_playback(
 
 async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
     let was_playing = {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
         if s.rate_limited_until
             .map(|t| t > Instant::now())
             .unwrap_or(false)
         {
             log::note("toggle_playback: skipped (rate-limited)", None);
+            return;
+        }
+        if s.device_present == Some(false) {
+            log::error(
+                "toggle_playback: skipped (device offline)",
+                "librespot Spirc is no longer registered with Spotify Connect",
+            );
+            s.error = Some(DEVICE_OFFLINE_MSG.to_string());
             return;
         }
         s.playback.as_ref().map(|p| p.is_playing).unwrap_or(false)
@@ -942,17 +1096,56 @@ async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
     match result {
         Ok(()) => {
             let ts = now_unix_ms();
+            // Freeze the progress anchor *before* flipping is_playing so the
+            // currently-displayed time is preserved across pause/resume. The
+            // displayed value = stored progress_ms + (elapsed since last_poll
+            // if playing); we collapse that into a fresh anchor of
+            // (new_progress, last_poll = now).
+            let now_instant = Instant::now();
+            let frozen_progress = displayed_progress_for_toggle(&s);
             if let Some(p) = s.playback.as_mut() {
                 p.is_playing = !was_playing;
+                p.progress_ms = Some(frozen_progress);
                 p.timestamp = Some(ts);
             }
+            s.last_poll = Some(now_instant);
             s.error = None;
             s.last_local_action_ms = ts;
         }
         Err(e) => {
-            log::error("toggle_playback", &format!("{e:#}"));
-            s.error = Some(format!("{e:#}"));
+            let msg = format!("{e:#}");
+            log::error("toggle_playback", &msg);
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
         }
+    }
+}
+
+const DEVICE_OFFLINE_MSG: &str =
+    "Connect device 'hifi' is offline — quit and restart hifi to reconnect";
+
+fn is_device_not_found(msg: &str) -> bool {
+    msg.contains("Device not found") || msg.contains("\"status\" : 404")
+}
+
+/// Effective progress in ms given the current state — same calculation as the
+/// UI's `displayed_progress`, but lives here so `toggle_playback` can freeze
+/// the value before mutating `is_playing`.
+fn displayed_progress_for_toggle(s: &AppState) -> u64 {
+    let Some(pb) = &s.playback else {
+        return 0;
+    };
+    let base = pb.progress_ms.unwrap_or(0);
+    if !pb.is_playing {
+        return base;
+    }
+    match s.last_poll {
+        Some(poll) => base + poll.elapsed().as_millis() as u64,
+        None => base,
     }
 }
 
@@ -981,9 +1174,15 @@ mod tests {
     }
 
     fn search_state_with_results(results: SearchResults) -> SearchState {
-        let mut s = SearchState::new(None);
+        let mut s = SearchState::new(None, Vec::new(), Vec::new());
         s.results = results;
         s
+    }
+
+    /// Test helper: build a SearchState wrapping a given InContext, with no
+    /// recents. Cuts boilerplate from in-context tests.
+    fn search_state_with_context(ctx: InContext) -> SearchState {
+        SearchState::new(Some(ctx), Vec::new(), Vec::new())
     }
 
     fn pb_with_ts(ts: Option<u64>, name: &str) -> Playback {
@@ -1069,11 +1268,11 @@ mod tests {
 
     #[test]
     fn synth_template_for_in_context_includes_playlist_context() {
-        let mut s = SearchState::new(Some(InContext {
+        let mut s = search_state_with_context(InContext {
             playlist_uri: "spotify:playlist:pl".into(),
             tracks: vec![track("spotify:track:in0", "in0")],
             filtered: vec![0],
-        }));
+        });
         s.selected = 0;
         let action = PlayAction::Context {
             uri: "spotify:playlist:pl".into(),
@@ -1190,11 +1389,11 @@ mod tests {
 
     #[test]
     fn resolve_in_context_uses_playlist_uri_with_offset() {
-        let mut s = SearchState::new(Some(InContext {
+        let mut s = search_state_with_context(InContext {
             playlist_uri: "spotify:playlist:pl".into(),
             tracks: vec![track("spotify:track:in0", "in0")],
             filtered: vec![0],
-        }));
+        });
         s.selected = 0;
         match resolve_selection(&s) {
             Some(PlayAction::Context { uri, offset }) => {
@@ -1207,14 +1406,14 @@ mod tests {
 
     #[test]
     fn refilter_in_context_matches_track_name_case_insensitive() {
-        let mut s = SearchState::new(Some(InContext {
+        let mut s = search_state_with_context(InContext {
             playlist_uri: "spotify:playlist:p".into(),
             tracks: vec![
                 track("spotify:track:1", "Strawberry Fields"),
                 track("spotify:track:2", "Yesterday"),
             ],
             filtered: vec![],
-        }));
+        });
         s.input = "STRAW".into();
         refilter_in_context(&mut s);
         let ctx = s.in_context.as_ref().unwrap();
@@ -1223,11 +1422,11 @@ mod tests {
 
     #[test]
     fn refilter_in_context_empty_input_clears() {
-        let mut s = SearchState::new(Some(InContext {
+        let mut s = search_state_with_context(InContext {
             playlist_uri: "spotify:playlist:p".into(),
             tracks: vec![track("spotify:track:1", "X")],
             filtered: vec![0],
-        }));
+        });
         s.input.clear();
         refilter_in_context(&mut s);
         assert!(s.in_context.as_ref().unwrap().filtered.is_empty());
@@ -1262,5 +1461,112 @@ mod tests {
             Some("abc123".into())
         );
         assert!(playlist_id_from_uri("spotify:album:abc").is_none());
+    }
+
+    // --- recents in the search overlay ---------------------------------
+
+    #[test]
+    fn recents_resolve_first_to_promote_query() {
+        let s = SearchState::new(
+            None,
+            vec!["the beatles".into(), "weezer".into()],
+            vec![track("spotify:track:r1", "Recent1")],
+        );
+        // selected=0 → first recent query
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::PromoteQuery(q)) => assert_eq!(q, "the beatles"),
+            other => panic!("expected PromoteQuery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recents_resolve_walks_into_recently_played() {
+        let mut s = SearchState::new(
+            None,
+            vec!["q1".into()],
+            vec![
+                track("spotify:track:r0", "R0"),
+                track("spotify:track:r1", "R1"),
+            ],
+        );
+        s.selected = 2; // queries=1 then tracks 0,1 → idx 2 is recent track[1]
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::Play(PlayAction::Track(uri))) => {
+                assert_eq!(uri, "spotify:track:r1");
+            }
+            other => panic!("expected Play(Track), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recents_hidden_when_input_nonempty() {
+        let mut s = SearchState::new(
+            None,
+            vec!["q1".into()],
+            vec![track("spotify:track:r0", "R0")],
+        );
+        s.input = "anything".into();
+        // No live results — falls through to resolve_selection → None.
+        assert!(resolve_full_selection(&s).is_none());
+    }
+
+    #[test]
+    fn visible_row_count_uses_recents_when_input_empty() {
+        let s = SearchState::new(
+            None,
+            vec!["q1".into(), "q2".into()],
+            vec![track("spotify:track:r0", "R0")],
+        );
+        assert_eq!(visible_row_count(&s), 3);
+    }
+
+    #[test]
+    fn visible_row_count_ignores_recents_when_input_nonempty() {
+        let mut s = SearchState::new(
+            None,
+            vec!["q1".into(), "q2".into()],
+            vec![track("spotify:track:r0", "R0")],
+        );
+        s.input = "x".into();
+        assert_eq!(visible_row_count(&s), 0);
+    }
+
+    // --- pause/resume progress anchor ----------------------------------
+
+    fn state_with_playback(progress_ms: u64, is_playing: bool) -> AppState {
+        AppState {
+            playback: Some(Playback {
+                is_playing,
+                progress_ms: Some(progress_ms),
+                item: Some(track("spotify:track:x", "X")),
+                context: None,
+                timestamp: None,
+            }),
+            last_poll: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn displayed_progress_for_toggle_paused_returns_stored() {
+        let s = state_with_playback(45_000, false);
+        assert_eq!(displayed_progress_for_toggle(&s), 45_000);
+    }
+
+    #[test]
+    fn displayed_progress_for_toggle_playing_adds_elapsed() {
+        // last_poll is "now"; elapsed should be ~0
+        let s = state_with_playback(45_000, true);
+        let got = displayed_progress_for_toggle(&s);
+        assert!(got >= 45_000 && got < 45_500, "got {got}");
+    }
+
+    #[test]
+    fn is_device_not_found_recognizes_404_message() {
+        assert!(is_device_not_found(
+            "PUT https://api.spotify.com/v1/me/player/play: 404 Not Found: Device not found"
+        ));
+        assert!(is_device_not_found("{\"error\": {\"status\" : 404, \"message\" : \"x\"}}"));
+        assert!(!is_device_not_found("rate limited"));
     }
 }

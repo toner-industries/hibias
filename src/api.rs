@@ -146,6 +146,18 @@ impl<T> Page<T> {
 }
 
 #[derive(Debug, Deserialize)]
+struct RecentlyPlayedPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<RecentlyPlayedItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentlyPlayedItem {
+    #[serde(default)]
+    track: Option<Track>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PlaylistTracksPage {
     #[serde(default = "Vec::new")]
     items: Vec<PlaylistTrackItem>,
@@ -286,6 +298,28 @@ impl SpotifyClient {
             artists: payload.artists.map(Page::into_items).unwrap_or_default(),
             playlists: payload.playlists.map(Page::into_items).unwrap_or_default(),
         })
+    }
+
+    pub async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>> {
+        let url = format!("{BASE}/me/player/recently-played?limit={limit}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let page: RecentlyPlayedPage =
+            serde_json::from_str(&body).context("parse recently-played")?;
+        // Spotify can return the same track multiple times; dedup by uri while
+        // preserving order.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for it in page.items.into_iter().filter_map(|i| i.track) {
+            let key = it.uri.clone().unwrap_or_else(|| it.name.clone());
+            if seen.insert(key) {
+                out.push(it);
+            }
+        }
+        Ok(out)
     }
 
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {

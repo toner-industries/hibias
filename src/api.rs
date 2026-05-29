@@ -169,6 +169,10 @@ impl SpotifyClient {
         self.device_id.get().map(String::as_str)
     }
 
+    pub fn device_id_for_log(&self) -> Option<String> {
+        self.device_id.get().cloned()
+    }
+
     async fn bearer(&self) -> Result<String> {
         Ok(format!("Bearer {}", self.auth.token().await?))
     }

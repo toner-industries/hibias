@@ -2,13 +2,41 @@
 default:
     @just --list
 
-# Build and run the TUI (release — needed for smooth audio + FFT)
-run:
-    cargo run --release
+# Start the TUI in a detached tmux session named `hifi` (no attach)
+start:
+    @cargo build --release --quiet
+    @if tmux has-session -t hifi 2>/dev/null; then echo "hifi: already running"; else tmux new-session -d -s hifi 'target/release/hifi' && echo "hifi: started (use 'just attach' to interact)"; fi
 
-# Run a debug build (faster compile, may glitch audio)
+# Start (if needed) and attach to the TUI; detach with Ctrl-b d
+run:
+    @cargo build --release --quiet
+    @tmux new-session -A -s hifi 'target/release/hifi'
+
+# Attach to a running hifi tmux session
+attach:
+    tmux attach -t hifi
+
+# Kill the tmux session (stops the app)
+stop:
+    -tmux kill-session -t hifi
+
+# Show whether the session is running and recent log entries
+status:
+    @if tmux has-session -t hifi 2>/dev/null; then echo "hifi: RUNNING"; else echo "hifi: stopped"; fi
+    @echo ""
+    @just logs 20
+
+# Capture the TUI's current screen (useful for inspection without attaching)
+peek:
+    tmux capture-pane -p -t hifi
+
+# Build & run inline (no tmux) — for when you don't want a session
+run-fg:
+    cargo run --release --bin hifi
+
+# Debug build run inline
 run-debug:
-    cargo run
+    cargo run --bin hifi
 
 # Release build without running
 build:
@@ -45,6 +73,14 @@ logs-shell:
 # Delete the SQLite log database
 logs-clear:
     rm -f hifi.log.sqlite hifi.log.sqlite-shm hifi.log.sqlite-wal
+
+# Show Spotify's view of current playback + devices (run while TUI is up)
+diag:
+    cargo run --release --bin hifi-diag
+
+# Send play to the "hifi" device and poll /me/player for 10s
+diag-play uri:
+    cargo run --release --bin hifi-diag -- play {{uri}}
 
 # Wipe build artifacts
 clean:

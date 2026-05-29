@@ -188,6 +188,42 @@ async fn run(
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
 ) -> Result<()> {
+    // Periodic device probe — logs Spotify's view of our device every 5s.
+    // Surfaces "device drops out of active state" issues that some other
+    // Spotify TUIs miss.
+    let dev_client = client.clone();
+    let dev_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match dev_client.get_devices().await {
+                Ok(devs) => {
+                    let our_id = dev_client.device_id_for_log();
+                    let summary = devs
+                        .iter()
+                        .map(|d| {
+                            let mark = match (&our_id, d.id.as_deref()) {
+                                (Some(o), Some(i)) if o == i => "*",
+                                _ => " ",
+                            };
+                            format!(
+                                "{mark}{}(active={},id={})",
+                                d.name,
+                                d.is_active,
+                                d.id.as_deref().unwrap_or("?")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    log::note("devices probe", Some(&summary));
+                }
+                Err(e) => log::note("devices probe failed", Some(&format!("{e:#}"))),
+            }
+        }
+    });
+
     let poll_state = state.clone();
     let poll_client = client.clone();
     let poll_loader = art_loader.clone();
@@ -288,20 +324,23 @@ async fn run(
     }
 
     poll_handle.abort();
+    dev_handle.abort();
     Ok(())
 }
 
 async fn wait_then_transfer(client: &SpotifyClient, device_id: &str) {
-    // Poll up to ~12s for our device to show up in the Connect device list.
     for attempt in 0..24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         match client.get_devices().await {
             Ok(devices) => {
-                let visible = devices.iter().any(|d| d.id.as_deref() == Some(device_id));
-                if visible {
+                let found = devices.iter().find(|d| d.id.as_deref() == Some(device_id));
+                if let Some(d) = found {
                     log::note(
                         "device visible to Spotify",
-                        Some(&format!("attempt={attempt}")),
+                        Some(&format!(
+                            "attempt={attempt} name={:?} is_active={}",
+                            d.name, d.is_active
+                        )),
                     );
                     match client.transfer_playback(device_id, false).await {
                         Ok(_) => log::note("transfer_playback ok", None),

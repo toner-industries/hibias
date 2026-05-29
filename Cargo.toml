@@ -2,6 +2,7 @@
 name = "hifi"
 version = "0.1.0"
 edition = "2021"
+default-run = "hifi"
 
 [dependencies]
 anyhow = "1"
@@ -25,6 +26,14 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 urlencoding = "2"
+
+[[bin]]
+name = "hifi"
+path = "src/main.rs"
+
+[[bin]]
+name = "hifi-diag"
+path = "src/bin/diag.rs"
 
 [profile.release]
 debug = 1

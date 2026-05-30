@@ -9,14 +9,15 @@ use ratatui_image::StatefulImage;
 use std::time::Instant;
 
 use crate::keys::{self, ModeMask};
-use crate::{AppState, Mode, SearchState};
+use crate::{AppState, Cmd, CommandState, Mode, SearchState};
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
-    let title = match (&state.device_name, &state.streaming_failed) {
-        (Some(name), _) => format!(" hifi · device: {name} "),
-        (None, None) => " hifi · starting device... ".to_string(),
-        (None, Some(_)) => " hifi · streaming unavailable ".to_string(),
+    let title = match (state.reconnecting, &state.device_name, &state.streaming_failed) {
+        (true, _, _) => " hifi · reconnecting... ".to_string(),
+        (false, Some(name), _) => format!(" hifi · device: {name} "),
+        (false, None, None) => " hifi · starting device... ".to_string(),
+        (false, None, Some(_)) => " hifi · streaming unavailable ".to_string(),
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -53,6 +54,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Mode::NowPlaying => {}
         Mode::Search(search) => render_search_overlay(f, area, search),
         Mode::Help => render_help_overlay(f, area),
+        Mode::Command(cmd) => render_command_overlay(f, area, cmd),
     }
 }
 
@@ -414,6 +416,84 @@ fn visible_total(s: &SearchState) -> usize {
         + s.results.albums.len()
         + s.results.artists.len()
         + s.results.playlists.len()
+}
+
+fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
+    let filtered = cmd.filtered();
+    // Height: title + input + hint + a row per command, capped by viewport.
+    let desired = 4 + filtered.len() as u16;
+    let height = desired.min(area.height.saturating_sub(2));
+    let width = 64u16.min(area.width.saturating_sub(2));
+    let rect = centered_exact(area, width, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" command (`:`) ")
+        .borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // input
+            Constraint::Length(1), // hint
+            Constraint::Min(0),    // list
+        ])
+        .split(inner);
+
+    // Input line — vim-style ":" prompt followed by the typed query.
+    let mut spans = vec![Span::styled(": ", Style::default().fg(Color::Green))];
+    let chars: Vec<char> = cmd.input.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if i == cmd.cursor {
+            spans.push(Span::styled(
+                c.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            spans.push(Span::raw(c.to_string()));
+        }
+    }
+    if cmd.cursor >= chars.len() {
+        spans.push(Span::styled(
+            " ",
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), layout[0]);
+
+    let hint = if filtered.is_empty() {
+        format!("no commands match \"{}\"", cmd.input)
+    } else {
+        format!(
+            "{}/{} · ↑/↓ to move · enter to run · esc to close",
+            filtered.len(),
+            Cmd::ALL.len()
+        )
+    };
+    f.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        layout[1],
+    );
+
+    let lines: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let label = format!("  {:<12}  {}", c.name(), c.description());
+            if i == cmd.selected {
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(label)
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[2]);
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {

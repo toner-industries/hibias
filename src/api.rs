@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::auth::Auth;
@@ -12,7 +12,9 @@ const BASE: &str = "https://api.spotify.com/v1";
 pub struct SpotifyClient {
     http: reqwest::Client,
     auth: Auth,
-    device_id: OnceLock<String>,
+    // Mutex (not OnceLock) because reconnect replaces the id when a fresh
+    // librespot session comes up.
+    device_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,20 +176,24 @@ impl SpotifyClient {
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             auth,
-            device_id: OnceLock::new(),
+            device_id: Mutex::new(None),
         })
     }
 
     pub fn set_device_id(&self, id: String) {
-        let _ = self.device_id.set(id);
+        *self.device_id.lock().expect("device_id poisoned") = Some(id);
     }
 
-    fn device_id(&self) -> Option<&str> {
-        self.device_id.get().map(String::as_str)
+    pub fn clear_device_id(&self) {
+        *self.device_id.lock().expect("device_id poisoned") = None;
+    }
+
+    fn device_id(&self) -> Option<String> {
+        self.device_id.lock().expect("device_id poisoned").clone()
     }
 
     pub fn device_id_for_log(&self) -> Option<String> {
-        self.device_id.get().cloned()
+        self.device_id()
     }
 
     async fn bearer(&self) -> Result<String> {
@@ -239,7 +245,8 @@ impl SpotifyClient {
 
     pub async fn seek_to(&self, position_ms: u64) -> Result<()> {
         let base = format!("{BASE}/me/player/seek?position_ms={position_ms}");
-        let url = with_device(&base, self.device_id());
+        let did = self.device_id();
+        let url = with_device(&base, did.as_deref());
         let req = self
             .http
             .put(&url)
@@ -249,13 +256,36 @@ impl SpotifyClient {
     }
 
     pub async fn pause(&self) -> Result<()> {
-        let url = with_device(&format!("{BASE}/me/player/pause"), self.device_id());
+        let did = self.device_id();
+        let url = with_device(&format!("{BASE}/me/player/pause"), did.as_deref());
         let req = self
             .http
             .put(&url)
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
         send_logged(req, "PUT", &url, None).await.map(|_| ())
+    }
+
+    pub async fn next_track(&self) -> Result<()> {
+        let did = self.device_id();
+        let url = with_device(&format!("{BASE}/me/player/next"), did.as_deref());
+        let req = self
+            .http
+            .post(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        send_logged(req, "POST", &url, None).await.map(|_| ())
+    }
+
+    pub async fn previous_track(&self) -> Result<()> {
+        let did = self.device_id();
+        let url = with_device(&format!("{BASE}/me/player/previous"), did.as_deref());
+        let req = self
+            .http
+            .post(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        send_logged(req, "POST", &url, None).await.map(|_| ())
     }
 
     pub async fn play_uris(&self, uris: &[String]) -> Result<()> {
@@ -271,7 +301,8 @@ impl SpotifyClient {
     }
 
     async fn put_play(&self, body: Option<serde_json::Value>) -> Result<()> {
-        let url = with_device(&format!("{BASE}/me/player/play"), self.device_id());
+        let did = self.device_id();
+        let url = with_device(&format!("{BASE}/me/player/play"), did.as_deref());
         let mut req = self
             .http
             .put(&url)

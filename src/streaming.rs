@@ -10,10 +10,19 @@ use librespot_playback::{
 use std::{path::PathBuf, sync::Arc};
 
 pub struct Streaming {
-    #[allow(dead_code)]
     spirc: Spirc,
     pub device_name: String,
     pub device_id: String,
+}
+
+impl Streaming {
+    /// Tell librespot to disconnect from Spotify Connect and end its
+    /// background task. The Spirc command is fire-and-forget; if the
+    /// session is already broken this may error but we don't care —
+    /// we're tearing it down either way.
+    pub fn shutdown(&self) -> Result<()> {
+        self.spirc.shutdown().map_err(|e| anyhow!("{e}"))
+    }
 }
 
 pub async fn start(device_name: &str) -> Result<Streaming> {

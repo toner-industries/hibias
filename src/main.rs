@@ -60,6 +60,14 @@ pub struct AppState {
     /// Background streaming startup status. None = still starting; Some(Ok)
     /// after Spirc is registered; Some(Err) on failure.
     pub streaming_failed: Option<String>,
+    /// The active librespot session, kept here so reconnect can shut down
+    /// the old one and replace it with a new one. None = not yet started
+    /// or torn down for reconnect.
+    pub streaming: Option<streaming::Streaming>,
+    /// True while a reconnect is in flight — prevents the auto-reconnect
+    /// watchdog from racing with a manual `:reconnect`, and lets the UI
+    /// show a "Reconnecting..." indicator.
+    pub reconnecting: bool,
 }
 
 impl Default for AppState {
@@ -79,6 +87,8 @@ impl Default for AppState {
             recent_queries: Vec::new(),
             boot: true,
             streaming_failed: None,
+            streaming: None,
+            reconnecting: false,
         }
     }
 }
@@ -89,6 +99,7 @@ pub enum Mode {
     NowPlaying,
     Search(SearchState),
     Help,
+    Command(CommandState),
 }
 
 impl Mode {
@@ -97,7 +108,92 @@ impl Mode {
             Mode::NowPlaying => ModeMask::NOW_PLAYING,
             Mode::Search(_) => ModeMask::SEARCH,
             Mode::Help => ModeMask::HELP,
+            Mode::Command(_) => ModeMask::COMMAND,
         }
+    }
+}
+
+/// A discrete action runnable from the command menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    PlayPause,
+    Next,
+    Previous,
+    Reconnect,
+    Search,
+    Help,
+    Quit,
+}
+
+impl Cmd {
+    pub const ALL: &'static [Cmd] = &[
+        Cmd::PlayPause,
+        Cmd::Next,
+        Cmd::Previous,
+        Cmd::Reconnect,
+        Cmd::Search,
+        Cmd::Help,
+        Cmd::Quit,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Cmd::PlayPause => "play / pause",
+            Cmd::Next => "next",
+            Cmd::Previous => "previous",
+            Cmd::Reconnect => "reconnect",
+            Cmd::Search => "search",
+            Cmd::Help => "help",
+            Cmd::Quit => "quit",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Cmd::PlayPause => "toggle playback on the current device",
+            Cmd::Next => "skip to the next track",
+            Cmd::Previous => "skip back (or restart current track)",
+            Cmd::Reconnect => "restart the 'hifi' Connect device",
+            Cmd::Search => "open the Spotify search overlay",
+            Cmd::Help => "show the hotkey help overlay",
+            Cmd::Quit => "exit hifi",
+        }
+    }
+}
+
+pub struct CommandState {
+    pub input: String,
+    pub cursor: usize,
+    pub selected: usize,
+}
+
+impl Default for CommandState {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            cursor: 0,
+            selected: 0,
+        }
+    }
+}
+
+impl CommandState {
+    /// Commands matching the current input (case-insensitive substring on
+    /// the name). With empty input, all commands are returned.
+    pub fn filtered(&self) -> Vec<Cmd> {
+        if self.input.is_empty() {
+            return Cmd::ALL.to_vec();
+        }
+        let q = self.input.to_lowercase();
+        Cmd::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.name().to_lowercase().contains(&q))
+            .collect()
+    }
+
+    pub fn selected_cmd(&self) -> Option<Cmd> {
+        self.filtered().get(self.selected).copied()
     }
 }
 
@@ -187,32 +283,7 @@ async fn main() -> Result<()> {
     // Start the Connect device in the background so we can render the TUI
     // immediately — librespot's Spirc handshake usually takes a couple of
     // seconds and we don't want to block the screen on it.
-    {
-        let client_bg = client.clone();
-        let state_bg = state.clone();
-        tokio::spawn(async move {
-            match streaming::start("hifi").await {
-                Ok(s) => {
-                    log::note(
-                        "connect device started",
-                        Some(&format!("name={} id={}", s.device_name, s.device_id)),
-                    );
-                    client_bg.set_device_id(s.device_id.clone());
-                    {
-                        let mut g = state_bg.lock().await;
-                        g.device_name = Some(s.device_name.clone());
-                    }
-                    wait_then_transfer(&client_bg, &s.device_id).await;
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    log::error("streaming::start", &msg);
-                    let mut g = state_bg.lock().await;
-                    g.streaming_failed = Some(msg);
-                }
-            }
-        });
-    }
+    spawn_reconnect(&client, &state, "boot");
 
     // Kick off a recently-played fetch in the background. Doubles as:
     //   (a) the "Recently played" section in the search overlay, and
@@ -318,6 +389,17 @@ async fn run(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Honor an existing rate-limit window — pounding /me/player/devices
+            // while Spotify is telling us to back off just extends the misery.
+            {
+                let s = dev_state.lock().await;
+                if s.rate_limited_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
             match dev_client.get_devices().await {
                 Ok(devs) => {
                     let our_id = dev_client.device_id_for_log();
@@ -340,7 +422,12 @@ async fn run(
                     log::note("devices probe", Some(&summary));
                     // Update our "is the librespot device still registered?"
                     // flag. Only meaningful once we've actually started a
-                    // device (our_id is set).
+                    // device (our_id is set). We do NOT auto-reconnect here
+                    // — the probe runs every 5s and repeated reconnect
+                    // attempts hammer Spotify (we saw an 8-hour Retry-After
+                    // come back from that loop). Instead, the next user
+                    // play/pause/seek/skip will trigger the reconnect, or
+                    // they can run `:reconnect` manually.
                     if let Some(id) = our_id {
                         let now_present = devs.iter().any(|d| d.id.as_deref() == Some(id.as_str()));
                         let mut s = dev_state.lock().await;
@@ -349,12 +436,22 @@ async fn run(
                         if was_present == Some(true) && !now_present {
                             log::error(
                                 "device dropped",
-                                "librespot Spirc lost its Connect cloud registration",
+                                "librespot Spirc lost its Connect cloud registration — next user action will reconnect",
                             );
                         }
                     }
                 }
-                Err(e) => log::note("devices probe failed", Some(&format!("{e:#}"))),
+                Err(e) => {
+                    // If the probe itself trips a 429, mirror what the
+                    // playback poller does so the rest of the app sees the
+                    // back-off window and stops piling on.
+                    if let Some(secs) = e.downcast_ref::<RateLimited>().map(|r| r.0) {
+                        let mut s = dev_state.lock().await;
+                        s.rate_limited_until =
+                            Some(Instant::now() + Duration::from_secs(secs));
+                    }
+                    log::note("devices probe failed", Some(&format!("{e:#}")));
+                }
             }
         }
     });
@@ -368,6 +465,16 @@ async fn run(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Same back-off respect as the devices probe — see above.
+            {
+                let s = poll_state.lock().await;
+                if s.rate_limited_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
             match poll_client.get_playback().await {
                 Ok(pb) => {
                     apply_playback(&poll_state, &poll_loader, pb).await;
@@ -421,6 +528,11 @@ async fn run(
                         KeyAction::Stay => {}
                         KeyAction::TogglePlayback => toggle_playback(&client, &state).await,
                         KeyAction::Seek(delta_ms) => seek_relative(&client, &state, delta_ms).await,
+                        KeyAction::NextTrack => skip_track(&client, &state, true).await,
+                        KeyAction::PrevTrack => skip_track(&client, &state, false).await,
+                        KeyAction::Reconnect => {
+                            spawn_reconnect(&client, &state, "user: :reconnect");
+                        }
                         KeyAction::EnterSearch => enter_search(&client, &state).await,
                         KeyAction::SearchInputChanged => kick_search(&client, &state).await,
                         KeyAction::PlaySelection => {
@@ -459,6 +571,117 @@ async fn run(
     Ok(())
 }
 
+/// Kick off a reconnect on a background task. Safe to call multiple times
+/// — the in-flight guard inside `reconnect_now` collapses concurrent
+/// triggers (e.g., auto-watchdog firing while a manual `:reconnect` is
+/// already running).
+fn spawn_reconnect(
+    client: &Arc<SpotifyClient>,
+    state: &Arc<Mutex<AppState>>,
+    reason: &'static str,
+) {
+    let client = client.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        reconnect_now(&client, &state, reason).await;
+    });
+}
+
+/// Tear down the current librespot session (if any) and start a fresh one.
+/// Used by both startup and reconnect — single code path keeps the device-id
+/// lifecycle in one place.
+async fn reconnect_now(
+    client: &Arc<SpotifyClient>,
+    state: &Arc<Mutex<AppState>>,
+    reason: &'static str,
+) {
+    // Skip if a reconnect is already underway.
+    {
+        let mut s = state.lock().await;
+        if s.reconnecting {
+            log::note("reconnect: already in flight, skipping", Some(reason));
+            return;
+        }
+        s.reconnecting = true;
+        // Reset visible state for the "starting" indicator. Also clear
+        // any lingering rate-limit and error state — Spotify sometimes
+        // hands out absurdly long Retry-After headers after a bad probe
+        // loop, and a manual reconnect is the user's "get me unstuck" lever.
+        s.streaming_failed = None;
+        s.device_name = None;
+        s.device_present = None;
+        s.rate_limited_until = None;
+        s.error = None;
+    }
+    log::note("reconnect: starting", Some(reason));
+
+    // Shut down the existing session (if any). This is fire-and-forget;
+    // a broken Spirc may surface an error but we're tearing it down regardless.
+    let old = {
+        let mut s = state.lock().await;
+        s.streaming.take()
+    };
+    if let Some(old) = old {
+        match old.shutdown() {
+            Ok(()) => log::note("reconnect: old spirc shutdown ok", None),
+            Err(e) => log::note("reconnect: old spirc shutdown err", Some(&format!("{e:#}"))),
+        }
+        // Give librespot a moment to actually wind down before binding a
+        // new session — otherwise Spotify Connect can return the old (dead)
+        // device record from /me/player/devices for a few seconds.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    client.clear_device_id();
+
+    match streaming::start("hifi").await {
+        Ok(new) => {
+            log::note(
+                "reconnect: new spirc up",
+                Some(&format!("name={} id={}", new.device_name, new.device_id)),
+            );
+            client.set_device_id(new.device_id.clone());
+            let device_id_for_transfer = new.device_id.clone();
+            {
+                let mut s = state.lock().await;
+                s.device_name = Some(new.device_name.clone());
+                s.streaming = Some(new);
+                s.reconnecting = false;
+            }
+            wait_then_transfer(client, &device_id_for_transfer).await;
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("reconnect: streaming::start failed", &msg);
+            let mut s = state.lock().await;
+            s.streaming_failed = Some(msg);
+            s.reconnecting = false;
+        }
+    }
+}
+
+/// If we know the librespot device has dropped off Spotify Connect, kick a
+/// reconnect and tell the caller to abort. The caller's API call would have
+/// 404'd anyway, and re-doing the action after reconnect is the user's job
+/// — they're already at the keyboard.
+async fn reconnect_if_device_offline(
+    client: &Arc<SpotifyClient>,
+    state: &Arc<Mutex<AppState>>,
+    caller: &'static str,
+) -> bool {
+    let offline = {
+        let s = state.lock().await;
+        s.device_present == Some(false) && !s.reconnecting
+    };
+    if offline {
+        log::note(
+            "device offline — auto-reconnecting on user action",
+            Some(caller),
+        );
+        spawn_reconnect(client, state, "user action while offline");
+    }
+    offline
+}
+
 async fn wait_then_transfer(client: &SpotifyClient, device_id: &str) {
     for attempt in 0..24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -494,6 +717,7 @@ fn mode_name(s: &AppState) -> &'static str {
         Mode::NowPlaying => "now_playing",
         Mode::Search(_) => "search",
         Mode::Help => "help",
+        Mode::Command(_) => "command",
     }
 }
 
@@ -526,6 +750,9 @@ enum KeyAction {
     PlaySelection,
     /// Seek the current track by ±N milliseconds.
     Seek(i64),
+    NextTrack,
+    PrevTrack,
+    Reconnect,
 }
 
 const SEEK_STEP_MS: i64 = 10_000;
@@ -551,6 +778,10 @@ async fn dispatch_key(
             KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => KeyAction::Seek(-SEEK_STEP_MS),
             KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => KeyAction::Seek(SEEK_STEP_MS),
             KeyCode::Char('/') => KeyAction::EnterSearch,
+            KeyCode::Char(':') => {
+                s.mode = Mode::Command(CommandState::default());
+                KeyAction::Stay
+            }
             KeyCode::Char('?') => {
                 s.mode = Mode::Help;
                 KeyAction::Stay
@@ -625,6 +856,75 @@ async fn dispatch_key(
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                 s.mode = Mode::NowPlaying;
                 KeyAction::Stay
+            }
+            _ => KeyAction::Stay,
+        },
+        Mode::Command(cmd) => match code {
+            KeyCode::Esc => {
+                s.mode = Mode::NowPlaying;
+                KeyAction::Stay
+            }
+            KeyCode::Up => {
+                if cmd.selected > 0 {
+                    cmd.selected -= 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Down => {
+                let max = cmd.filtered().len().saturating_sub(1);
+                if cmd.selected < max {
+                    cmd.selected += 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Left => {
+                if cmd.cursor > 0 {
+                    cmd.cursor -= 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Right => {
+                let max = cmd.input.chars().count();
+                if cmd.cursor < max {
+                    cmd.cursor += 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Backspace => {
+                if cmd.cursor > 0 {
+                    let byte = char_idx_to_byte(&cmd.input, cmd.cursor - 1);
+                    cmd.input.remove(byte);
+                    cmd.cursor -= 1;
+                    cmd.selected = 0;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Char(c) => {
+                let byte = char_idx_to_byte(&cmd.input, cmd.cursor);
+                cmd.input.insert(byte, c);
+                cmd.cursor += 1;
+                cmd.selected = 0;
+                KeyAction::Stay
+            }
+            KeyCode::Enter => {
+                let Some(chosen) = cmd.selected_cmd() else {
+                    return KeyAction::Stay;
+                };
+                // Dispatch — most commands close the menu first, then the
+                // run loop performs the action.
+                s.mode = Mode::NowPlaying;
+                match chosen {
+                    Cmd::PlayPause => KeyAction::TogglePlayback,
+                    Cmd::Next => KeyAction::NextTrack,
+                    Cmd::Previous => KeyAction::PrevTrack,
+                    Cmd::Reconnect => KeyAction::Reconnect,
+                    Cmd::Search => KeyAction::EnterSearch,
+                    Cmd::Help => {
+                        s.mode = Mode::Help;
+                        KeyAction::Stay
+                    }
+                    Cmd::Quit => KeyAction::Quit,
+                }
             }
             _ => KeyAction::Stay,
         },
@@ -834,15 +1134,11 @@ async fn play_selection(
     // 1. Resolve action and capture the synth template now, while search
     //    state is still in AppState. We finalize its timestamp later (after
     //    a successful play) so it matches `last_local_action_ms` exactly.
+    if reconnect_if_device_offline(client, state, "play_selection").await {
+        return;
+    }
     let (action, synth_template) = {
         let s = state.lock().await;
-        if s.device_present == Some(false) {
-            log::error(
-                "play_selection: skipped (device offline)",
-                "librespot Spirc is no longer registered with Spotify Connect",
-            );
-            return;
-        }
         let Mode::Search(search) = &s.mode else {
             return;
         };
@@ -1167,22 +1463,17 @@ async fn apply_playback_inner(
     }
 }
 
-async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
+async fn toggle_playback(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) {
+    if reconnect_if_device_offline(client, state, "toggle_playback").await {
+        return;
+    }
     let was_playing = {
-        let mut s = state.lock().await;
+        let s = state.lock().await;
         if s.rate_limited_until
             .map(|t| t > Instant::now())
             .unwrap_or(false)
         {
             log::note("toggle_playback: skipped (rate-limited)", None);
-            return;
-        }
-        if s.device_present == Some(false) {
-            log::error(
-                "toggle_playback: skipped (device offline)",
-                "librespot Spirc is no longer registered with Spotify Connect",
-            );
-            s.error = Some(DEVICE_OFFLINE_MSG.to_string());
             return;
         }
         s.playback.as_ref().map(|p| p.is_playing).unwrap_or(false)
@@ -1231,10 +1522,13 @@ async fn toggle_playback(client: &SpotifyClient, state: &Mutex<AppState>) {
 }
 
 async fn seek_relative(
-    client: &SpotifyClient,
-    state: &Mutex<AppState>,
+    client: &Arc<SpotifyClient>,
+    state: &Arc<Mutex<AppState>>,
     delta_ms: i64,
 ) {
+    if reconnect_if_device_offline(client, state, "seek_relative").await {
+        return;
+    }
     // Compute the target position from the currently-displayed value (which
     // already includes elapsed time when playing), clamped to track duration.
     let (target_ms, was_playing) = {
@@ -1244,13 +1538,6 @@ async fn seek_relative(
             .unwrap_or(false)
         {
             log::note("seek_relative: skipped (rate-limited)", None);
-            return;
-        }
-        if s.device_present == Some(false) {
-            log::error(
-                "seek_relative: skipped (device offline)",
-                "librespot Spirc is no longer registered with Spotify Connect",
-            );
             return;
         }
         let Some(pb) = s.playback.as_ref() else {
@@ -1296,8 +1583,53 @@ async fn seek_relative(
     }
 }
 
+async fn skip_track(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>, forward: bool) {
+    if reconnect_if_device_offline(client, state, "skip_track").await {
+        return;
+    }
+    {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("skip_track: skipped (rate-limited)", None);
+            return;
+        }
+    }
+    log::note(
+        "skip_track",
+        Some(if forward { "next" } else { "previous" }),
+    );
+    let result = if forward {
+        client.next_track().await
+    } else {
+        client.previous_track().await
+    };
+    let mut s = state.lock().await;
+    match result {
+        Ok(()) => {
+            // The track has changed; poll will pick up the new one. Clear
+            // the boot guard so the next poll lands.
+            s.last_local_action_ms = now_unix_ms();
+            s.boot = false;
+            s.error = None;
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("skip_track", &msg);
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
+        }
+    }
+}
+
 const DEVICE_OFFLINE_MSG: &str =
-    "Connect device 'hifi' is offline — quit and restart hifi to reconnect";
+    "Connect device 'hifi' is offline — auto-reconnecting (or press ':' → reconnect)";
 
 fn is_device_not_found(msg: &str) -> bool {
     msg.contains("Device not found") || msg.contains("\"status\" : 404")
@@ -1766,6 +2098,39 @@ mod tests {
         let s = state_with_playback(45_000, true);
         let got = displayed_progress_for_toggle(&s);
         assert!(got >= 45_000 && got < 45_500, "got {got}");
+    }
+
+    // --- command menu ---------------------------------------------------
+
+    #[test]
+    fn cmd_filtered_empty_input_returns_all() {
+        let s = CommandState::default();
+        assert_eq!(s.filtered().len(), Cmd::ALL.len());
+    }
+
+    #[test]
+    fn cmd_filtered_case_insensitive_substring() {
+        let mut s = CommandState::default();
+        s.input = "PaUs".into();
+        let got: Vec<&'static str> = s.filtered().iter().map(|c| c.name()).collect();
+        assert!(got.contains(&"play / pause"), "got: {got:?}");
+    }
+
+    #[test]
+    fn cmd_selected_indexes_into_filtered() {
+        let mut s = CommandState::default();
+        s.input = "re".into(); // matches "previous", "reconnect"
+        s.selected = 1;
+        let chosen = s.selected_cmd().expect("must select");
+        let names: Vec<&'static str> = s.filtered().iter().map(|c| c.name()).collect();
+        assert_eq!(chosen.name(), names[1]);
+    }
+
+    #[test]
+    fn cmd_selected_out_of_range_returns_none() {
+        let mut s = CommandState::default();
+        s.selected = 999;
+        assert!(s.selected_cmd().is_none());
     }
 
     #[test]

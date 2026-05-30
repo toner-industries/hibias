@@ -499,8 +499,13 @@ async fn run(
     let mut redraw = tokio::time::interval(Duration::from_millis(100));
 
     loop {
+        // Mirror the client's rate-limit gate into UI state. The client is
+        // the source of truth (`send_logged` writes it on any 429); we just
+        // surface it here for the status line.
+        let client_rl = client.rate_limited_until();
         {
             let mut s = state.lock().await;
+            s.rate_limited_until = client_rl;
             terminal.draw(|f| ui::render(f, &mut s))?;
         }
 
@@ -548,6 +553,14 @@ async fn run(
                             tokio::spawn(async move {
                                 for _ in 0..6 {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
+                                    // The client's send_logged would
+                                    // short-circuit anyway, but bailing the
+                                    // whole burst is cleaner — no point
+                                    // chewing through six instant-fail
+                                    // RateLimited errors.
+                                    if c.rate_limited_until().is_some() {
+                                        break;
+                                    }
                                     if let Ok(pb) = c.get_playback().await {
                                         apply_playback(&s, &a, pb).await;
                                     }
@@ -613,6 +626,7 @@ async fn reconnect_now(
         s.rate_limited_until = None;
         s.error = None;
     }
+    client.clear_rate_limit();
     log::note("reconnect: starting", Some(reason));
 
     // Shut down the existing session (if any). This is fire-and-forget;
@@ -685,6 +699,13 @@ async fn reconnect_if_device_offline(
 async fn wait_then_transfer(client: &SpotifyClient, device_id: &str) {
     for attempt in 0..24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // Bail the whole loop if the rate-limit gate trips mid-probe; we
+        // don't want to keep poking /me/player/devices every 500ms while
+        // we're meant to be backing off.
+        if client.rate_limited_until().is_some() {
+            log::note("wait_then_transfer: aborted (rate-limited)", None);
+            return;
+        }
         match client.get_devices().await {
             Ok(devices) => {
                 let found = devices.iter().find(|d| d.id.as_deref() == Some(device_id));
@@ -702,6 +723,12 @@ async fn wait_then_transfer(client: &SpotifyClient, device_id: &str) {
                     }
                     return;
                 }
+            }
+            // get_devices/transfer_playback returning RateLimited is the
+            // signal that the gate is set; abort and let the user retry.
+            Err(e) if e.downcast_ref::<RateLimited>().is_some() => {
+                log::note("wait_then_transfer: aborted (RateLimited)", None);
+                return;
             }
             Err(e) => log::note("get_devices failed", Some(&format!("{e:#}"))),
         }

@@ -15,6 +15,16 @@ pub struct SpotifyClient {
     // Mutex (not OnceLock) because reconnect replaces the id when a fresh
     // librespot session comes up.
     device_id: Mutex<Option<String>>,
+    /// Single source of truth for the "Spotify told us to back off" state.
+    /// Set by `send_logged` on any 429 response, checked by `send_logged`
+    /// before sending any new request. This is the hard circuit breaker —
+    /// while it's set in the future, no HTTP requests reach Spotify, no
+    /// matter which code path tries (poll loops, user actions, reconnect
+    /// probes, retry bursts).
+    ///
+    /// We learned the hard way that piling extra requests on a 429 turns a
+    /// short server-side back-off into a multi-hour one.
+    rate_limited_until: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,7 +187,33 @@ impl SpotifyClient {
             http: reqwest::Client::builder().build()?,
             auth,
             device_id: Mutex::new(None),
+            rate_limited_until: Mutex::new(None),
         })
+    }
+
+    /// Returns the current rate-limit deadline if one is in effect (i.e. in
+    /// the future). Lazily clears expired deadlines so callers see `None`.
+    pub fn rate_limited_until(&self) -> Option<Instant> {
+        let mut guard = self.rate_limited_until.lock().expect("rate_limit poisoned");
+        match *guard {
+            Some(t) if t > Instant::now() => Some(t),
+            _ => {
+                *guard = None;
+                None
+            }
+        }
+    }
+
+    /// Wipes the rate-limit gate. The user's "get me unstuck" lever — wired
+    /// to `:reconnect`. If Spotify is still rate-limiting us server-side,
+    /// the next 429 will re-set the gate; this just gives the user a try.
+    pub fn clear_rate_limit(&self) {
+        *self.rate_limited_until.lock().expect("rate_limit poisoned") = None;
+    }
+
+    fn note_rate_limit(&self, secs: u64) {
+        *self.rate_limited_until.lock().expect("rate_limit poisoned") =
+            Some(Instant::now() + std::time::Duration::from_secs(secs));
     }
 
     pub fn set_device_id(&self, id: String) {
@@ -206,7 +242,7 @@ impl SpotifyClient {
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
-        let (status, body) = send_logged(req, "GET", &url, None).await?;
+        let (status, body) = self.send_logged(req, "GET", &url, None).await?;
         if status == reqwest::StatusCode::NO_CONTENT || body.is_empty() {
             return Ok(None);
         }
@@ -224,7 +260,7 @@ impl SpotifyClient {
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
-        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
         let page: DevicesPayload = serde_json::from_str(&body).context("parse /me/player/devices")?;
         Ok(page.devices)
     }
@@ -238,7 +274,7 @@ impl SpotifyClient {
             .put(&url)
             .header("Authorization", self.bearer().await?)
             .json(&body);
-        send_logged(req, "PUT", &url, Some(&body.to_string()))
+        self.send_logged(req, "PUT", &url, Some(&body.to_string()))
             .await
             .map(|_| ())
     }
@@ -252,7 +288,7 @@ impl SpotifyClient {
             .put(&url)
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
-        send_logged(req, "PUT", &url, None).await.map(|_| ())
+        self.send_logged(req, "PUT", &url, None).await.map(|_| ())
     }
 
     pub async fn pause(&self) -> Result<()> {
@@ -263,7 +299,7 @@ impl SpotifyClient {
             .put(&url)
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
-        send_logged(req, "PUT", &url, None).await.map(|_| ())
+        self.send_logged(req, "PUT", &url, None).await.map(|_| ())
     }
 
     pub async fn next_track(&self) -> Result<()> {
@@ -274,7 +310,7 @@ impl SpotifyClient {
             .post(&url)
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
-        send_logged(req, "POST", &url, None).await.map(|_| ())
+        self.send_logged(req, "POST", &url, None).await.map(|_| ())
     }
 
     pub async fn previous_track(&self) -> Result<()> {
@@ -285,7 +321,7 @@ impl SpotifyClient {
             .post(&url)
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
-        send_logged(req, "POST", &url, None).await.map(|_| ())
+        self.send_logged(req, "POST", &url, None).await.map(|_| ())
     }
 
     pub async fn play_uris(&self, uris: &[String]) -> Result<()> {
@@ -317,7 +353,7 @@ impl SpotifyClient {
                 None
             }
         };
-        send_logged(req, "PUT", &url, body_str.as_deref())
+        self.send_logged(req, "PUT", &url, body_str.as_deref())
             .await
             .map(|_| ())
     }
@@ -331,7 +367,7 @@ impl SpotifyClient {
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
-        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
         let payload: SearchPayload =
             serde_json::from_str(&body).context("parse /search body")?;
         Ok(SearchResults {
@@ -348,7 +384,7 @@ impl SpotifyClient {
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
-        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
         let page: RecentlyPlayedPage =
             serde_json::from_str(&body).context("parse recently-played")?;
         // Spotify can return the same track multiple times; dedup by uri while
@@ -373,7 +409,7 @@ impl SpotifyClient {
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
-        let (_, body) = send_logged(req, "GET", &url, None).await?;
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
         let page: PlaylistTracksPage =
             serde_json::from_str(&body).context("parse playlist tracks")?;
         Ok(page.items.into_iter().filter_map(|i| i.track).collect())
@@ -390,44 +426,61 @@ pub(crate) fn with_device(url: &str, device_id: Option<&str>) -> String {
     }
 }
 
-async fn send_logged(
-    req: reqwest::RequestBuilder,
-    method: &'static str,
-    url: &str,
-    body_json: Option<&str>,
-) -> Result<(reqwest::StatusCode, String)> {
-    let req_id = log::next_request_id();
-    log::api_req(req_id, method, url, body_json);
-    let started = Instant::now();
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let latency = started.elapsed().as_millis() as i64;
-            log::api_err(req_id, latency, &format!("{e:#}"));
-            return Err(e).with_context(|| format!("{method} {url}"));
+impl SpotifyClient {
+    /// Wrapping send: every HTTP request to Spotify goes through here. This
+    /// is the hard rate-limit gate — if we've already received a 429, we
+    /// short-circuit *without* hitting the network until the deadline
+    /// passes. Callers don't have to remember to check.
+    async fn send_logged(
+        &self,
+        req: reqwest::RequestBuilder,
+        method: &'static str,
+        url: &str,
+        body_json: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        // Pre-flight: are we currently rate-limited?
+        if let Some(until) = self.rate_limited_until() {
+            let secs = until.saturating_duration_since(Instant::now()).as_secs();
+            // Don't even log this at api_req — it never went on the wire.
+            anyhow::bail!(RateLimited(secs.max(1)));
         }
-    };
-    let status = resp.status();
-    let latency = started.elapsed().as_millis() as i64;
 
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry = retry_after_secs(&resp).unwrap_or(30);
-        log::api_resp(
-            req_id,
-            status.as_u16(),
-            latency,
-            Some(&format!("rate-limited; retry-after={retry}s")),
-        );
-        anyhow::bail!(RateLimited(retry));
+        let req_id = log::next_request_id();
+        log::api_req(req_id, method, url, body_json);
+        let started = Instant::now();
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let latency = started.elapsed().as_millis() as i64;
+                log::api_err(req_id, latency, &format!("{e:#}"));
+                return Err(e).with_context(|| format!("{method} {url}"));
+            }
+        };
+        let status = resp.status();
+        let latency = started.elapsed().as_millis() as i64;
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry = retry_after_secs(&resp).unwrap_or(30);
+            // Set the gate immediately so any concurrent in-flight requests
+            // (e.g. from the other poll loop) refuse to fire when they wake.
+            self.note_rate_limit(retry);
+            log::api_resp(
+                req_id,
+                status.as_u16(),
+                latency,
+                Some(&format!("rate-limited; retry-after={retry}s")),
+            );
+            anyhow::bail!(RateLimited(retry));
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        log::api_resp(req_id, status.as_u16(), latency, Some(&body_text));
+
+        if !status.is_success() {
+            anyhow::bail!("{method} {url}: {status}: {body_text}");
+        }
+        Ok((status, body_text))
     }
-
-    let body_text = resp.text().await.unwrap_or_default();
-    log::api_resp(req_id, status.as_u16(), latency, Some(&body_text));
-
-    if !status.is_success() {
-        anyhow::bail!("{method} {url}: {status}: {body_text}");
-    }
-    Ok((status, body_text))
 }
 
 #[derive(Debug)]
@@ -562,5 +615,57 @@ mod tests {
         assert_eq!(out, "https://x.test/path");
         let out = with_device("https://x.test/path", Some(""));
         assert_eq!(out, "https://x.test/path");
+    }
+
+    // --- circuit breaker --------------------------------------------------
+
+    /// Exercise the gate's read/write/auto-clear semantics directly. We
+    /// can't drive the HTTP-level short-circuit without a mock server, so
+    /// these tests pin the state machine that `send_logged` depends on.
+    /// Mirrors the three methods on `SpotifyClient` (`rate_limited_until`,
+    /// `note_rate_limit`, `clear_rate_limit`) one-to-one.
+    fn read_gate(gate: &Mutex<Option<Instant>>) -> Option<Instant> {
+        let mut guard = gate.lock().unwrap();
+        match *guard {
+            Some(t) if t > Instant::now() => Some(t),
+            _ => {
+                *guard = None;
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_gate_returns_none_when_unset() {
+        let gate: Mutex<Option<Instant>> = Mutex::new(None);
+        assert!(read_gate(&gate).is_none());
+    }
+
+    #[test]
+    fn rate_limit_gate_holds_for_future_deadlines() {
+        let gate: Mutex<Option<Instant>> = Mutex::new(Some(
+            Instant::now() + std::time::Duration::from_secs(30),
+        ));
+        assert!(read_gate(&gate).is_some());
+    }
+
+    #[test]
+    fn rate_limit_gate_auto_clears_past_deadlines() {
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("test box must have a 1s old Instant available");
+        let gate: Mutex<Option<Instant>> = Mutex::new(Some(past));
+        assert!(read_gate(&gate).is_none());
+        // Lazy clear: the slot itself should now be None.
+        assert!(gate.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rate_limit_gate_clear_wipes_state() {
+        let gate: Mutex<Option<Instant>> = Mutex::new(Some(
+            Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        *gate.lock().unwrap() = None; // mirrors clear_rate_limit
+        assert!(read_gate(&gate).is_none());
     }
 }

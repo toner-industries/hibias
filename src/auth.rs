@@ -206,11 +206,11 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
     }
 
     let body = if let Some(e) = &error {
-        format!("<h1>Auth failed</h1><p>{e}</p>")
+        render_callback_page(CallbackOutcome::Error(e))
     } else if code.is_some() {
-        "<h1>Logged in</h1><p>You can close this tab.</p>".to_string()
+        render_callback_page(CallbackOutcome::Success)
     } else {
-        "<h1>Bad request</h1>".to_string()
+        render_callback_page(CallbackOutcome::BadRequest)
     };
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -229,6 +229,177 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
         anyhow::bail!("OAuth state mismatch (CSRF guard)");
     }
     Ok(code)
+}
+
+enum CallbackOutcome<'a> {
+    Success,
+    Error(&'a str),
+    BadRequest,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn render_callback_page(outcome: CallbackOutcome<'_>) -> String {
+    // Colors lifted from the TUI: cyan accents, green for success, yellow
+    // for warnings, red for errors. Background mimics a dark terminal.
+    let (title, accent, badge, lines): (&str, &str, &str, Vec<String>) = match outcome {
+        CallbackOutcome::Success => (
+            "hifi · logged in",
+            "#39d353",
+            "[ok]",
+            vec![
+                "Spotify authorization succeeded.".into(),
+                "".into(),
+                "You can close this tab and return to the terminal.".into(),
+            ],
+        ),
+        CallbackOutcome::Error(e) => (
+            "hifi · auth failed",
+            "#f85149",
+            "[err]",
+            vec![
+                "Spotify returned an error during authorization:".into(),
+                "".into(),
+                format!("    {}", html_escape(e)),
+                "".into(),
+                "Close this tab and re-run `just reauth`.".into(),
+            ],
+        ),
+        CallbackOutcome::BadRequest => (
+            "hifi · bad request",
+            "#e3b341",
+            "[warn]",
+            vec![
+                "No authorization code in the callback URL.".into(),
+                "".into(),
+                "Close this tab and re-run `just reauth`.".into(),
+            ],
+        ),
+    };
+
+    let body_html = lines
+        .iter()
+        .map(|l| {
+            if l.is_empty() {
+                "<div class=\"row\">&nbsp;</div>".to_string()
+            } else {
+                format!("<div class=\"row\">{}</div>", l)
+            }
+        })
+        .collect::<String>();
+
+    format!(
+r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+  html, body {{
+    margin: 0;
+    padding: 0;
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 14px;
+    line-height: 1.4;
+    min-height: 100vh;
+  }}
+  body {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    box-sizing: border-box;
+  }}
+  .frame {{
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 16px 20px;
+    min-width: 320px;
+    max-width: 560px;
+    box-shadow: 0 0 0 1px #161b22 inset;
+  }}
+  .titlebar {{
+    color: #8b949e;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 8px;
+    margin-bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+  }}
+  .badge {{
+    color: {accent};
+    font-weight: bold;
+  }}
+  .row {{
+    white-space: pre-wrap;
+    word-break: break-word;
+  }}
+  .footer {{
+    color: #6e7681;
+    margin-top: 14px;
+    padding-top: 8px;
+    border-top: 1px solid #30363d;
+  }}
+  .key {{
+    color: #58a6ff;
+  }}
+  ::selection {{
+    background: #1f6feb;
+    color: #fff;
+  }}
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="titlebar">
+      <span>{title}</span>
+      <span class="badge">{badge}</span>
+    </div>
+    {body_html}
+    <div class="footer">[ <span class="key">close tab</span> ] to dismiss</div>
+  </div>
+</body>
+</html>"#,
+        title = html_escape(title),
+        accent = accent,
+        badge = badge,
+        body_html = body_html,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_callback_pages_for_visual_review() {
+        if std::env::var("HIFI_DUMP_AUTH_PAGES").is_err() {
+            return;
+        }
+        std::fs::write(
+            "/tmp/hifi_auth_success.html",
+            render_callback_page(CallbackOutcome::Success),
+        )
+        .unwrap();
+        std::fs::write(
+            "/tmp/hifi_auth_error.html",
+            render_callback_page(CallbackOutcome::Error("access_denied")),
+        )
+        .unwrap();
+        std::fs::write(
+            "/tmp/hifi_auth_bad.html",
+            render_callback_page(CallbackOutcome::BadRequest),
+        )
+        .unwrap();
+    }
 }
 
 mod pkce {

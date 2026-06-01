@@ -9,7 +9,7 @@ use ratatui_image::StatefulImage;
 use std::time::Instant;
 
 use crate::keys::{self, ModeMask};
-use crate::{AppState, Cmd, CommandState, Mode, SearchState};
+use crate::{AppState, BrowseState, Cmd, CommandState, Mode, SearchState};
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
@@ -55,6 +55,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Mode::Search(search) => render_search_overlay(f, area, search),
         Mode::Help => render_help_overlay(f, area),
         Mode::Command(cmd) => render_command_overlay(f, area, cmd),
+        Mode::Browse(browse) => render_browse_overlay(f, area, browse),
     }
 }
 
@@ -496,6 +497,129 @@ fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[2]);
 }
 
+fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
+    let rect = centered(area, 70, 80);
+    f.render_widget(Clear, rect);
+    let title = format!(" browse · {} ", browse.collection.kind.label());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // name
+            Constraint::Length(1), // subtitle
+            Constraint::Length(1), // hint
+            Constraint::Min(0),    // list
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(browse.collection.name.clone())
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        layout[0],
+    );
+    f.render_widget(
+        Paragraph::new(browse.collection.subtitle.clone())
+            .style(Style::default().fg(Color::DarkGray)),
+        layout[1],
+    );
+
+    let (hint, hint_color) = if browse.loading {
+        ("loading...".to_string(), Color::DarkGray)
+    } else if let Some(e) = &browse.error {
+        if is_browse_forbidden(e) {
+            (
+                format!(
+                    "⚠ Spotify won't let us read this {}'s tracks (API restricted). [p] play whole {} · [esc] back",
+                    browse.collection.kind.label(),
+                    browse.collection.kind.label()
+                ),
+                Color::Yellow,
+            )
+        } else {
+            (format!("error: {e}  ·  [p] play whole {} · [esc] back", browse.collection.kind.label()), Color::Red)
+        }
+    } else {
+        (
+            format!(
+                "{} tracks · ↑/↓ to move · [enter] play · [p] play all · [esc] back",
+                browse.tracks.len()
+            ),
+            Color::DarkGray,
+        )
+    };
+    f.render_widget(
+        Paragraph::new(hint)
+            .style(Style::default().fg(hint_color))
+            .wrap(Wrap { trim: true }),
+        layout[2],
+    );
+
+    // Compute the visible window. We keep the selected index inside it by
+    // centering when possible; long collections scroll smoothly.
+    let list_h = layout[3].height as usize;
+    if list_h == 0 || browse.tracks.is_empty() {
+        return;
+    }
+    let scroll = compute_scroll(browse.selected, browse.tracks.len(), list_h);
+    let end = (scroll + list_h).min(browse.tracks.len());
+
+    let lines: Vec<Line> = browse.tracks[scroll..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, t)| {
+            let idx = scroll + offset;
+            let artists = t
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let label = if artists.is_empty() {
+                format!("  {:>3}. {}", idx + 1, t.name)
+            } else {
+                format!("  {:>3}. {} — {}", idx + 1, t.name, artists)
+            };
+            if idx == browse.selected {
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(label)
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[3]);
+}
+
+/// Heuristic: was this Browse fetch error a Spotify access restriction?
+/// In late 2024 Spotify locked down /playlists/{id}/tracks (and several
+/// other browse endpoints) to apps created before the change; everyone
+/// else gets a 403. We surface this with a different, less alarming hint.
+fn is_browse_forbidden(e: &str) -> bool {
+    e.contains("403 Forbidden")
+        || e.contains("\"status\": 403")
+        || e.contains("\"status\" : 403")
+        || e.contains("Insufficient client scope")
+}
+
+/// Given a selected row, the total number of rows, and the height of the
+/// list area, return the index of the first row to render so that the
+/// selection stays visible (and centered when possible).
+fn compute_scroll(selected: usize, total: usize, list_h: usize) -> usize {
+    if total <= list_h {
+        return 0;
+    }
+    let half = list_h / 2;
+    let max_scroll = total - list_h;
+    selected.saturating_sub(half).min(max_scroll)
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let rows: Vec<&keys::Hotkey> = keys::for_mode(ModeMask::NOW_PLAYING).collect();
     let height = (rows.len() as u16 + 4).min(area.height);
@@ -557,4 +681,37 @@ fn fmt_dur(ms: u64) -> String {
     let m = total_s / 60;
     let s = total_s % 60;
     format!("{m}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forbidden_classifier_matches_403_shapes() {
+        // The real 403 body Spotify sent us when /playlists/{id}/tracks
+        // got locked down.
+        assert!(is_browse_forbidden(
+            "GET https://api.spotify.com/v1/playlists/xyz/tracks: 403 Forbidden: {\"error\": {\"status\": 403, \"message\": \"Forbidden\"}}"
+        ));
+        assert!(is_browse_forbidden("\"status\" : 403"));
+        assert!(is_browse_forbidden("Insufficient client scope"));
+        assert!(!is_browse_forbidden("rate limited; retry after 30s"));
+        assert!(!is_browse_forbidden("connection refused"));
+    }
+
+    #[test]
+    fn compute_scroll_keeps_selection_visible() {
+        // 100 items, list of 10 rows. Selected near the start -> scroll 0.
+        assert_eq!(compute_scroll(0, 100, 10), 0);
+        assert_eq!(compute_scroll(4, 100, 10), 0);
+        // Centering kicks in once the selection passes the midpoint of the
+        // viewport — for list_h=10 the midpoint is 5.
+        assert_eq!(compute_scroll(5, 100, 10), 0);
+        assert_eq!(compute_scroll(10, 100, 10), 5);
+        // Near the end: clamped so we don't scroll past max.
+        assert_eq!(compute_scroll(99, 100, 10), 90);
+        // List fits entirely: no scroll.
+        assert_eq!(compute_scroll(7, 8, 10), 0);
+    }
 }

@@ -22,9 +22,11 @@ mod keys;
 mod log;
 mod recent;
 mod streaming;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
-use api::{Context as PlaybackContext, Playback, RateLimited, SearchResults, SpotifyClient, Track};
+use api::{Context as PlaybackContext, Playback, RateLimited, SearchResults, SpotifyApi, SpotifyClient, Track};
 use keys::ModeMask;
 
 pub struct AppState {
@@ -100,6 +102,7 @@ pub enum Mode {
     Search(SearchState),
     Help,
     Command(CommandState),
+    Browse(BrowseState),
 }
 
 impl Mode {
@@ -109,8 +112,50 @@ impl Mode {
             Mode::Search(_) => ModeMask::SEARCH,
             Mode::Help => ModeMask::HELP,
             Mode::Command(_) => ModeMask::COMMAND,
+            Mode::Browse(_) => ModeMask::BROWSE,
         }
     }
+}
+
+/// Album or playlist metadata, captured at the moment the user hit Enter
+/// on a search row. The tracks themselves are fetched lazily.
+#[derive(Debug, Clone)]
+pub struct Collection {
+    pub kind: CollectionKind,
+    pub uri: String,
+    pub name: String,
+    pub subtitle: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionKind {
+    Album,
+    Playlist,
+}
+
+impl CollectionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CollectionKind::Album => "album",
+            CollectionKind::Playlist => "playlist",
+        }
+    }
+}
+
+pub struct BrowseState {
+    pub collection: Collection,
+    pub tracks: Vec<Track>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub selected: usize,
+    /// First visible track index, for scrolling long collections.
+    pub scroll: usize,
+    /// The Search state we came from, kept here so Esc can restore the
+    /// user's query, results, and selection exactly as they left it.
+    pub prior_search: SearchState,
+    /// Monotonic id so a slow fetch that resolves after the user has
+    /// already navigated away can be dropped instead of clobbering state.
+    pub fetch_id: u64,
 }
 
 /// A discrete action runnable from the command menu.
@@ -266,7 +311,7 @@ async fn main() -> Result<()> {
             return Err(e);
         }
     };
-    let client = Arc::new(SpotifyClient::new(auth)?);
+    let client: Arc<dyn SpotifyApi> = Arc::new(SpotifyClient::new(auth)?);
 
     eprintln!("Probing terminal for image support...");
     let art_loader = Arc::new(art::ArtLoader::new(reqwest::Client::new()));
@@ -374,7 +419,7 @@ fn teardown_terminal(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    client: Arc<SpotifyClient>,
+    client: Arc<dyn SpotifyApi>,
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
 ) -> Result<()> {
@@ -539,6 +584,13 @@ async fn run(
                             spawn_reconnect(&client, &state, "user: :reconnect");
                         }
                         KeyAction::EnterSearch => enter_search(&client, &state).await,
+                        KeyAction::OpenBrowse(coll) => enter_browse(&client, &state, coll).await,
+                        KeyAction::PlayBrowseSelection => {
+                            play_browse_selection(&client, &state, &art_loader).await;
+                        }
+                        KeyAction::PlayBrowseCollection => {
+                            play_browse_collection(&client, &state, &art_loader).await;
+                        }
                         KeyAction::SearchInputChanged => kick_search(&client, &state).await,
                         KeyAction::PlaySelection => {
                             play_selection(&client, &state, &art_loader).await;
@@ -589,7 +641,7 @@ async fn run(
 /// triggers (e.g., auto-watchdog firing while a manual `:reconnect` is
 /// already running).
 fn spawn_reconnect(
-    client: &Arc<SpotifyClient>,
+    client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     reason: &'static str,
 ) {
@@ -604,7 +656,7 @@ fn spawn_reconnect(
 /// Used by both startup and reconnect — single code path keeps the device-id
 /// lifecycle in one place.
 async fn reconnect_now(
-    client: &Arc<SpotifyClient>,
+    client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     reason: &'static str,
 ) {
@@ -661,7 +713,7 @@ async fn reconnect_now(
                 s.streaming = Some(new);
                 s.reconnecting = false;
             }
-            wait_then_transfer(client, &device_id_for_transfer).await;
+            wait_then_transfer(client.as_ref(), &device_id_for_transfer).await;
         }
         Err(e) => {
             let msg = format!("{e:#}");
@@ -678,7 +730,7 @@ async fn reconnect_now(
 /// 404'd anyway, and re-doing the action after reconnect is the user's job
 /// — they're already at the keyboard.
 async fn reconnect_if_device_offline(
-    client: &Arc<SpotifyClient>,
+    client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     caller: &'static str,
 ) -> bool {
@@ -696,7 +748,7 @@ async fn reconnect_if_device_offline(
     offline
 }
 
-async fn wait_then_transfer(client: &SpotifyClient, device_id: &str) {
+async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
     for attempt in 0..24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Bail the whole loop if the rate-limit gate trips mid-probe; we
@@ -745,6 +797,7 @@ fn mode_name(s: &AppState) -> &'static str {
         Mode::Search(_) => "search",
         Mode::Help => "help",
         Mode::Command(_) => "command",
+        Mode::Browse(_) => "browse",
     }
 }
 
@@ -775,6 +828,14 @@ enum KeyAction {
     EnterSearch,
     SearchInputChanged,
     PlaySelection,
+    /// Open the Browse mode loaded with the given album or playlist.
+    OpenBrowse(Collection),
+    /// Play the currently selected track inside the active Browse view.
+    PlayBrowseSelection,
+    /// Play the active Browse collection from the start, ignoring the
+    /// per-track selection. Used when the tracks endpoint is 403'd —
+    /// the user can still kick off playback of the whole album/playlist.
+    PlayBrowseCollection,
     /// Seek the current track by ±N milliseconds.
     Seek(i64),
     NextTrack,
@@ -790,6 +851,8 @@ enum SelectionAction {
     /// Re-run search with this query (selected a row from "Recent searches").
     PromoteQuery(String),
     Play(PlayAction),
+    /// Open an album or playlist to browse its tracks.
+    Browse(Collection),
 }
 
 async fn dispatch_key(
@@ -844,6 +907,7 @@ async fn dispatch_key(
                     KeyAction::SearchInputChanged
                 }
                 Some(SelectionAction::Play(_)) => KeyAction::PlaySelection,
+                Some(SelectionAction::Browse(coll)) => KeyAction::OpenBrowse(coll),
                 None => KeyAction::Stay,
             },
             KeyCode::Backspace => {
@@ -955,6 +1019,38 @@ async fn dispatch_key(
             }
             _ => KeyAction::Stay,
         },
+        Mode::Browse(browse) => match code {
+            KeyCode::Esc => {
+                // Restore the search the user came from.
+                let prior = std::mem::replace(&mut browse.prior_search, SearchState::new(None, Vec::new(), Vec::new()));
+                s.mode = Mode::Search(prior);
+                KeyAction::Stay
+            }
+            KeyCode::Up => {
+                if browse.selected > 0 {
+                    browse.selected -= 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Down => {
+                let max = browse.tracks.len().saturating_sub(1);
+                if browse.selected < max {
+                    browse.selected += 1;
+                }
+                KeyAction::Stay
+            }
+            KeyCode::Enter => {
+                if browse.tracks.is_empty() {
+                    KeyAction::Stay
+                } else {
+                    KeyAction::PlayBrowseSelection
+                }
+            }
+            // "Play the whole album/playlist" — works regardless of whether
+            // the track list loaded.
+            KeyCode::Char('p') => KeyAction::PlayBrowseCollection,
+            _ => KeyAction::Stay,
+        },
     }
 }
 
@@ -1000,7 +1096,7 @@ fn char_idx_to_byte(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-async fn enter_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) {
+async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     let context_uri = {
         let s = state.lock().await;
         s.playback
@@ -1062,7 +1158,255 @@ fn playlist_id_from_uri(uri: &str) -> Option<String> {
     uri.strip_prefix("spotify:playlist:").map(|s| s.to_string())
 }
 
-async fn kick_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) {
+fn album_id_from_uri(uri: &str) -> Option<String> {
+    uri.strip_prefix("spotify:album:").map(|s| s.to_string())
+}
+
+/// Open the Browse overlay for the given collection, taking the current
+/// SearchState with us so Esc can restore it. Kicks off the track fetch in
+/// the background — Browse renders immediately with a "Loading..." placeholder.
+async fn enter_browse(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    collection: Collection,
+) {
+    log::note(
+        "enter_browse",
+        Some(&format!(
+            "kind={} uri={} name={:?}",
+            collection.kind.label(),
+            collection.uri,
+            collection.name
+        )),
+    );
+    let fetch_id = {
+        let mut s = state.lock().await;
+        // Pull the current SearchState out so we can stash it in Browse.
+        let prior = match std::mem::replace(&mut s.mode, Mode::NowPlaying) {
+            Mode::Search(prev) => prev,
+            // Defensive: caller should only invoke from Search.
+            other => {
+                s.mode = other;
+                log::error("enter_browse called outside Search mode", "ignored");
+                return;
+            }
+        };
+        let fetch_id = prior.request_id.wrapping_add(1);
+        s.mode = Mode::Browse(BrowseState {
+            collection: collection.clone(),
+            tracks: Vec::new(),
+            loading: true,
+            error: None,
+            selected: 0,
+            scroll: 0,
+            prior_search: prior,
+            fetch_id,
+        });
+        fetch_id
+    };
+
+    // Fire the fetch.
+    let client = client.clone();
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        let result = match collection.kind {
+            CollectionKind::Album => match album_id_from_uri(&collection.uri) {
+                Some(id) => client.get_album_tracks(&id).await,
+                None => Err(anyhow::anyhow!("bad album uri: {}", collection.uri)),
+            },
+            CollectionKind::Playlist => match playlist_id_from_uri(&collection.uri) {
+                Some(id) => client.get_playlist_tracks(&id).await,
+                None => Err(anyhow::anyhow!("bad playlist uri: {}", collection.uri)),
+            },
+        };
+        let mut s = state_bg.lock().await;
+        let Mode::Browse(browse) = &mut s.mode else {
+            // User navigated away; drop the result.
+            log::note(
+                "browse fetch arrived but not in Browse mode anymore",
+                Some(&collection.uri),
+            );
+            return;
+        };
+        if browse.fetch_id != fetch_id || browse.collection.uri != collection.uri {
+            // Stale fetch — user already opened a different collection.
+            log::note("browse fetch stale", Some(&collection.uri));
+            return;
+        }
+        browse.loading = false;
+        match result {
+            Ok(tracks) => {
+                log::note(
+                    "browse loaded",
+                    Some(&format!("uri={} count={}", collection.uri, tracks.len())),
+                );
+                browse.tracks = tracks;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                log::error("browse fetch", &msg);
+                browse.error = Some(msg);
+            }
+        }
+    });
+}
+
+/// Play the currently-selected track inside the active Browse view, using
+/// the collection as the playback context (so Next/Previous walk the
+/// collection in order).
+async fn play_browse_selection(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    art_loader: &Arc<art::ArtLoader>,
+) {
+    if reconnect_if_device_offline(client, state, "play_browse_selection").await {
+        return;
+    }
+    let (action, synth) = {
+        let s = state.lock().await;
+        let Mode::Browse(browse) = &s.mode else { return };
+        if browse.tracks.is_empty() {
+            return;
+        }
+        let track = match browse.tracks.get(browse.selected) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let offset_uri = match track.uri.clone() {
+            Some(u) => u,
+            None => {
+                log::note("play_browse_selection: track missing uri", None);
+                return;
+            }
+        };
+        let action = PlayAction::Context {
+            uri: browse.collection.uri.clone(),
+            offset: Some(offset_uri),
+        };
+        // Synthesize the now-playing display: stamp the collection name into
+        // the track's album field for albums (it was blank from the API),
+        // so the user sees something sensible while the real poll catches up.
+        let mut track = track;
+        if matches!(browse.collection.kind, CollectionKind::Album) && track.album.name.is_empty() {
+            track.album.name = browse.collection.name.clone();
+        }
+        let synth = Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track),
+            context: Some(api::Context {
+                uri: browse.collection.uri.clone(),
+                kind: browse.collection.kind.label().to_string(),
+            }),
+            timestamp: None,
+        };
+        (action, Some(synth))
+    };
+
+    log::note("play_browse_selection", Some(&format!("{action:?}")));
+    let result = match &action {
+        PlayAction::Context { uri, offset } => {
+            client.play_context(uri, offset.as_deref()).await
+        }
+        // Unreachable — we only construct Context above.
+        PlayAction::Track(_) => unreachable!(),
+    };
+
+    let synth_to_apply = match &result {
+        Ok(()) => {
+            let ts = now_unix_ms();
+            let mut s = state.lock().await;
+            s.error = None;
+            log::mode_change("browse", "now_playing");
+            s.mode = Mode::NowPlaying;
+            s.last_local_action_ms = ts;
+            s.boot = false;
+            synth.map(|mut pb| {
+                pb.timestamp = Some(ts);
+                pb
+            })
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("play_browse_selection", &msg);
+            let mut s = state.lock().await;
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
+            None
+        }
+    };
+    if let Some(pb) = synth_to_apply {
+        apply_playback(state, art_loader, Some(pb)).await;
+    }
+}
+
+/// Play the active Browse collection from the start with no offset. This is
+/// the fallback when `/playlists/{id}/tracks` or `/albums/{id}/tracks` 403s
+/// (Spotify locked these endpoints down for newly-created apps in late
+/// 2024); the user can still kick off playback of the whole thing.
+async fn play_browse_collection(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    art_loader: &Arc<art::ArtLoader>,
+) {
+    if reconnect_if_device_offline(client, state, "play_browse_collection").await {
+        return;
+    }
+    let uri = {
+        let s = state.lock().await;
+        let Mode::Browse(browse) = &s.mode else { return };
+        browse.collection.uri.clone()
+    };
+    log::note("play_browse_collection", Some(&uri));
+    let result = client.play_context(&uri, None).await;
+    match result {
+        Ok(()) => {
+            // No tracks list to synth from — let the next /me/player poll
+            // populate the now-playing display.
+            let ts = now_unix_ms();
+            let mut s = state.lock().await;
+            s.error = None;
+            log::mode_change("browse", "now_playing");
+            s.mode = Mode::NowPlaying;
+            s.last_local_action_ms = ts;
+            s.boot = false;
+            // Force-clear `playback` so the poll's first hit definitely
+            // gets applied (it'll be a different track than the seed).
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("play_browse_collection", &msg);
+            let mut s = state.lock().await;
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
+        }
+    }
+    // Bump a poll burst so we pick up the new track quickly.
+    let c = client.clone();
+    let s = state.clone();
+    let a = art_loader.clone();
+    tokio::spawn(async move {
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if c.rate_limited_until().is_some() {
+                break;
+            }
+            if let Ok(pb) = c.get_playback().await {
+                apply_playback(&s, &a, pb).await;
+            }
+        }
+    });
+}
+
+async fn kick_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     let (q, my_id) = {
         let mut s = state.lock().await;
         let Mode::Search(search) = &mut s.mode else {
@@ -1154,7 +1498,7 @@ async fn kick_search(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) 
 }
 
 async fn play_selection(
-    client: &Arc<SpotifyClient>,
+    client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     art_loader: &Arc<art::ArtLoader>,
 ) {
@@ -1176,6 +1520,11 @@ async fn play_selection(
                 // PromoteQuery is handled in dispatch_key before
                 // PlaySelection is requested; defensive guard.
                 log::note("play_selection: skipped (promote-query selection)", None);
+                return;
+            }
+            Some(SelectionAction::Browse(_)) => {
+                // Browse is routed via KeyAction::OpenBrowse, not PlaySelection.
+                log::note("play_selection: skipped (browse selection)", None);
                 return;
             }
             None => {
@@ -1317,7 +1666,75 @@ fn resolve_full_selection(s: &SearchState) -> Option<SelectionAction> {
         }
         return None;
     }
+    // Albums and playlists open Browse instead of playing straight away.
+    if let Some(coll) = resolve_collection_to_browse(s) {
+        return Some(SelectionAction::Browse(coll));
+    }
     resolve_selection(s).map(SelectionAction::Play)
+}
+
+/// If the current selection points at an album or playlist row in the
+/// search results, return that collection's metadata. Otherwise None —
+/// e.g. tracks, artists, and in-context rows fall through to play directly.
+fn resolve_collection_to_browse(s: &SearchState) -> Option<Collection> {
+    let mut idx = s.selected;
+    if let Some(ctx) = &s.in_context {
+        if idx < ctx.filtered.len() {
+            return None;
+        }
+        idx -= ctx.filtered.len();
+    }
+    if idx < s.results.tracks.len() {
+        return None;
+    }
+    idx -= s.results.tracks.len();
+    if idx < s.results.albums.len() {
+        let a = &s.results.albums[idx];
+        let uri = a.uri.clone()?;
+        let subtitle = a
+            .artists
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(Collection {
+            kind: CollectionKind::Album,
+            uri,
+            name: a.name.clone(),
+            subtitle: if subtitle.is_empty() {
+                "album".to_string()
+            } else {
+                format!("album · {subtitle}")
+            },
+        });
+    }
+    idx -= s.results.albums.len();
+    if idx < s.results.artists.len() {
+        // Artists still play directly (Spotify's "play artist context" picks
+        // top tracks). Browsing an artist would need a different endpoint
+        // (top tracks vs albums) — out of scope for now.
+        return None;
+    }
+    idx -= s.results.artists.len();
+    if idx < s.results.playlists.len() {
+        let p = &s.results.playlists[idx];
+        let owner = p
+            .owner
+            .as_ref()
+            .and_then(|o| o.display_name.clone())
+            .unwrap_or_default();
+        return Some(Collection {
+            kind: CollectionKind::Playlist,
+            uri: p.uri.clone(),
+            name: p.name.clone(),
+            subtitle: if owner.is_empty() {
+                "playlist".to_string()
+            } else {
+                format!("playlist · {owner}")
+            },
+        });
+    }
+    None
 }
 
 fn resolve_selection(s: &SearchState) -> Option<PlayAction> {
@@ -1490,7 +1907,7 @@ async fn apply_playback_inner(
     }
 }
 
-async fn toggle_playback(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>) {
+async fn toggle_playback(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     if reconnect_if_device_offline(client, state, "toggle_playback").await {
         return;
     }
@@ -1549,7 +1966,7 @@ async fn toggle_playback(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState
 }
 
 async fn seek_relative(
-    client: &Arc<SpotifyClient>,
+    client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     delta_ms: i64,
 ) {
@@ -1610,7 +2027,7 @@ async fn seek_relative(
     }
 }
 
-async fn skip_track(client: &Arc<SpotifyClient>, state: &Arc<Mutex<AppState>>, forward: bool) {
+async fn skip_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>, forward: bool) {
     if reconnect_if_device_offline(client, state, "skip_track").await {
         return;
     }
@@ -2127,6 +2544,108 @@ mod tests {
         assert!(got >= 45_000 && got < 45_500, "got {got}");
     }
 
+    // --- browse routing -------------------------------------------------
+
+    #[test]
+    fn resolve_album_row_returns_browse_action() {
+        let mut s = search_state_with_results(SearchResults {
+            albums: vec![Album {
+                uri: Some("spotify:album:abc".into()),
+                name: "Some Album".into(),
+                artists: vec![Artist {
+                    uri: None,
+                    name: "Artist X".into(),
+                }],
+                images: vec![],
+            }],
+            ..Default::default()
+        });
+        // Non-empty input so showing_recents() is false and we hit the
+        // results branch.
+        s.input = "x".into();
+        s.selected = 0;
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::Browse(c)) => {
+                assert_eq!(c.uri, "spotify:album:abc");
+                assert!(matches!(c.kind, CollectionKind::Album));
+                assert_eq!(c.name, "Some Album");
+                assert!(c.subtitle.contains("Artist X"), "got: {}", c.subtitle);
+            }
+            other => panic!("expected Browse(album), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_playlist_row_returns_browse_action() {
+        let mut s = search_state_with_results(SearchResults {
+            playlists: vec![Playlist {
+                uri: "spotify:playlist:p1".into(),
+                name: "Mix".into(),
+                owner: Some(api::PlaylistOwner {
+                    display_name: Some("alice".into()),
+                }),
+            }],
+            ..Default::default()
+        });
+        s.input = "x".into();
+        s.selected = 0;
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::Browse(c)) => {
+                assert_eq!(c.uri, "spotify:playlist:p1");
+                assert!(matches!(c.kind, CollectionKind::Playlist));
+                assert!(c.subtitle.contains("alice"), "got: {}", c.subtitle);
+            }
+            other => panic!("expected Browse(playlist), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_track_row_still_plays_not_browses() {
+        let mut s = search_state_with_results(SearchResults {
+            tracks: vec![track("spotify:track:t1", "T1")],
+            ..Default::default()
+        });
+        s.input = "x".into();
+        // selected=0 is the track row; should remain a Play action.
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::Play(PlayAction::Track(uri))) => {
+                assert_eq!(uri, "spotify:track:t1");
+            }
+            other => panic!("expected Play(Track), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_artist_row_still_plays_not_browses() {
+        // Artists should keep playing directly (top-tracks context) since
+        // there's no album-level browse to open.
+        let mut s = search_state_with_results(SearchResults {
+            artists: vec![Artist {
+                uri: Some("spotify:artist:a1".into()),
+                name: "AR".into(),
+            }],
+            ..Default::default()
+        });
+        s.input = "x".into();
+        s.selected = 0;
+        match resolve_full_selection(&s) {
+            Some(SelectionAction::Play(PlayAction::Context { uri, offset })) => {
+                assert_eq!(uri, "spotify:artist:a1");
+                assert!(offset.is_none());
+            }
+            other => panic!("expected Play(Context for artist), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn album_id_from_uri_extracts() {
+        assert_eq!(
+            album_id_from_uri("spotify:album:xyz"),
+            Some("xyz".to_string())
+        );
+        assert!(album_id_from_uri("spotify:playlist:xyz").is_none());
+    }
+
     // --- command menu ---------------------------------------------------
 
     #[test]
@@ -2167,5 +2686,338 @@ mod tests {
         ));
         assert!(is_device_not_found("{\"error\": {\"status\" : 404, \"message\" : \"x\"}}"));
         assert!(!is_device_not_found("rate limited"));
+    }
+
+    // ====================================================================
+    // End-to-end scenarios driven through the Harness (test_support.rs).
+    //
+    // Each test wires up a `FakeSpotify`, programs the responses the
+    // scenario needs, then drives keypresses through `dispatch_key` +
+    // action handlers — the same paths the run loop uses in production.
+    // Assertions look at the resulting `AppState` and at the rendered UI
+    // (via ratatui's `TestBackend`).
+    // ====================================================================
+
+    use crate::test_support::{Call, Harness};
+
+    fn dummy_album(uri: &str, name: &str, artist: &str) -> Album {
+        Album {
+            uri: Some(uri.into()),
+            name: name.into(),
+            artists: vec![Artist {
+                uri: None,
+                name: artist.into(),
+            }],
+            images: vec![],
+        }
+    }
+
+    fn dummy_playlist(uri: &str, name: &str, owner: &str) -> Playlist {
+        Playlist {
+            uri: uri.into(),
+            name: name.into(),
+            owner: Some(api::PlaylistOwner {
+                display_name: Some(owner.into()),
+            }),
+        }
+    }
+
+    /// The exact scenario the user just hit:
+    ///   1. search for "power"
+    ///   2. arrow down to a playlist row
+    ///   3. press Enter to open Browse
+    ///   4. Spotify 403s the `/playlists/{id}/tracks` endpoint
+    ///   5. the Browse overlay shows a friendly yellow warning and
+    ///      offers `p` to play the whole playlist
+    #[tokio::test]
+    async fn playlist_browse_403_shows_friendly_error_and_offers_p_fallback() {
+        let h = Harness::new();
+        // The search returns one playlist row.
+        h.fake.set_search(
+            "power",
+            Ok(SearchResults {
+                playlists: vec![dummy_playlist(
+                    "spotify:playlist:abc123",
+                    "POWER",
+                    "chrisbolin",
+                )],
+                ..Default::default()
+            }),
+        );
+        // The playlist-tracks fetch fails with Spotify's actual 403 body.
+        h.fake.set_playlist_tracks(
+            "abc123",
+            Err("GET https://api.spotify.com/v1/playlists/abc123/tracks: 403 Forbidden: {\"error\": {\"status\": 403, \"message\": \"Forbidden\"}}".into()),
+        );
+
+        // Drive the flow.
+        h.press_and_run(KeyCode::Char('/')).await; // open search
+        h.type_str("power").await; // each char triggers a debounce
+        h.settle().await; // let the debounce fire
+        h.press_and_run(KeyCode::Down).await; // move off track row to playlist row
+        h.press_and_run(KeyCode::Enter).await; // open browse
+        h.settle().await; // let the playlist-tracks fetch resolve
+
+        // State assertions.
+        assert_eq!(h.mode_name().await, "browse");
+        {
+            let s = h.state.lock().await;
+            let Mode::Browse(b) = &s.mode else {
+                panic!("expected Mode::Browse, got {}", mode_name(&s));
+            };
+            assert!(!b.loading, "loading flag should be cleared");
+            assert!(b.error.is_some(), "error should be populated on 403");
+            let e = b.error.as_ref().unwrap();
+            assert!(e.contains("403"), "error must mention 403, got: {e}");
+        }
+
+        // UI assertion: rendered screen contains the friendly hint.
+        let screen = h.snapshot().await;
+        assert!(
+            screen.contains("Spotify won't let us read this playlist's tracks"),
+            "expected friendly hint in:\n{screen}"
+        );
+        assert!(
+            screen.contains("[p] play whole"),
+            "expected fallback hint in:\n{screen}"
+        );
+
+        // And that the fake actually saw the playlist-tracks call (not the
+        // album-tracks endpoint).
+        let calls = h.fake.calls();
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::GetPlaylistTracks(id) if id == "abc123")),
+            "calls: {calls:?}"
+        );
+    }
+
+    /// Inverse of the above: when the fetch succeeds, Browse shows the
+    /// tracks and the regular hint, not the warning.
+    #[tokio::test]
+    async fn album_browse_success_shows_track_list() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "test",
+            Ok(SearchResults {
+                albums: vec![dummy_album("spotify:album:al1", "Test Album", "Test Artist")],
+                ..Default::default()
+            }),
+        );
+        h.fake.set_album_tracks(
+            "al1",
+            Ok(vec![
+                track("spotify:track:a", "Track One"),
+                track("spotify:track:b", "Track Two"),
+                track("spotify:track:c", "Track Three"),
+            ]),
+        );
+
+        h.press_and_run(KeyCode::Char('/')).await;
+        h.type_str("test").await;
+        h.settle().await;
+        h.press_and_run(KeyCode::Enter).await; // album is first row -> Browse
+        h.settle().await;
+
+        let s = h.state.lock().await;
+        let Mode::Browse(b) = &s.mode else {
+            panic!("expected Browse");
+        };
+        assert!(!b.loading);
+        assert!(b.error.is_none(), "no error expected, got {:?}", b.error);
+        assert_eq!(b.tracks.len(), 3);
+        assert_eq!(b.collection.name, "Test Album");
+    }
+
+    /// Pressing `p` inside Browse plays the whole collection via
+    /// `play_context` with no offset — even when tracks haven't loaded.
+    #[tokio::test]
+    async fn p_in_browse_plays_whole_collection() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "x",
+            Ok(SearchResults {
+                playlists: vec![dummy_playlist("spotify:playlist:xyz", "Mix", "alice")],
+                ..Default::default()
+            }),
+        );
+        // Playlist-tracks 403s — but that doesn't block `p`.
+        h.fake.set_playlist_tracks("xyz", Err("403 Forbidden".into()));
+
+        h.press_and_run(KeyCode::Char('/')).await;
+        h.type_str("x").await;
+        h.settle().await;
+        h.press_and_run(KeyCode::Enter).await;
+        h.settle().await;
+
+        // Now press `p` to play the whole playlist.
+        h.fake.clear_calls();
+        h.press_and_run(KeyCode::Char('p')).await;
+        h.settle().await;
+
+        let calls = h.fake.calls();
+        let played = calls.iter().find_map(|c| match c {
+            Call::PlayContext { uri, offset } => Some((uri.clone(), offset.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            played,
+            Some(("spotify:playlist:xyz".into(), None)),
+            "expected play_context(playlist, None), all calls: {calls:?}"
+        );
+        // And the mode flips back to NowPlaying.
+        assert_eq!(h.mode_name().await, "now_playing");
+    }
+
+    /// Enter on a track row in Browse plays via play_context with the
+    /// track's URI as the offset (so Next/Previous walk the collection).
+    #[tokio::test]
+    async fn enter_in_browse_plays_selected_with_context_offset() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "x",
+            Ok(SearchResults {
+                albums: vec![dummy_album("spotify:album:al1", "Album", "Artist")],
+                ..Default::default()
+            }),
+        );
+        h.fake.set_album_tracks(
+            "al1",
+            Ok(vec![
+                track("spotify:track:t0", "T0"),
+                track("spotify:track:t1", "T1"),
+                track("spotify:track:t2", "T2"),
+            ]),
+        );
+
+        h.press_and_run(KeyCode::Char('/')).await;
+        h.type_str("x").await;
+        h.settle().await;
+        h.press_and_run(KeyCode::Enter).await; // open browse
+        h.settle().await;
+
+        // Move down twice and pick T2.
+        h.press_and_run(KeyCode::Down).await;
+        h.press_and_run(KeyCode::Down).await;
+        h.fake.clear_calls();
+        h.press_and_run(KeyCode::Enter).await;
+        h.settle().await;
+
+        let calls = h.fake.calls();
+        let played = calls.iter().find_map(|c| match c {
+            Call::PlayContext { uri, offset } => Some((uri.clone(), offset.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            played,
+            Some((
+                "spotify:album:al1".into(),
+                Some("spotify:track:t2".into()),
+            )),
+            "got calls: {calls:?}"
+        );
+    }
+
+    /// Esc inside Browse returns to the search the user came from, with
+    /// the query, results, and selection intact.
+    #[tokio::test]
+    async fn esc_in_browse_restores_prior_search() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "x",
+            Ok(SearchResults {
+                albums: vec![dummy_album("spotify:album:al1", "A", "Art")],
+                ..Default::default()
+            }),
+        );
+        h.fake.set_album_tracks("al1", Ok(vec![]));
+
+        h.press_and_run(KeyCode::Char('/')).await;
+        h.type_str("x").await;
+        h.settle().await;
+        h.press_and_run(KeyCode::Enter).await;
+        h.settle().await;
+        assert_eq!(h.mode_name().await, "browse");
+
+        h.press_and_run(KeyCode::Esc).await;
+        assert_eq!(h.mode_name().await, "search");
+
+        let s = h.state.lock().await;
+        let Mode::Search(search) = &s.mode else {
+            panic!();
+        };
+        assert_eq!(search.input, "x");
+        assert_eq!(search.results.albums.len(), 1);
+    }
+
+    /// The rate-limit gate, when set, prevents user actions from hitting
+    /// the API. Confirms the circuit breaker is wired all the way through
+    /// the action handler layer (not just the HTTP layer).
+    #[tokio::test]
+    async fn rate_limited_state_blocks_play_pause() {
+        let h = Harness::new();
+        // Seed a playback (paused) so toggle has something to flip.
+        h.seed_playback(Playback {
+            is_playing: false,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:x", "X")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        }).await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+            s.rate_limited_until = Some(Instant::now() + Duration::from_secs(300));
+        }
+        h.fake.clear_calls();
+        h.press_and_run(KeyCode::Char(' ')).await;
+
+        let calls = h.fake.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Play | Call::Pause)),
+            "expected no Play/Pause calls while rate-limited, got: {calls:?}"
+        );
+    }
+
+    /// The status line surfaces the rate-limit countdown.
+    #[tokio::test]
+    async fn rate_limited_ui_shows_countdown() {
+        let h = Harness::new();
+        {
+            let mut s = h.state.lock().await;
+            s.rate_limited_until = Some(Instant::now() + Duration::from_secs(120));
+        }
+        let screen = h.snapshot().await;
+        assert!(
+            screen.contains("rate limited"),
+            "expected rate-limit hint in:\n{screen}"
+        );
+    }
+
+    /// Search → Enter on a track row plays it directly (no Browse opens).
+    #[tokio::test]
+    async fn enter_on_track_row_plays_directly() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "rock",
+            Ok(SearchResults {
+                tracks: vec![track("spotify:track:hit", "Hit")],
+                ..Default::default()
+            }),
+        );
+
+        h.press_and_run(KeyCode::Char('/')).await;
+        h.type_str("rock").await;
+        h.settle().await;
+        h.fake.clear_calls();
+        h.press_and_run(KeyCode::Enter).await;
+        h.settle().await;
+
+        let calls = h.fake.calls();
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::PlayUris(uris) if uris == &["spotify:track:hit".to_string()])),
+            "expected PlayUris call, got: {calls:?}"
+        );
+        // And we're back in NowPlaying.
+        assert_eq!(h.mode_name().await, "now_playing");
     }
 }

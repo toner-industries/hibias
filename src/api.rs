@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Mutex;
@@ -58,6 +59,10 @@ pub struct Track {
     pub duration_ms: u64,
     #[serde(default)]
     pub artists: Vec<Artist>,
+    // `/albums/{id}/tracks` returns Track objects without a nested `album`
+    // (the caller already knows it). Default to a blank Album so the parse
+    // doesn't fail on those responses; callers that care fill it in.
+    #[serde(default)]
     pub album: Album,
 }
 
@@ -68,10 +73,11 @@ pub struct Artist {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Album {
     #[serde(default)]
     pub uri: Option<String>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub artists: Vec<Artist>,
@@ -170,6 +176,12 @@ struct RecentlyPlayedItem {
 }
 
 #[derive(Debug, Deserialize)]
+struct AlbumTracksPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<Track>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PlaylistTracksPage {
     #[serde(default = "Vec::new")]
     items: Vec<PlaylistTrackItem>,
@@ -179,6 +191,95 @@ struct PlaylistTracksPage {
 struct PlaylistTrackItem {
     #[serde(default)]
     track: Option<Track>,
+}
+
+/// The set of Spotify operations the rest of the app needs. Splitting this
+/// out lets tests inject a `FakeSpotify` (see `test_support`) that returns
+/// programmed responses without touching the wire — every action handler
+/// and the run loop is generic over this trait.
+#[async_trait]
+pub trait SpotifyApi: Send + Sync {
+    fn set_device_id(&self, id: String);
+    fn clear_device_id(&self);
+    fn device_id_for_log(&self) -> Option<String>;
+    fn rate_limited_until(&self) -> Option<Instant>;
+    fn clear_rate_limit(&self);
+
+    async fn get_playback(&self) -> Result<Option<Playback>>;
+    async fn play(&self) -> Result<()>;
+    async fn pause(&self) -> Result<()>;
+    async fn get_devices(&self) -> Result<Vec<Device>>;
+    async fn transfer_playback(&self, device_id: &str, play: bool) -> Result<()>;
+    async fn seek_to(&self, position_ms: u64) -> Result<()>;
+    async fn next_track(&self) -> Result<()>;
+    async fn previous_track(&self) -> Result<()>;
+    async fn play_uris(&self, uris: &[String]) -> Result<()>;
+    async fn play_context(&self, context_uri: &str, offset_uri: Option<&str>) -> Result<()>;
+    async fn search(&self, q: &str) -> Result<SearchResults>;
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>>;
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
+    async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>>;
+}
+
+#[async_trait]
+impl SpotifyApi for SpotifyClient {
+    fn set_device_id(&self, id: String) {
+        SpotifyClient::set_device_id(self, id)
+    }
+    fn clear_device_id(&self) {
+        SpotifyClient::clear_device_id(self)
+    }
+    fn device_id_for_log(&self) -> Option<String> {
+        SpotifyClient::device_id_for_log(self)
+    }
+    fn rate_limited_until(&self) -> Option<Instant> {
+        SpotifyClient::rate_limited_until(self)
+    }
+    fn clear_rate_limit(&self) {
+        SpotifyClient::clear_rate_limit(self)
+    }
+    async fn get_playback(&self) -> Result<Option<Playback>> {
+        SpotifyClient::get_playback(self).await
+    }
+    async fn play(&self) -> Result<()> {
+        SpotifyClient::play(self).await
+    }
+    async fn pause(&self) -> Result<()> {
+        SpotifyClient::pause(self).await
+    }
+    async fn get_devices(&self) -> Result<Vec<Device>> {
+        SpotifyClient::get_devices(self).await
+    }
+    async fn transfer_playback(&self, device_id: &str, play: bool) -> Result<()> {
+        SpotifyClient::transfer_playback(self, device_id, play).await
+    }
+    async fn seek_to(&self, position_ms: u64) -> Result<()> {
+        SpotifyClient::seek_to(self, position_ms).await
+    }
+    async fn next_track(&self) -> Result<()> {
+        SpotifyClient::next_track(self).await
+    }
+    async fn previous_track(&self) -> Result<()> {
+        SpotifyClient::previous_track(self).await
+    }
+    async fn play_uris(&self, uris: &[String]) -> Result<()> {
+        SpotifyClient::play_uris(self, uris).await
+    }
+    async fn play_context(&self, context_uri: &str, offset_uri: Option<&str>) -> Result<()> {
+        SpotifyClient::play_context(self, context_uri, offset_uri).await
+    }
+    async fn search(&self, q: &str) -> Result<SearchResults> {
+        SpotifyClient::search(self, q).await
+    }
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
+        SpotifyClient::get_album_tracks(self, album_id).await
+    }
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        SpotifyClient::get_playlist_tracks(self, playlist_id).await
+    }
+    async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>> {
+        SpotifyClient::get_recently_played(self, limit).await
+    }
 }
 
 impl SpotifyClient {
@@ -398,6 +499,21 @@ impl SpotifyClient {
             }
         }
         Ok(out)
+    }
+
+    pub async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
+        // The /albums/{id}/tracks endpoint returns Track objects without a
+        // nested `album` (Track defaults that field). Limit 50 is plenty
+        // for personal use.
+        let url = format!("{BASE}/albums/{album_id}/tracks?limit=50");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let page: AlbumTracksPage =
+            serde_json::from_str(&body).context("parse album tracks")?;
+        Ok(page.items)
     }
 
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {

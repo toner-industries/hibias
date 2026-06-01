@@ -6,6 +6,7 @@ default-run = "hifi"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs-next = "2"

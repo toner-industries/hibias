@@ -11,8 +11,23 @@ use std::time::Instant;
 use crate::app::{AppState, BrowseState, Cmd, CommandState, Mode, SearchState};
 use crate::keys::{self, ModeMask};
 
+/// Fixed canvas size. Layouts compute against this regardless of the actual
+/// terminal dimensions, so the UI doesn't reflow as the user resizes.
+/// Terminals larger than this leave the surrounding cells empty; smaller
+/// terminals clip the bottom-right.
+pub const FIXED_W: u16 = 96;
+pub const FIXED_H: u16 = 40;
+
 pub fn render(f: &mut Frame, state: &mut AppState) {
-    let area = f.area();
+    // Pin to a fixed-size top-left rect — ratatui silently clips writes
+    // that fall outside the terminal buffer, so a smaller terminal just
+    // crops the canvas instead of rearranging the layout.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: FIXED_W,
+        height: FIXED_H,
+    };
     let title = match (state.reconnecting, &state.device_name, &state.streaming_failed) {
         (true, _, _) => " hifi · reconnecting... ".to_string(),
         (false, Some(name), _) => format!(" hifi · device: {name} "),
@@ -99,7 +114,15 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
 }
 
 fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {
-    let want_art = state.art.is_some() && area.width >= 50 && area.height >= 4;
+    // Only show art alongside a real track. apply_playback_inner already
+    // wipes `art` when the track clears, but tying both conditions here
+    // keeps the rendering invariant local to this function.
+    let has_track = state
+        .playback
+        .as_ref()
+        .and_then(|p| p.item.as_ref())
+        .is_some();
+    let want_art = state.art.is_some() && has_track && area.width >= 50 && area.height >= 4;
     if !want_art {
         render_info(f, area, state);
         return;
@@ -120,7 +143,13 @@ fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
-    let Some(pb) = &state.playback else {
+    // `apply_playback_inner` filters out item-less Playbacks before they
+    // reach state, but treating `playback: Some(pb { item: None })` as
+    // equivalent to `playback: None` here too means a regression in the
+    // filter can't surface as the old "Track info unavailable + stale art"
+    // hybrid.
+    let track = state.playback.as_ref().and_then(|p| p.item.as_ref());
+    let Some(track) = track else {
         let msg = if state.device_name.is_none() && state.streaming_failed.is_none() {
             "Connecting to Spotify...\n\nStarting the 'hifi' Connect device — this usually takes a couple of seconds."
         } else {
@@ -128,11 +157,6 @@ fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
         };
         let p = Paragraph::new(msg).alignment(Alignment::Left);
         f.render_widget(p, area);
-        return;
-    };
-
-    let Some(track) = &pb.item else {
-        f.render_widget(Paragraph::new("Track info unavailable."), area);
         return;
     };
 
@@ -192,6 +216,11 @@ fn render_footer(f: &mut Frame, area: Rect, mode: ModeMask) {
     let mut spans = Vec::new();
     let mut first = true;
     for h in keys::for_mode(mode) {
+        // ctrl-c lives in the help overlay; surfacing it in every mode's
+        // footer just eats horizontal room at the fixed canvas width.
+        if h.key == "ctrl-c" {
+            continue;
+        }
         if !first {
             spans.push(Span::raw("   "));
         }
@@ -229,18 +258,20 @@ fn render_search_overlay(f: &mut Frame, area: Rect, s: &SearchState) {
         if total == 0 {
             "type to search · esc to close".to_string()
         } else {
-            "type to search · ↑/↓ to pick · enter to play / re-run · esc to close".to_string()
+            "↑/↓ pick · enter play/re-run · esc close".to_string()
         }
     } else if loading {
         if s.last_query.is_empty() {
             "loading…".to_string()
         } else {
-            format!("loading… (showing \"{}\")", s.last_query)
+            let q = truncate_for_hint(&s.last_query, 40);
+            format!("loading… (showing \"{q}\")")
         }
     } else if total == 0 {
-        format!("no results for \"{}\"", s.input)
+        let q = truncate_for_hint(&s.input, 45);
+        format!("no results for \"{q}\"")
     } else {
-        format!("{total} results · ↑/↓ to move · enter to play · esc to close")
+        format!("{total} results · ↑/↓ move · enter play · esc close")
     };
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
@@ -307,7 +338,9 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                 s.selected,
             );
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        // No wrap — long row labels clip at the right edge instead of
+        // taking up two rows each and pushing later rows off-screen.
+        f.render_widget(Paragraph::new(lines), area);
         return;
     }
 
@@ -370,7 +403,7 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         s.selected,
     );
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn push_header(lines: &mut Vec<Line>, text: &str) {
@@ -501,7 +534,7 @@ fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
             }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[2]);
+    f.render_widget(Paragraph::new(lines), layout[2]);
 }
 
 fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
@@ -536,24 +569,20 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
     let (hint, hint_color) = if browse.loading {
         ("loading...".to_string(), Color::DarkGray)
     } else if let Some(e) = &browse.error {
+        // [p] play / [esc] back are already in the mode's footer, no need
+        // to repeat them in the hint and crowd out the actual message.
         if is_browse_forbidden(e) {
             (
-                format!(
-                    "⚠ Spotify won't let us read this {}'s tracks (API restricted). [p] play whole {} · [esc] back",
-                    browse.collection.kind.label(),
-                    browse.collection.kind.label()
-                ),
+                format!("⚠ Spotify locked this {} (API) — [p] plays anyway", browse.collection.kind.label()),
                 Color::Yellow,
             )
         } else {
-            (format!("error: {e}  ·  [p] play whole {} · [esc] back", browse.collection.kind.label()), Color::Red)
+            let short = truncate_for_hint(e, 50);
+            (format!("error: {short}"), Color::Red)
         }
     } else {
         (
-            format!(
-                "{} tracks · ↑/↓ to move · [enter] play · [p] play all · [esc] back",
-                browse.tracks.len()
-            ),
+            format!("{} tracks", browse.tracks.len()),
             Color::DarkGray,
         )
     };
@@ -601,7 +630,7 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
             }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[3]);
+    f.render_widget(Paragraph::new(lines), layout[3]);
 }
 
 /// Heuristic: was this Browse fetch error a Spotify access restriction?
@@ -669,6 +698,17 @@ fn centered_exact(area: Rect, w: u16, h: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect { x, y, width: w, height: h }
+}
+
+/// Cap a user-provided string to N chars, with an ellipsis. Used in hints
+/// so long queries don't push the surrounding hint text off-canvas.
+fn truncate_for_hint(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 fn displayed_progress(s: &AppState) -> u64 {

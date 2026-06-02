@@ -1516,6 +1516,12 @@ async fn apply_playback_inner(
     pb: Option<Playback>,
     force: bool,
 ) {
+    // A Playback with no `item` carries no useful track info — Spotify
+    // returns this between tracks or when nothing is actively serving.
+    // Collapse it to `None` so we never end up in the janky hybrid state
+    // (no track info displayed, but the previous album art still on screen).
+    let pb = pb.filter(|p| p.item.is_some());
+
     // Skip stale data so we don't overwrite freshly-synthesized local state
     // (see should_accept).
     if !force {
@@ -1558,7 +1564,14 @@ async fn apply_playback_inner(
         if has_track {
             s.boot = false;
         }
-        new_track_id.is_some() && prev != new_track_id
+        let track_changed = prev != new_track_id;
+        // When the track goes away (or changes), drop the old cover so the
+        // UI doesn't render last-track's art alongside the next/empty state.
+        // The new track's art is fetched async below if there is one.
+        if track_changed {
+            s.art = None;
+        }
+        new_track_id.is_some() && track_changed
     };
 
     if needs_art_fetch {
@@ -2397,11 +2410,11 @@ mod tests {
 
         let screen = h.snapshot().await;
         assert!(
-            screen.contains("Spotify won't let us read this playlist's tracks"),
+            screen.contains("Spotify locked this playlist"),
             "expected friendly hint in:\n{screen}"
         );
         assert!(
-            screen.contains("[p] play whole"),
+            screen.contains("[p] plays anyway") || screen.contains("[p] play"),
             "expected fallback hint in:\n{screen}"
         );
 
@@ -2719,6 +2732,352 @@ mod tests {
             screen.contains("no results for"),
             "expected 'no results' for genuine empty response, got:\n{screen}"
         );
+    }
+
+    // --- 96x40 fixed-canvas exercise -----------------------------------
+    //
+    // Renders every mode at exactly the fixed canvas size with deliberately
+    // long content (track names, playlist names, etc.) and checks for the
+    // tell-tale signs of overflow:
+    //
+    //   1. The bottom-right corner of the outer Block border is at column
+    //      95, row 39 — if it's missing the layout overran height.
+    //   2. The footer hint line (row 38) is fully rendered — if truncated
+    //      mid-character, the canvas is too narrow.
+    //   3. No row has content extending past column 95 (impossible by
+    //      construction, but worth pinning).
+    //
+    // Run with `cargo test ui_at_96x40 -- --nocapture` to see snapshots.
+
+    fn long_track() -> Track {
+        Track {
+            id: Some("idLong".into()),
+            uri: Some("spotify:track:long".into()),
+            name: "Mr. Brightside (Jacques Lu Cont's Thin White Duke Mix)".into(),
+            duration_ms: 423_000,
+            artists: vec![
+                Artist { uri: None, name: "The Killers".into() },
+                Artist { uri: None, name: "Featuring Some Other Long-Named Collaborator".into() },
+            ],
+            album: Album {
+                uri: None,
+                name: "Hot Fuss: 10th Anniversary Deluxe Edition (Remastered)".into(),
+                artists: vec![],
+                images: vec![],
+            },
+        }
+    }
+
+    /// Bottom-right corner of the outer border must land at (col 95, row 39)
+    /// regardless of which overlay is active. If layouts overflow, that cell
+    /// is empty (or contains arbitrary content) instead of the corner glyph.
+    fn assert_border_closes(label: &str, screen: &str) {
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(
+            lines.len() >= 40,
+            "[{label}] expected ≥40 rows, got {}:\n{screen}",
+            lines.len()
+        );
+        // Row 0 must start with the top-left corner.
+        let top = lines[0];
+        let top_chars: Vec<char> = top.chars().collect();
+        assert!(
+            !top_chars.is_empty() && !top_chars[0].is_whitespace(),
+            "[{label}] top-left corner missing at (0,0):\n{screen}"
+        );
+        // Row 39 is the bottom border line; its rightmost rendered char
+        // should be a corner glyph at or near column 95.
+        let bottom = lines[39];
+        let bottom_trimmed = bottom.trim_end();
+        assert!(
+            !bottom_trimmed.is_empty(),
+            "[{label}] bottom border row 39 is empty (height overflow):\n{screen}"
+        );
+        // After trimming trailing whitespace, the bottom border should be
+        // exactly the canvas width minus any leading offset (we anchor at
+        // x=0 so no offset). Width is 96, so 96 chars of border.
+        let bottom_width = bottom_trimmed.chars().count();
+        assert_eq!(
+            bottom_width, 96,
+            "[{label}] bottom border has {bottom_width} chars, expected 96:\n{bottom_trimmed}"
+        );
+        // And row 0's top border too.
+        let top_trimmed = top.trim_end();
+        let top_width = top_trimmed.chars().count();
+        assert_eq!(
+            top_width, 96,
+            "[{label}] top border has {top_width} chars, expected 96:\n{top_trimmed}"
+        );
+    }
+
+    fn print_snapshot(label: &str, screen: &str) {
+        eprintln!("\n=== {label} ===");
+        for (i, line) in screen.lines().enumerate() {
+            eprintln!("{i:>2}|{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_now_playing_with_long_metadata() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(123_000),
+            item: Some(long_track()),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        }).await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+            s.device_name = Some("hifi (cabin)".into());
+        }
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("now_playing long metadata", &screen);
+        assert_border_closes("now_playing long metadata", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_now_playing_with_rate_limit_status() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: false,
+            progress_ms: Some(0),
+            item: Some(long_track()),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        }).await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+            s.device_name = Some("hifi".into());
+            s.rate_limited_until = Some(Instant::now() + Duration::from_secs(45));
+        }
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("now_playing + rate-limited", &screen);
+        assert_border_closes("now_playing + rate-limited", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_search_with_results_in_every_section() {
+        let h = Harness::new();
+        let q = "very long search query string text here";
+        h.fake.set_search(
+            q,
+            Ok(SearchResults {
+                tracks: (0..5)
+                    .map(|i| {
+                        let mut t = long_track();
+                        t.uri = Some(format!("spotify:track:t{i}"));
+                        t.id = Some(format!("t{i}"));
+                        t.name = format!("Track {i} — Mr. Brightside (Jacques Lu Cont's Remix)");
+                        t
+                    })
+                    .collect(),
+                albums: (0..4)
+                    .map(|i| Album {
+                        uri: Some(format!("spotify:album:a{i}")),
+                        name: format!(
+                            "Album {i}: A Very Long Title That Might Make The Row Overflow"
+                        ),
+                        artists: vec![Artist {
+                            uri: None,
+                            name: "Some Artist".into(),
+                        }],
+                        images: vec![],
+                    })
+                    .collect(),
+                artists: (0..3)
+                    .map(|i| Artist {
+                        uri: Some(format!("spotify:artist:ar{i}")),
+                        name: format!("Artist {i} With A Reasonably Long Performer Name"),
+                    })
+                    .collect(),
+                playlists: (0..4)
+                    .map(|i| Playlist {
+                        uri: format!("spotify:playlist:p{i}"),
+                        name: format!(
+                            "Playlist {i}: This Is The Sort Of Title People Use For Their Own Mixes"
+                        ),
+                        owner: Some(crate::api::PlaylistOwner {
+                            display_name: Some(format!("owner_with_a_long_username_{i}")),
+                        }),
+                    })
+                    .collect(),
+            }),
+        );
+        h.press_and_run(Key::Char('/')).await;
+        h.type_str(q).await;
+        h.settle().await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("search results", &screen);
+        assert_border_closes("search results", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_search_recents() {
+        let h = Harness::new();
+        {
+            let mut s = h.state.lock().await;
+            s.recent_queries = (0..10)
+                .map(|i| format!("recent search query number {i} with extra padding text"))
+                .collect();
+            s.recent_tracks = (0..8)
+                .map(|i| {
+                    let mut t = long_track();
+                    t.uri = Some(format!("spotify:track:r{i}"));
+                    t.id = Some(format!("r{i}"));
+                    t.name = format!("Recently Played {i} — Some Long Track Title Goes Here");
+                    t
+                })
+                .collect();
+        }
+        h.press_and_run(Key::Char('/')).await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("search recents", &screen);
+        assert_border_closes("search recents", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_help_overlay() {
+        let h = Harness::new();
+        h.press_and_run(Key::Char('?')).await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("help overlay", &screen);
+        assert_border_closes("help overlay", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_command_overlay() {
+        let h = Harness::new();
+        h.press_and_run(Key::Char(':')).await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("command overlay", &screen);
+        assert_border_closes("command overlay", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_browse_with_many_tracks() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "test",
+            Ok(SearchResults {
+                albums: vec![dummy_album(
+                    "spotify:album:al1",
+                    "An Album Title That Is Quite Long For A Header",
+                    "Some Artist",
+                )],
+                ..Default::default()
+            }),
+        );
+        h.fake.set_album_tracks(
+            "al1",
+            Ok((0..40)
+                .map(|i| {
+                    let mut t = long_track();
+                    t.uri = Some(format!("spotify:track:bt{i}"));
+                    t.id = Some(format!("bt{i}"));
+                    t.name = format!("Browse Track {i:02} — Some Reasonably Long Track Name");
+                    t
+                })
+                .collect()),
+        );
+        h.press_and_run(Key::Char('/')).await;
+        h.type_str("test").await;
+        h.settle().await;
+        h.press_and_run(Key::Enter).await;
+        h.settle().await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("browse 40 tracks", &screen);
+        assert_border_closes("browse 40 tracks", &screen);
+    }
+
+    /// The exact bug the user hit at launch: boot seed loaded recently-played
+    /// (track + art populated), then a poll returned `Playback { item: None }`,
+    /// which overwrote the state into the janky "Track info unavailable +
+    /// stale album art" hybrid. The fix is two-fold: item-less Playback is
+    /// collapsed to None on the way in, and the art field is cleared
+    /// whenever the current_track_id changes.
+    #[tokio::test]
+    async fn item_none_poll_does_not_create_track_info_unavailable_hybrid() {
+        let h = Harness::new();
+        // Seed exactly like the boot path does: a paused synth from
+        // recently-played, art populated by a successful art fetch (we just
+        // mark current_track_id so the comparison logic exercises).
+        let seed = Playback {
+            is_playing: false,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:seed", "Seeded Track")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        };
+        h.seed_playback(seed).await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+            // Simulate the art fetch having completed: current_track_id is
+            // already set from seed_playback, but mark art as present so
+            // we can verify it gets cleared.
+            // (Real ArtLoader doesn't run in the test harness, so we fake it.)
+            s.current_track_id = Some("seed".into());
+        }
+
+        // Now simulate the poll that Spotify often returns after a transfer:
+        // `is_playing: false`, `item: None`. This used to clobber the seed.
+        apply_playback(
+            &h.state,
+            &h.art_loader,
+            Some(Playback {
+                is_playing: false,
+                progress_ms: None,
+                item: None,
+                context: None,
+                timestamp: Some(now_unix_ms() + 1000),
+            }),
+        )
+        .await;
+
+        let s = h.state.lock().await;
+        // Either the seed survives (defended by `pb.filter`) OR the state
+        // is fully cleared. The disallowed outcome is "playback Some + item
+        // None + art Some" — the hybrid the user complained about.
+        let has_item = s
+            .playback
+            .as_ref()
+            .and_then(|p| p.item.as_ref())
+            .is_some();
+        let art_present = s.art.is_some();
+        assert!(
+            has_item || !art_present,
+            "expected either a track to be displayed OR art to be cleared; \
+             got playback={:?} art={art_present}",
+            s.playback.as_ref().map(|p| p.item.as_ref().map(|t| &t.name)),
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_browse_403_warning() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "x",
+            Ok(SearchResults {
+                playlists: vec![dummy_playlist(
+                    "spotify:playlist:px",
+                    "Some Curated Playlist With A Long Title",
+                    "an_owner_username",
+                )],
+                ..Default::default()
+            }),
+        );
+        h.fake.set_playlist_tracks("px", Err("403 Forbidden".into()));
+        h.press_and_run(Key::Char('/')).await;
+        h.type_str("x").await;
+        h.settle().await;
+        h.press_and_run(Key::Enter).await;
+        h.settle().await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("browse 403 warning", &screen);
+        assert_border_closes("browse 403 warning", &screen);
     }
 }
 

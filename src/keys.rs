@@ -24,18 +24,22 @@ pub struct Hotkey {
     pub modes: ModeMask,
 }
 
+// Labels are tuned so every mode's footer fits inside the 94-col inner
+// width of the fixed 96-col canvas. Wide unicode characters (←, →, ±, ↑, ↓)
+// each occupy two terminal columns despite reading as one glyph, so leave
+// breathing room when adding entries.
 pub const HOTKEYS: &[Hotkey] = &[
-    Hotkey { key: "space",      action: "play / pause",    modes: ModeMask::NOW_PLAYING },
-    Hotkey { key: "shift ←/→",  action: "seek ±10s",       modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "space",      action: "play/pause",      modes: ModeMask::NOW_PLAYING },
+    Hotkey { key: "shift ←/→",  action: "seek",            modes: ModeMask::NOW_PLAYING },
     Hotkey { key: "/",          action: "search",          modes: ModeMask::NOW_PLAYING },
     Hotkey { key: ":",          action: "commands",        modes: ModeMask::NOW_PLAYING },
     Hotkey { key: "?",          action: "help",            modes: ModeMask::NOW_PLAYING },
-    Hotkey { key: "↑ / ↓",      action: "move selection",  modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE) },
-    Hotkey { key: "enter",      action: "open / play",     modes: ModeMask::SEARCH },
-    Hotkey { key: "enter",      action: "play track",      modes: ModeMask::BROWSE },
-    Hotkey { key: "p",          action: "play whole",      modes: ModeMask::BROWSE },
-    Hotkey { key: "enter",      action: "run command",     modes: ModeMask::COMMAND },
-    Hotkey { key: "esc",        action: "close / back",    modes: ModeMask::SEARCH.or(ModeMask::HELP).or(ModeMask::COMMAND).or(ModeMask::BROWSE) },
+    Hotkey { key: "↑/↓",        action: "move",            modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE) },
+    Hotkey { key: "enter",      action: "play",            modes: ModeMask::SEARCH },
+    Hotkey { key: "enter",      action: "play",            modes: ModeMask::BROWSE },
+    Hotkey { key: "p",          action: "play all",        modes: ModeMask::BROWSE },
+    Hotkey { key: "enter",      action: "run",             modes: ModeMask::COMMAND },
+    Hotkey { key: "esc",        action: "back",            modes: ModeMask::SEARCH.or(ModeMask::HELP).or(ModeMask::COMMAND).or(ModeMask::BROWSE) },
     Hotkey { key: "q",          action: "quit",            modes: ModeMask::NOW_PLAYING },
     Hotkey { key: "ctrl-c",     action: "quit",            modes: ModeMask::ANY },
 ];

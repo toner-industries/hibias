@@ -8,8 +8,8 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 use std::time::Instant;
 
+use crate::app::{AppState, BrowseState, Cmd, CommandState, Mode, SearchState};
 use crate::keys::{self, ModeMask};
-use crate::{AppState, BrowseState, Cmd, CommandState, Mode, SearchState};
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
@@ -224,11 +224,18 @@ fn render_search_overlay(f: &mut Frame, area: Rect, s: &SearchState) {
 
     render_search_input(f, layout[0], s);
     let total = visible_total(s);
+    let loading = s.is_loading();
     let hint = if s.input.is_empty() {
         if total == 0 {
             "type to search · esc to close".to_string()
         } else {
             "type to search · ↑/↓ to pick · enter to play / re-run · esc to close".to_string()
+        }
+    } else if loading {
+        if s.last_query.is_empty() {
+            "loading…".to_string()
+        } else {
+            format!("loading… (showing \"{}\")", s.last_query)
         }
     } else if total == 0 {
         format!("no results for \"{}\"", s.input)

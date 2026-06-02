@@ -117,7 +117,6 @@ struct DevicesPayload {
 pub struct Image {
     pub url: String,
     pub width: Option<u32>,
-    pub height: Option<u32>,
 }
 
 impl Album {

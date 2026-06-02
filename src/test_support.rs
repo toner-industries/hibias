@@ -9,7 +9,6 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::collections::HashMap;
@@ -21,11 +20,13 @@ use tokio::sync::Mutex;
 use crate::api::{
     Device, Playback, SearchResults, SpotifyApi, Track,
 };
-use crate::{
-    apply_playback, art, dispatch_key, enter_browse, enter_search, kick_search,
+use crate::app::{
+    apply_playback, dispatch_input, enter_browse, enter_search, kick_search,
     play_browse_collection, play_browse_selection, play_selection, seek_relative,
-    skip_track, toggle_playback, ui, AppState, KeyAction,
+    skip_track, toggle_playback, AppState, KeyAction,
 };
+use crate::input::{Input, Key, Mods};
+use crate::{art, ui};
 
 /// What a call to the fake recorded — used by tests to assert the right
 /// endpoint was hit, with the right arguments.
@@ -330,20 +331,20 @@ impl Harness {
     }
 
     /// Dispatch one keypress and return what action the run loop would take.
-    pub async fn press(&self, code: KeyCode) -> KeyAction {
-        dispatch_key(code, KeyModifiers::empty(), &self.state).await
+    pub async fn press(&self, key: Key) -> KeyAction {
+        dispatch_input(Input::new(key), &self.state).await
     }
 
-    pub async fn press_with_mods(&self, code: KeyCode, mods: KeyModifiers) -> KeyAction {
-        dispatch_key(code, mods, &self.state).await
+    pub async fn press_with_mods(&self, key: Key, mods: Mods) -> KeyAction {
+        dispatch_input(Input::with_mods(key, mods), &self.state).await
     }
 
     /// Equivalent to typing each character of `s` into whichever mode is
-    /// active. Each char goes through `dispatch_key`; if the result is
+    /// active. Each char goes through `dispatch_input`; if the result is
     /// `SearchInputChanged`, the search-debounce side-effect runs.
     pub async fn type_str(&self, s: &str) {
         for c in s.chars() {
-            let action = self.press(KeyCode::Char(c)).await;
+            let action = self.press(Key::Char(c)).await;
             self.run(action).await;
         }
     }
@@ -381,8 +382,8 @@ impl Harness {
 
     /// Press a key and execute the resulting action in one step — the
     /// common case in tests that read like "press p".
-    pub async fn press_and_run(&self, code: KeyCode) {
-        let action = self.press(code).await;
+    pub async fn press_and_run(&self, key: Key) {
+        let action = self.press(key).await;
         self.run(action).await;
     }
 
@@ -393,7 +394,7 @@ impl Harness {
     }
 
     pub async fn mode_name(&self) -> &'static str {
-        crate::mode_name(&*self.state.lock().await)
+        crate::app::mode_name(&*self.state.lock().await)
     }
 
     /// Wait until all spawned background tasks (browse fetches, search

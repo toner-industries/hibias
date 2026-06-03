@@ -14,7 +14,8 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const REDIRECT_URI: &str = "http://127.0.0.1:8989/login";
 const SCOPES: &str = "user-read-playback-state user-modify-playback-state \
-                      playlist-read-private user-read-recently-played";
+                      playlist-read-private user-read-recently-played \
+                      user-library-modify";
 const REFRESH_MARGIN_SECS: u64 = 60;
 
 pub struct Auth {

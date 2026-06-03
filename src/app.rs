@@ -65,6 +65,10 @@ pub struct AppState {
     /// watchdog from racing with a manual `:reconnect`, and lets the UI
     /// show a "Reconnecting..." indicator.
     pub reconnecting: bool,
+    /// Transient success/info message with an expiry. Used by commands
+    /// whose effect is invisible from the now-playing view (e.g. `:like`).
+    /// Status line renders it green; expiry is checked lazily on read.
+    pub notice: Option<(String, Instant)>,
 }
 
 impl Default for AppState {
@@ -86,6 +90,7 @@ impl Default for AppState {
             streaming_failed: None,
             streaming: None,
             reconnecting: false,
+            notice: None,
         }
     }
 }
@@ -167,6 +172,7 @@ pub enum Cmd {
     PlayPause,
     Next,
     Previous,
+    Like,
     Reconnect,
     Search,
     Help,
@@ -178,6 +184,7 @@ impl Cmd {
         Cmd::PlayPause,
         Cmd::Next,
         Cmd::Previous,
+        Cmd::Like,
         Cmd::Reconnect,
         Cmd::Search,
         Cmd::Help,
@@ -189,6 +196,7 @@ impl Cmd {
             Cmd::PlayPause => "play / pause",
             Cmd::Next => "next",
             Cmd::Previous => "previous",
+            Cmd::Like => "like",
             Cmd::Reconnect => "reconnect",
             Cmd::Search => "search",
             Cmd::Help => "help",
@@ -201,6 +209,7 @@ impl Cmd {
             Cmd::PlayPause => "toggle playback on the current device",
             Cmd::Next => "skip to the next track",
             Cmd::Previous => "skip back (or restart current track)",
+            Cmd::Like => "save the current track to Liked Songs",
             Cmd::Reconnect => "restart the 'hifi' Connect device",
             Cmd::Search => "open the Spotify search overlay",
             Cmd::Help => "show the hotkey help overlay",
@@ -327,6 +336,7 @@ pub enum KeyAction {
     NextTrack,
     PrevTrack,
     Reconnect,
+    LikeCurrent,
 }
 
 const SEEK_STEP_MS: i64 = 10_000;
@@ -497,6 +507,7 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
                     Cmd::PlayPause => KeyAction::TogglePlayback,
                     Cmd::Next => KeyAction::NextTrack,
                     Cmd::Previous => KeyAction::PrevTrack,
+                    Cmd::Like => KeyAction::LikeCurrent,
                     Cmd::Reconnect => KeyAction::Reconnect,
                     Cmd::Search => KeyAction::EnterSearch,
                     Cmd::Help => {
@@ -1591,6 +1602,55 @@ async fn apply_playback_inner(
     }
 }
 
+/// Save the currently-playing track to the user's Liked Songs. Reads the
+/// track id from `state.playback.item.id` — if there's nothing playing,
+/// returns silently. On success, sets a transient green notice; on
+/// failure (typically 403 when `user-library-modify` scope is missing),
+/// sets `error`. Skips when the rate-limit gate is engaged, like the
+/// other action handlers.
+pub async fn like_current_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let (track_id, label) = {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("like: skipped (rate-limited)", None);
+            return;
+        }
+        let Some(track) = s.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            log::note("like: skipped (no current track)", None);
+            return;
+        };
+        let Some(id) = track.id.clone() else {
+            log::note("like: skipped (track has no id)", None);
+            return;
+        };
+        (id, track.name.clone())
+    };
+    log::note("like", Some(&format!("track={label} id={track_id}")));
+    match client.save_track(&track_id).await {
+        Ok(()) => {
+            let mut s = state.lock().await;
+            s.error = None;
+            s.notice = Some((
+                format!("♥ liked: {label}"),
+                Instant::now() + std::time::Duration::from_secs(3),
+            ));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("like", &msg);
+            let mut s = state.lock().await;
+            s.error = Some(if msg.contains("403") {
+                "like failed: missing scope — delete hifi-auth.json and re-auth".into()
+            } else {
+                msg
+            });
+        }
+    }
+}
+
 pub async fn toggle_playback(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     if reconnect_if_device_offline(client, state, "toggle_playback").await {
         return;
@@ -2593,6 +2653,88 @@ mod tests {
         assert!(
             !calls.iter().any(|c| matches!(c, Call::Play | Call::Pause)),
             "expected no Play/Pause calls while rate-limited, got: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn like_command_calls_save_track_for_current_track() {
+        let h = Harness::new();
+        {
+            let mut s = h.state.lock().await;
+            s.playback = Some(Playback {
+                is_playing: true,
+                progress_ms: Some(0),
+                item: Some(Track {
+                    id: Some("track42".into()),
+                    uri: Some("spotify:track:track42".into()),
+                    name: "Heart It Races".into(),
+                    duration_ms: 200_000,
+                    artists: vec![],
+                    album: Album::default(),
+                }),
+                context: None,
+                timestamp: None,
+            });
+        }
+
+        h.run(KeyAction::LikeCurrent).await;
+
+        let calls = h.fake.calls();
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::SaveTrack(id) if id == "track42")),
+            "expected SaveTrack(track42), got: {calls:?}"
+        );
+        let s = h.state.lock().await;
+        let (msg, _) = s.notice.as_ref().expect("notice should be set on success");
+        assert!(msg.contains("Heart It Races"), "got notice: {msg}");
+        assert!(s.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn like_command_skips_when_nothing_playing() {
+        let h = Harness::new();
+        // No playback set — like should be a no-op.
+
+        h.run(KeyAction::LikeCurrent).await;
+
+        let calls = h.fake.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::SaveTrack(_))),
+            "expected no SaveTrack call, got: {calls:?}"
+        );
+        let s = h.state.lock().await;
+        assert!(s.notice.is_none());
+        assert!(s.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn like_command_skipped_when_rate_limited() {
+        let h = Harness::new();
+        {
+            let mut s = h.state.lock().await;
+            s.rate_limited_until = Some(Instant::now() + Duration::from_secs(120));
+            s.playback = Some(Playback {
+                is_playing: true,
+                progress_ms: Some(0),
+                item: Some(Track {
+                    id: Some("track42".into()),
+                    uri: Some("spotify:track:track42".into()),
+                    name: "T".into(),
+                    duration_ms: 1,
+                    artists: vec![],
+                    album: Album::default(),
+                }),
+                context: None,
+                timestamp: None,
+            });
+        }
+
+        h.run(KeyAction::LikeCurrent).await;
+
+        let calls = h.fake.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::SaveTrack(_))),
+            "expected no SaveTrack while rate-limited, got: {calls:?}"
         );
     }
 

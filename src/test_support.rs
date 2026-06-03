@@ -21,7 +21,7 @@ use crate::api::{
     Device, Playback, SearchResults, SpotifyApi, Track,
 };
 use crate::app::{
-    apply_playback, dispatch_input, enter_browse, enter_search, kick_search,
+    apply_playback, dispatch_input, enter_browse, enter_search, kick_search, like_current_track,
     play_browse_collection, play_browse_selection, play_selection, seek_relative,
     skip_track, toggle_playback, AppState, KeyAction,
 };
@@ -46,6 +46,7 @@ pub enum Call {
     GetAlbumTracks(String),
     GetPlaylistTracks(String),
     GetRecentlyPlayed(u32),
+    SaveTrack(String),
 }
 
 #[derive(Default)]
@@ -297,6 +298,11 @@ impl SpotifyApi for FakeSpotify {
             None => Ok(Vec::new()),
         }
     }
+
+    async fn save_track(&self, track_id: &str) -> Result<()> {
+        self.record(Call::SaveTrack(track_id.to_string()));
+        Ok(())
+    }
 }
 
 /// Headless test harness — owns an AppState, a programmable FakeSpotify,
@@ -378,6 +384,7 @@ impl Harness {
             KeyAction::PlayBrowseCollection => {
                 play_browse_collection(&self.client, &self.state, &self.art_loader).await
             }
+            KeyAction::LikeCurrent => like_current_track(&self.client, &self.state).await,
         }
     }
 

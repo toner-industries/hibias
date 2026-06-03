@@ -28,9 +28,9 @@ mod ui;
 
 use api::{Playback, RateLimited, SpotifyApi, SpotifyClient};
 use app::{
-    apply_playback_force, dispatch_input, mode_name, play_browse_collection, play_browse_selection,
-    play_selection, seek_relative, skip_track, spawn_post_play_poll, spawn_reconnect,
-    toggle_playback, AppState, KeyAction,
+    apply_playback_force, dispatch_input, like_current_track, mode_name,
+    play_browse_collection, play_browse_selection, play_selection, seek_relative, skip_track,
+    spawn_post_play_poll, spawn_reconnect, toggle_playback, AppState, KeyAction,
 };
 use input::{Input, Key, Mods};
 
@@ -232,6 +232,7 @@ async fn run(
                         KeyAction::Reconnect => {
                             spawn_reconnect(&client, &state, "user: :reconnect");
                         }
+                        KeyAction::LikeCurrent => like_current_track(&client, &state).await,
                         KeyAction::EnterSearch => app::enter_search(&client, &state).await,
                         KeyAction::OpenBrowse(coll) => app::enter_browse(&client, &state, coll).await,
                         KeyAction::PlayBrowseSelection => {
@@ -267,29 +268,45 @@ async fn run(
     Ok(())
 }
 
-/// Poll /me/player every 5s and apply the result.
+/// Cadence for the /me/player poll. 10s while a track is playing — track
+/// changes are picked up quickly enough for a TUI; ~5s median latency on
+/// transitions is below most users' noticing threshold. 30s while paused
+/// or idle — playback state is server-side static while we hold the
+/// device, so frequent polling there is wasted traffic that contributes
+/// to the sustained-load 429 pattern.
+const PLAYBACK_POLL_PLAYING: Duration = Duration::from_secs(10);
+const PLAYBACK_POLL_PAUSED: Duration = Duration::from_secs(30);
+
+/// Poll /me/player on a play/pause-aware cadence and apply the result.
 fn spawn_playback_poll(
     client: Arc<dyn SpotifyApi>,
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
         // Track soft-cap engagement so we log only on edge transitions
-        // (engaged → released, released → engaged) instead of every 5s tick.
+        // (engaged → released, released → engaged) instead of every tick.
         let mut throttle_engaged = false;
         loop {
-            interval.tick().await;
-            {
+            // Sleep first so we don't fire immediately on startup —
+            // `spawn_boot_seed` handles the first paint.
+            let (delay, gated) = {
                 let s = state.lock().await;
-                if s.rate_limited_until
+                let is_playing = s.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
+                let delay = if is_playing {
+                    PLAYBACK_POLL_PLAYING
+                } else {
+                    PLAYBACK_POLL_PAUSED
+                };
+                let gated = s
+                    .rate_limited_until
                     .map(|t| t > Instant::now())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
+                    .unwrap_or(false);
+                (delay, gated)
+            };
+            tokio::time::sleep(delay).await;
+            if gated {
+                continue;
             }
             if client.background_throttled() {
                 if !throttle_engaged {

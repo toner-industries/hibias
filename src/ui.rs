@@ -85,6 +85,18 @@ fn top_height(inner_h: u16) -> u16 {
 }
 
 fn status_line(state: &AppState) -> Option<(String, Color)> {
+    // Errors take precedence so a failure isn't masked by a stale notice.
+    if let Some(e) = &state.error {
+        return Some((format!("error: {e}"), Color::Red));
+    }
+    // Transient command notices ("♥ liked: …") sit above rate-limit /
+    // device warnings so the user sees the immediate effect of what they
+    // just did. Lazily expire so we don't need a separate prune tick.
+    if let Some((msg, until)) = &state.notice {
+        if *until > Instant::now() {
+            return Some((msg.clone(), Color::Green));
+        }
+    }
     if let Some(until) = state.rate_limited_until {
         let remaining = until.saturating_duration_since(Instant::now()).as_secs();
         if remaining > 0 {
@@ -96,21 +108,16 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
     }
     // Surface a persistent warning when the librespot device has dropped off
     // Spotify Connect — without it the user just sees mysterious 404s.
-    if state.device_present == Some(false) && state.error.is_none() {
+    if state.device_present == Some(false) {
         return Some((
             "⚠ Connect device 'hifi' is offline — restart hifi to reconnect".to_string(),
             Color::Yellow,
         ));
     }
     if let Some(msg) = &state.streaming_failed {
-        if state.error.is_none() {
-            return Some((format!("⚠ streaming disabled: {msg}"), Color::Yellow));
-        }
+        return Some((format!("⚠ streaming disabled: {msg}"), Color::Yellow));
     }
-    state
-        .error
-        .as_ref()
-        .map(|e| (format!("error: {e}"), Color::Red))
+    None
 }
 
 fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {

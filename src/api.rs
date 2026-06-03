@@ -18,10 +18,11 @@ const THROTTLE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Soft cap for background traffic over `THROTTLE_WINDOW`. When exceeded,
 /// background pollers skip their tick; user-initiated requests still go
-/// through. Sized well below the level that has historically tripped a 429
-/// (sustained ~12/30s with two pollers), with headroom for user bursts on
-/// top of the current single-poller baseline of ~3/30s.
-const BACKGROUND_SOFT_CAP: usize = 20;
+/// through. Sized well below the 12/30s sustained load that historically
+/// tripped a 429 — at 10/30s we sit at a fraction of the burn line with
+/// ~7-9 req/30s of headroom on top of the steady-state baseline (1-3
+/// /me/player polls per window, depending on play/pause state).
+const BACKGROUND_SOFT_CAP: usize = 10;
 
 pub struct SpotifyClient {
     http: reqwest::Client,
@@ -239,6 +240,7 @@ pub trait SpotifyApi: Send + Sync {
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
     async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>>;
+    async fn save_track(&self, track_id: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -299,6 +301,9 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>> {
         SpotifyClient::get_recently_played(self, limit).await
+    }
+    async fn save_track(&self, track_id: &str) -> Result<()> {
+        SpotifyClient::save_track(self, track_id).await
     }
 }
 
@@ -519,6 +524,19 @@ impl SpotifyClient {
         self.send_logged(req, "PUT", &url, body_str.as_deref())
             .await
             .map(|_| ())
+    }
+
+    /// Add a single track to the user's Liked Songs. Requires the
+    /// `user-library-modify` scope — a stored token without that scope
+    /// will 403; the user must delete `hifi-auth.json` and re-auth.
+    pub async fn save_track(&self, track_id: &str) -> Result<()> {
+        let url = format!("{BASE}/me/tracks?ids={}", urlencoding::encode(track_id));
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        self.send_logged(req, "PUT", &url, None).await.map(|_| ())
     }
 
     pub async fn search(&self, q: &str) -> Result<SearchResults> {

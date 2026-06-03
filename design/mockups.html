@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hifi · screen mockups</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --fg: #c9d1d9;
+    --dim: #6e7681;
+    --bd: #30363d;
+    --cy: #7dd3fc;
+    --gr: #86efac;
+    --ye: #fcd34d;
+    --rd: #fca5a5;
+    --sel: #21262d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 240px 1fr;
+  }
+
+  /* sidebar */
+  aside.thumbs {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 14px 12px 30px;
+    background: var(--panel);
+    border-right: 1px solid var(--bd);
+    z-index: 5;
+  }
+  aside.thumbs h1 {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--dim);
+    margin: 0 6px 16px;
+    letter-spacing: 0.05em;
+    text-transform: lowercase;
+  }
+  a.thumb {
+    display: block;
+    margin-bottom: 12px;
+    border: 1px solid var(--bd);
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg);
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+  }
+  a.thumb:hover { border-color: var(--dim); }
+  a.thumb.active {
+    border-color: var(--cy);
+    background: rgba(125,211,252,0.04);
+  }
+  .thumb-mock {
+    width: 100%;
+    height: 162px;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .thumb-mock pre {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.25;
+    margin: 0;
+    padding: 6px 8px;
+    background: var(--bg);
+    color: var(--fg);
+    white-space: pre;
+    transform: scale(0.275);
+    transform-origin: top left;
+    width: max-content;
+  }
+  .thumb-label {
+    padding: 6px 10px 7px;
+    font-size: 11px;
+    color: var(--dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  a.thumb.active .thumb-label { color: var(--fg); }
+  .thumb-label .num {
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+    font-size: 10px;
+  }
+  a.thumb.active .thumb-label .num { color: var(--cy); }
+
+  /* main column */
+  main {
+    padding: 28px 32px 80px;
+    min-width: 0;  /* allow content to shrink within the grid cell */
+  }
+
+  /* mockup canvas */
+  pre.mock {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.25;
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 14px 16px;
+    border: 1px solid var(--bd);
+    border-radius: 6px;
+    white-space: pre;
+    width: max-content;
+  }
+
+  /* color classes (shared between sidebar minis and main mockups) */
+  .cy { color: var(--cy); }
+  .di { color: var(--dim); }
+  .gr { color: var(--gr); }
+  .ye { color: var(--ye); }
+  .rd { color: var(--rd); }
+  .bo { font-weight: 600; color: var(--fg); }
+  .bd { color: var(--bd); }
+  .sel { background: var(--sel); color: var(--fg); }
+  .art { color: #4c5158; }
+  .head { color: var(--dim); font-weight: 600; }
+  .ok { color: var(--gr); }
+  .prog { color: var(--gr); }
+
+  /* per-screen section in main column */
+  .screen {
+    scroll-margin-top: 24px;
+    margin-bottom: 56px;
+  }
+  .screen-header {
+    margin: 0 0 12px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .screen-header .name {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg);
+    margin: 0;
+  }
+  .screen-header .num {
+    font-size: 11px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .screen-header .desc {
+    color: var(--dim);
+    font-size: 13px;
+  }
+  .notes {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--bd);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--dim);
+    font-size: 13px;
+    line-height: 1.55;
+    max-width: 860px;
+  }
+  .notes strong { color: var(--fg); font-weight: 600; }
+  .notes .kbd {
+    color: var(--cy);
+    background: rgba(125,211,252,0.08);
+    border: 1px solid rgba(125,211,252,0.2);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", Menlo, monospace;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+
+<aside class="thumbs">
+  <h1>hifi · screen mockups</h1>
+  <div id="thumbList"></div>
+</aside>
+
+<main id="screens"></main>
+
+<script>
+// ---- micro-DSL for building 96-col-wide TUI mockups ------------------------
+const W = 96;
+
+// visible-length helper: strip HTML tags
+function vlen(s) { return s.replace(/<[^>]*>/g, '').length; }
+
+// span shortcuts
+const cy = (s) => `<span class="cy">${s}</span>`;
+const di = (s) => `<span class="di">${s}</span>`;
+const gr = (s) => `<span class="gr">${s}</span>`;
+const ye = (s) => `<span class="ye">${s}</span>`;
+const rd = (s) => `<span class="rd">${s}</span>`;
+const bo = (s) => `<span class="bo">${s}</span>`;
+const sel = (s) => `<span class="sel">${s}</span>`;
+const art = (s) => `<span class="art">${s}</span>`;
+const head = (s) => `<span class="head">${s}</span>`;
+const ok = (s) => `<span class="ok">${s}</span>`;
+const prog = (s) => `<span class="prog">${s}</span>`;
+const bd = (s) => `<span class="bd">${s}</span>`;
+
+// pad helper: returns text padded to width with spaces (HTML-tag-safe)
+function pad(text, width) {
+  const need = Math.max(0, width - vlen(text));
+  return text + ' '.repeat(need);
+}
+
+// build a top border line: ┌── title ─...─┐
+function topBorder(title, opts={}) {
+  const w = opts.width || W;
+  const leftPad = '┌';
+  const rightPad = '┐';
+  const filled = title ? `${leftPad} ${di(title)} ` : leftPad;
+  const tail = rightPad;
+  const dashesNeeded = w - vlen(filled) - vlen(tail);
+  return bd(leftPad) + (title ? ` ${di(title)} ` : '') + bd('─'.repeat(dashesNeeded)) + bd(rightPad);
+}
+
+function bot(opts={}) {
+  const w = opts.width || W;
+  return bd('└' + '─'.repeat(w - 2) + '┘');
+}
+
+// content row with side borders: │ <padded to w-2> │
+function row(content, opts={}) {
+  const w = opts.width || W;
+  const inner = pad(content, w - 2);
+  return bd('│') + inner + bd('│');
+}
+
+// blank row
+function blank(opts={}) { return row('', opts); }
+
+// horizontal separator inside a content area: │─────│ (using inner ─)
+function hsep(opts={}) {
+  const w = opts.width || W;
+  return bd('│') + bd('─'.repeat(w - 2)) + bd('│');
+}
+
+// overlay box drawn inside the main canvas. Renders an overlay starting at
+// x within the current content area, with given width and content rows. The
+// caller composes by writing rows that mix left-of-overlay text and overlay
+// content using `overlayRow`. For simplicity here we just compose the whole
+// 40 lines per-screen.
+
+// Build a centered overlay border line. Returns text positioned within an
+// already-rendered side-border row, given the inner content area width.
+// We don't try to be clever — each screen lays out its overlay by hand.
+
+// ---- screen builders -------------------------------------------------------
+
+// Build a "now-playing background" set of inner lines (38 lines tall) showing
+// the populated track + progress + footer. Used as the backdrop for overlay
+// screens. Returns array of 38 strings (excluding top/bottom borders).
+// Right-align helper: builds an inner row with `left` text, padding, then
+// `right` text, sized to the inner canvas width (94 cols inside the outer
+// border). Both arguments may contain colored HTML spans.
+function rightAlign(left, right, width=94) {
+  const padded = pad(left, width - vlen(right));
+  return padded + right;
+}
+
+// Build a tab strip row plus its underline row. Returns [strip, underline]
+// — each a 94-col-wide inner row. The active tab is bold; inactive tabs
+// dim. A cyan underline sits beneath the active tab name.
+function tabStrip(active, tabs, opts={}) {
+  const indent = opts.indent || 2;
+  const gap = opts.gap || 4;
+  let strip = ' '.repeat(indent);
+  const positions = [];
+  tabs.forEach((t, i) => {
+    if (i > 0) strip += ' '.repeat(gap);
+    const start = vlen(strip);
+    strip += (t === active) ? bo(t) : di(t);
+    positions.push({ name: t, start, end: vlen(strip) });
+  });
+  const a = positions.find(p => p.name === active) || positions[0];
+  const underline = ' '.repeat(a.start) + cy('━'.repeat(a.end - a.start));
+  return [strip, underline];
+}
+
+// Sub-tab strip (used inside the Library tab). Same idea as tabStrip but
+// using middot separators between tabs to read more like a breadcrumb.
+function subTabStrip(active, tabs, opts={}) {
+  const indent = opts.indent || 2;
+  let strip = ' '.repeat(indent);
+  const positions = [];
+  tabs.forEach((t, i) => {
+    if (i > 0) strip += di('  ·  ');
+    const start = vlen(strip);
+    strip += (t === active) ? bo(t) : t;
+    positions.push({ name: t, start, end: vlen(strip) });
+  });
+  const a = positions.find(p => p.name === active) || positions[0];
+  const underline = ' '.repeat(a.start) + cy('─'.repeat(a.end - a.start));
+  return [strip, underline];
+}
+
+const TOP_TABS = ['Now Playing', 'Search', 'Library'];
+
+// Render the standard top-tab strip + a separator line. Returns 4 inner
+// rows ready to be unshifted into screen content:
+//   [blank, name-strip, underline, blank]
+function topChrome(activeTab) {
+  const [names, under] = tabStrip(activeTab, TOP_TABS);
+  return ['', names, under, ''];
+}
+
+function nowPlayingInner({withFooter=true, footerKeys='now'}={}) {
+  const lines = topChrome('Now Playing');
+  // Art block — 20 chars wide × 10 rows tall.
+  const artBlock = [
+    art('████████████████████'),
+    art('████▓▓▓▓▓▓▓▓▓▓▓▓████'),
+    art('███▓▓▓▒▒▒▒▒▒▒▒▓▓▓███'),
+    art('██▓▓▒▒░░░░░░░░▒▒▓▓██'),
+    art('██▓▒░░░░░░░░░░░░▒▓██'),
+    art('██▓▒░░░░░░░░░░░░▒▓██'),
+    art('███▓▓▒▒▒▒▒▒▒▒▒▒▓▓███'),
+    art('████▓▓▓▓▓▓▓▓▓▓▓▓████'),
+    art('█████▓▓▓▓▓▓▓▓▓▓█████'),
+    art('████████████████████'),
+  ];
+  // 60-col progress bar — fits beside the art block. ~46% played.
+  const barWidth = 60;
+  const filled = Math.round(barWidth * 0.46);
+  const progressBar = prog('█'.repeat(filled)) + di('░'.repeat(barWidth - filled));
+  // Information shown to the right of the art block, one entry per art row.
+  // Lines that need the full art-relative width can use longer content.
+  const trackInfo = [
+    bo('POWER'),
+    'Kanye West',
+    di('My Beautiful Dark Twisted Fantasy'),
+    '',
+    cy('▶') + '  2:14 / 4:52',
+    progressBar,
+    '',
+    di('context · ') + 'album · my-beautiful-dark…',
+    '',
+    '',
+  ];
+
+  // (rows 0–3 are tab strip + underline + blanks, already populated by topChrome)
+  // [4..13] art block + track info
+  for (let i = 0; i < 10; i++) {
+    lines.push(' ' + artBlock[i] + '  ' + trackInfo[i]);
+  }
+  // [11] blank
+  lines.push('');
+  // [12] "Up next" section header
+  lines.push(' ' + head('Up next') + di('  ·  ') + 'from album · My Beautiful Dark Twisted Fantasy');
+  // [13] blank
+  lines.push('');
+  // [14..20] 7 upcoming tracks (no selection — these are the play queue,
+  // not a list the user is picking from; the selection lives in Browse).
+  const upNext = [
+    [1, 'All of the Lights', '',                                  '5:01'],
+    [2, 'Monster',           'feat. JAY-Z, Rick Ross, Nicki Minaj','6:18'],
+    [3, 'Runaway',           'feat. Pusha T',                     '9:08'],
+    [4, 'Hell of a Life',    '',                                  '5:27'],
+    [5, 'Blame Game',        'feat. John Legend',                 '7:50'],
+    [6, 'Lost in the World', 'feat. Bon Iver',                    '4:16'],
+    [7, 'Who Will Survive in America', '',                        '1:38'],
+  ];
+  for (const [num, name, sub, dur] of upNext) {
+    const idx = String(num).padStart(2, ' ');
+    const subText = sub ? di(' — ' + sub) : '';
+    const left = `   ${di(idx + '.')}  ${bo(name)}${subText}`;
+    lines.push(rightAlign(left, di(dur)));
+  }
+  // [21] blank
+  lines.push('');
+  // [22] "Recently played" header
+  lines.push(' ' + head('Recently played'));
+  // [23] blank
+  lines.push('');
+  // [24..26] 3 recent tracks (compact — full history lives elsewhere)
+  const recent = [
+    ['Dark Fantasy',      'Kanye West', '4:41'],
+    ['Stronger',          'Kanye West', '5:11'],
+    ['Bohemian Rhapsody', 'Queen',      '5:55'],
+  ];
+  for (const [name, artist, dur] of recent) {
+    const left = `      ${bo(name)}${di(' — ')}${artist}`;
+    lines.push(rightAlign(left, di(dur)));
+  }
+  // Fill blank rows up to the footer slot.
+  while (lines.length < 36) lines.push('');
+  // [36] footer hotkeys. Note: [shift ←/→] seek is documented in the help
+  // overlay but kept out of the footer to reduce visual noise — the daily
+  // hotkeys are the ones shown here.
+  if (withFooter && footerKeys === 'now') {
+    lines.push('       ' + cy('[space]') + ' play/pause   ' + cy('[/]') + ' search   ' + cy('[:]') + ' commands   ' + cy('[?]') + ' help   ' + cy('[q]') + ' quit');
+  } else {
+    lines.push('');
+  }
+  // [37] blank
+  lines.push('');
+  while (lines.length < 38) lines.push('');
+  return lines.slice(0, 38);
+}
+
+// Wrap the 38 inner lines + top + bottom border into a full screen.
+function shell(title, innerLines) {
+  const out = [topBorder(title)];
+  for (const l of innerLines) out.push(row(l));
+  out.push(bot());
+  return out.join('\n');
+}
+
+// Overlay helper: draw an overlay box positioned at (col, rowStart) with
+// given width and rows of overlay content. Returns a function that given an
+// inner content line index and the line's base text, returns the line with
+// the overlay drawn on top. We do this by string-splice.
+function compositeWithOverlay(innerLines, overlay) {
+  // overlay = { x, y, w, h, title, contentRows: [string] }
+  const { x, y, w, h, title, contentRows } = overlay;
+  // Build overlay rows:
+  // row 0: ┌ title ─...─┐
+  // rows 1..h-2: │ content (padded to w-2) │
+  // row h-1: └─...─┘
+  const overlayRows = [];
+  // top
+  const filled = title ? `┌ ${title} ` : '┌';
+  const dashes = w - vlen(filled) - 1;
+  overlayRows.push(bd(filled.replace('┌', '')) === '' ? bd('┌') + (title ? ` ${di(title)} ` : '') + bd('─'.repeat(dashes)) + bd('┐')
+                                                       : bd('┌') + (title ? ` ${di(title)} ` : '') + bd('─'.repeat(dashes)) + bd('┐'));
+  // content
+  for (let i = 0; i < h - 2; i++) {
+    const c = contentRows[i] !== undefined ? contentRows[i] : '';
+    const inner = pad(c, w - 2);
+    overlayRows.push(bd('│') + inner + bd('│'));
+  }
+  // bottom
+  overlayRows.push(bd('└' + '─'.repeat(w - 2) + '┘'));
+
+  // Now composite onto innerLines. Each innerLines[i] is the text inside the
+  // outer Block's content area (width W - 2 = 94). We need to splice the
+  // overlay starting at column x (within the 94-wide inner area), spanning
+  // rows y..y+h-1.
+  const innerW = W - 2;
+  const out = innerLines.map(l => pad(l, innerW));  // ensure full width
+
+  for (let r = 0; r < overlayRows.length; r++) {
+    const targetRow = y + r;
+    if (targetRow < 0 || targetRow >= out.length) continue;
+    const ov = overlayRows[r];
+    const ovVis = vlen(ov);
+    // Splice: take base[0..x-1] + overlay + base[x+ovVis..]
+    const base = out[targetRow];
+    out[targetRow] = spliceVisible(base, x, ovVis, ov);
+  }
+  return out;
+}
+
+// splice characters in a string-with-HTML at visible position [start, start+len)
+// replacing them with the given replacement (HTML).
+// This is tricky because of HTML tags. We'll iterate char by char.
+function spliceVisible(haystack, start, len, replacement) {
+  let visIdx = 0;
+  let out = '';
+  let i = 0;
+  let inTag = false;
+  let inserted = false;
+  while (i < haystack.length) {
+    const ch = haystack[i];
+    if (ch === '<') { inTag = true; out += ch; i++; continue; }
+    if (ch === '>') { inTag = false; out += ch; i++; continue; }
+    if (inTag) { out += ch; i++; continue; }
+    if (visIdx === start && !inserted) {
+      out += replacement;
+      inserted = true;
+    }
+    if (visIdx < start || visIdx >= start + len) {
+      out += ch;
+    }
+    visIdx++;
+    i++;
+  }
+  if (!inserted && visIdx <= start) {
+    // pad with spaces up to start, then append replacement
+    out += ' '.repeat(start - visIdx) + replacement;
+  }
+  return out;
+}
+
+// ============================================================================
+// SCREEN 1: NOW PLAYING (populated, no overlay)
+// ============================================================================
+function screen_now_playing() {
+  const inner = nowPlayingInner({withFooter: true, footerKeys: 'now'});
+  return shell('hifi · device: hifi (cabin)', inner);
+}
+
+// ============================================================================
+// SCREEN: SEARCH — full-screen tab (replaces the previous overlay)
+// ============================================================================
+function screen_search() {
+  const inner = topChrome('Search');
+  // [4] search input
+  inner.push(' ' + gr('/') + ' the killers');
+  // [5] hint
+  inner.push(' ' + di('6 results · ↑/↓ move · enter play · esc close'));
+  // [6] blank
+  inner.push('');
+  // [7] separator
+  inner.push(' ' + di('─'.repeat(92)));
+  // [8] blank
+  inner.push('');
+
+  // [9] Tracks section
+  inner.push(' ' + head('Tracks'));
+  const tracks = [
+    ['Mr. Brightside',       'The Killers', '3:42', true],
+    ['Somebody Told Me',     'The Killers', '3:17'],
+    ['When You Were Young',  'The Killers', '3:39'],
+  ];
+  for (const [name, artist, dur, isSelected] of tracks) {
+    const left = `   ${bo(name)}${di(' — ')}${artist}`;
+    const line = rightAlign(left, di(dur));
+    inner.push(isSelected ? sel(line) : line);
+  }
+  inner.push('');
+
+  // Albums
+  inner.push(' ' + head('Albums'));
+  const albums = [
+    ['Hot Fuss',   'The Killers · 2004', '11 tracks'],
+    ["Sam's Town", 'The Killers · 2006', '12 tracks'],
+  ];
+  for (const [name, sub, count] of albums) {
+    const left = `   ${bo(name)}${di(' — ')}${sub}`;
+    inner.push(rightAlign(left, di(count)));
+  }
+  inner.push('');
+
+  // Artists
+  inner.push(' ' + head('Artists'));
+  inner.push(rightAlign(`   ${bo('The Killers')}`, di('12.4M monthly listeners')));
+  inner.push('');
+
+  // Playlists
+  inner.push(' ' + head('Playlists'));
+  inner.push(rightAlign(`   ${bo('Killers Essentials')}${di(' — ')}spotify`, di('30 tracks')));
+
+  while (inner.length < 36) inner.push('');
+  inner.push('       ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' play / open   ' + cy('[tab]') + ' switch tab   ' + cy('[?]') + ' help');
+  inner.push('');
+  while (inner.length < 38) inner.push('');
+  return shell('hifi · device: hifi (cabin)', inner.slice(0, 38));
+}
+
+// ============================================================================
+// SCREEN: BROWSE — full-screen album / playlist view (no overlay)
+// ============================================================================
+function screen_browse() {
+  // Browse opens *within* whichever tab the user navigated from — most
+  // commonly Search. The tab strip stays visible so they can hop back.
+  const inner = topChrome('Search');
+  // collection title
+  inner.push(' ' + bo('My Beautiful Dark Twisted Fantasy'));
+  // subtitle
+  inner.push(' ' + di('album · Kanye West · 13 tracks · 68:38'));
+  // blank
+  inner.push('');
+  // thin separator across the canvas to anchor the header
+  inner.push(' ' + di('─'.repeat(92)));
+  // blank
+  inner.push('');
+
+  // [6..18] 13 track rows
+  const tracks = [
+    [1,  'Dark Fantasy',                  '',                                  '4:41'],
+    [2,  'Gorgeous',                      'feat. Kid Cudi, Raekwon',           '5:57'],
+    [3,  'POWER',                         '',                                  '4:52'],
+    [4,  'All of the Lights (Interlude)', '',                                  '1:02'],
+    [5,  'All of the Lights',             '',                                  '5:01'],   // selected
+    [6,  'Monster',                       'feat. JAY-Z, Rick Ross, Nicki Minaj','6:18'],
+    [7,  'So Appalled',                   'feat. JAY-Z, Pusha T, CyHi the Prynce','6:38'],
+    [8,  'Devil in a New Dress',          'feat. Rick Ross',                   '5:53'],
+    [9,  'Runaway',                       'feat. Pusha T',                     '9:08'],
+    [10, 'Hell of a Life',                '',                                  '5:27'],
+    [11, 'Blame Game',                    'feat. John Legend',                 '7:50'],
+    [12, 'Lost in the World',             'feat. Bon Iver',                    '4:16'],
+    [13, 'Who Will Survive in America',   '',                                  '1:38'],
+  ];
+  for (const [num, name, sub, dur] of tracks) {
+    const idx = String(num).padStart(2, ' ');
+    const subText = sub ? di(' — ' + sub) : '';
+    const left = `   ${di(idx + '.')}  ${bo(name)}${subText}`;
+    const line = rightAlign(left, di(dur));
+    inner.push(num === 5 ? sel(line) : line);
+  }
+
+  // pad to footer slot
+  while (inner.length < 36) inner.push('');
+  inner.push('   ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' play   ' + cy('[p]') + ' play all   ' + cy('[/]') + ' search   ' + cy('[esc]') + ' back');
+  inner.push('');
+  while (inner.length < 38) inner.push('');
+  return shell('hifi · device: hifi (cabin)', inner.slice(0, 38));
+}
+
+// ============================================================================
+// SCREEN 5: LIBRARY — full-screen
+// ============================================================================
+function screen_library() {
+  // Top-tab strip + blank padding.
+  const inner = topChrome('Library');
+  // Sub-tab strip beneath: which slice of the library to show.
+  const [subNames, subUnder] = subTabStrip('Playlists', ['Liked', 'Playlists', 'Albums', 'Artists']);
+  inner.push(subNames);
+  inner.push(subUnder);
+  inner.push('');
+  inner.push(' ' + di('─'.repeat(92)));
+  inner.push('');
+  inner.push(' ' + head('Your playlists') + di('  · 23 total'));
+  inner.push('');
+  const playlists = [
+    ['POWER',                        'chrisbolin',     42, true],
+    ['discover_lately',              'chrisbolin',    187, false],
+    ['driving',                      'chrisbolin',     54, false],
+    ['cabin energy',                 'chrisbolin',     31, false],
+    ['focus deep',                   'chrisbolin',     76, false],
+    ['Daily Mix 1',                  'Spotify',        50, false],
+    ['Release Radar',                'Spotify',        30, false],
+    ['Today\'s Top Hits',            'Spotify',        50, false],
+    ['On Repeat',                    'Spotify',        30, false],
+    ['Liked from Radio',             'chrisbolin',     14, false],
+    ['Strawberry Fields Forever',    'chrisbolin',      8, false],
+    ['running',                      'chrisbolin',     22, false],
+    ['rainy sunday',                 'chrisbolin',     17, false],
+    ['hardstyle warning',            'chrisbolin',     11, false],
+    ['vegas trip 2024',              'chrisbolin',      9, false],
+  ];
+  for (const [name, owner, count, isSelected] of playlists) {
+    const left = `  ${bo(name)}${di(' · ')}${di(owner)}`;
+    const right = di(String(count).padStart(3, ' ') + ' tracks');
+    const lineContent = pad(left, 94 - vlen(right) - 1) + right;
+    if (isSelected) inner.push(sel(' ' + pad(left, 94 - vlen(right) - 2) + right + ' '));
+    else inner.push(' ' + lineContent);
+  }
+  while (inner.length < 36) inner.push('');
+  inner.push('   ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' open   ' + cy('[tab]') + ' switch tab   ' + cy('[/]') + ' search   ' + cy('[esc]') + ' back');
+  inner.push('');
+  while (inner.length < 38) inner.push('');
+  return shell('hifi · device: hifi (cabin) · library', inner.slice(0, 38));
+}
+
+// ============================================================================
+// SCREEN 6: DEVICES overlay
+// ============================================================================
+function screen_devices() {
+  const bg = nowPlayingInner({withFooter: true});
+  bg[36] = '                    ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' transfer   ' + cy('[esc]') + ' back';
+
+  const overlay = {
+    x: 22,
+    y: 9,
+    w: 49,
+    h: 18,
+    title: 'devices',
+    contentRows: [
+      di('Select device for playback'),
+      '',
+      sel(`  ${ok('*')} ${bo('hifi (cabin)')}${di('  · this app  ')}        `),
+      `    ${di(' ')} ${bo('Chris\'s MacBook Pro')}${di('  · spotify')}    `,
+      `    ${di(' ')} ${bo('iPhone (Chris)')}${di('  · mobile')}           `,
+      `    ${di(' ')} ${bo('Kitchen Speaker')}${di('  · cast')}            `,
+      `    ${di(' ')} ${bo('Living Room TV')}${di('  · cast · offline')}   `,
+      '',
+      di('5 devices · ↑/↓ move · enter to transfer'),
+    ],
+  };
+  while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
+  const composed = compositeWithOverlay(bg, overlay);
+  return shell('hifi · device: hifi (cabin)', composed);
+}
+
+// ============================================================================
+// SCREEN 7: HELP overlay
+// ============================================================================
+function screen_help() {
+  const bg = nowPlayingInner({withFooter: true});
+  bg[36] = '                              ' + cy('[esc]') + ' back   ' + cy('[ctrl-c]') + ' quit';
+
+  const overlay = {
+    x: 25,
+    y: 8,
+    w: 44,
+    h: 22,
+    title: 'help',
+    contentRows: [
+      head('Hotkeys'),
+      '',
+      `  ${cy('space')}     play / pause`,
+      `  ${cy('shift ←/→')} seek ±10s`,
+      `  ${cy('/')}         search`,
+      `  ${cy(':')}         commands`,
+      `  ${cy('q')}         queue`,
+      `  ${cy('l')}         library`,
+      `  ${cy('d')}         devices`,
+      `  ${cy('?')}         help`,
+      `  ${cy('↑/↓')}       move selection`,
+      `  ${cy('enter')}     play / open`,
+      `  ${cy('esc')}       back`,
+      `  ${cy('ctrl-c')}    quit`,
+      '',
+      di('hifi · v0.1'),
+    ],
+  };
+  while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
+  const composed = compositeWithOverlay(bg, overlay);
+  return shell('hifi · device: hifi (cabin)', composed);
+}
+
+// ============================================================================
+// SCREEN 8: COMMAND palette
+// ============================================================================
+function screen_command() {
+  const bg = nowPlayingInner({withFooter: true});
+  bg[36] = '      ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' run   ' + cy('[esc]') + ' back';
+
+  const overlay = {
+    x: 15,
+    y: 7,
+    w: 64,
+    h: 22,
+    title: 'command (`:`)',
+    contentRows: [
+      `${cy(':')} pl`,
+      di('2 / 9 · ↑/↓ move · enter run · esc close'),
+      '',
+      sel(`  ${bo('play / pause')}      toggle playback on the current device  `),
+      `  ${bo('playlists')}         open library on the playlists tab`,
+      '',
+      di('All commands (matching "")'),
+      '',
+      `  ${bo('next')}              skip to the next track`,
+      `  ${bo('previous')}          skip back (or restart current track)`,
+      `  ${bo('reconnect')}         restart the 'hifi' Connect device`,
+      `  ${bo('queue')}             open the queue view`,
+      `  ${bo('library')}           open library`,
+      `  ${bo('devices')}           pick playback device`,
+      `  ${bo('search')}            open the search overlay`,
+      `  ${bo('help')}              show the hotkey help overlay`,
+      `  ${bo('quit')}              exit hifi`,
+    ],
+  };
+  while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
+  const composed = compositeWithOverlay(bg, overlay);
+  return shell('hifi · device: hifi (cabin)', composed);
+}
+
+// ---- registry --------------------------------------------------------------
+const SCREENS = [
+  { id: 'now-playing', name: 'Now Playing', desc: 'Track info, album art, progress, and the play queue below — the default screen.', build: screen_now_playing,
+    notes: 'Reached at boot or by pressing <span class="kbd">esc</span> from any overlay. Top block shows the current track (art, name, artist, album, progress). Below: <strong>Up next</strong> (the play queue) and <strong>Recently played</strong>. Most-used hotkeys live in the footer. Replaces the previous standalone Queue screen — the queue is part of the main view now, not a separate destination.' },
+  { id: 'search', name: 'Search', desc: 'Type to search the Spotify catalog. Centered overlay.', build: screen_search,
+    notes: 'Reached by <span class="kbd">/</span>. Debounced (250ms). Results split into Tracks · Albums · Artists · Playlists, with an extra "In current playlist" section when playing from a playlist. Enter on a track plays it; Enter on an album/playlist opens Browse as a full screen.' },
+  { id: 'browse', name: 'Browse', desc: 'Full-screen album or playlist view; track list with selection.', build: screen_browse,
+    notes: 'Reached by <span class="kbd">enter</span> on an album or playlist in Search or Library. Full-screen (not an overlay) — opening a collection feels like a navigation, not a popup. <span class="kbd">p</span> plays the whole collection (essential fallback when the tracks endpoint is API-locked). <span class="kbd">esc</span> returns to wherever you came from.' },
+  { id: 'library', name: 'Library', desc: 'Your saved playlists, liked, albums, and artists.', build: screen_library,
+    notes: 'Reached by <span class="kbd">l</span>. Tabs across the top (Liked · Playlists · Albums · Artists), <span class="kbd">tab</span>/<span class="kbd">shift+tab</span> cycles tabs. Selecting a row drills into a Browse view of that collection.' },
+  { id: 'devices', name: 'Devices', desc: 'Pick which Connect device receives playback.', build: screen_devices,
+    notes: 'Reached by <span class="kbd">d</span> or via <span class="kbd">:</span> devices. The asterisk marks the active device. Enter transfers playback to the selected one. Offline devices remain listed but dimmed.' },
+  { id: 'help', name: 'Help', desc: 'Hotkey reference for the active mode.', build: screen_help,
+    notes: 'Reached by <span class="kbd">?</span> from any mode. Sourced from the single HOTKEYS table in <code>src/keys.rs</code>, so it can\'t drift from the real keymap.' },
+  { id: 'command', name: 'Command palette', desc: 'Fuzzy-find any command.', build: screen_command,
+    notes: 'Reached by <span class="kbd">:</span>. Filters as you type; ranked by name match. Enter runs the highlighted command. Useful when you forget the hotkey for a less-common action.' },
+];
+
+// ---- mount -----------------------------------------------------------------
+// Each screen's mockup is built once and inserted into both the sidebar
+// thumbnail and the main full-size section. The thumbnail uses a transform
+// scale, the main uses native size — both share the same colored markup.
+const mainEl = document.getElementById('screens');
+const thumbListEl = document.getElementById('thumbList');
+
+SCREENS.forEach((s, idx) => {
+  const mockHtml = s.build();
+  const num = String(idx + 1).padStart(2, '0');
+
+  // Sidebar thumbnail (anchor link → scrolls to the main section).
+  const thumb = document.createElement('a');
+  thumb.className = 'thumb' + (idx === 0 ? ' active' : '');
+  thumb.href = `#${s.id}`;
+  thumb.dataset.id = s.id;
+  thumb.innerHTML = `
+    <div class="thumb-mock"><pre>${mockHtml}</pre></div>
+    <div class="thumb-label"><span class="num">${num}</span> ${s.name}</div>
+  `;
+  thumbListEl.appendChild(thumb);
+
+  // Main column: full-size mockup + header + notes.
+  const section = document.createElement('section');
+  section.className = 'screen';
+  section.id = s.id;
+  section.dataset.id = s.id;
+  section.innerHTML = `
+    <div class="screen-header">
+      <span class="num">${num}</span>
+      <h2 class="name">${s.name}</h2>
+      <span class="desc">${s.desc}</span>
+    </div>
+    <pre class="mock">${mockHtml}</pre>
+    <div class="notes">${s.notes}</div>
+  `;
+  mainEl.appendChild(section);
+});
+
+// Self-check: validate each rendered line is exactly 96 visible chars. Runs
+// over the main column's mocks (the thumbnails contain identical markup).
+(function validate() {
+  const errors = [];
+  document.querySelectorAll('main pre.mock').forEach(pre => {
+    const screen = pre.closest('.screen').dataset.id;
+    const lines = pre.innerHTML.split('\n');
+    if (lines.length !== 40) errors.push(`${screen}: ${lines.length} lines, expected 40`);
+    lines.forEach((l, i) => {
+      const visible = l.replace(/<[^>]*>/g, '').length;
+      if (visible !== 96) errors.push(`${screen} line ${i}: ${visible} cols, expected 96`);
+    });
+  });
+  if (errors.length) {
+    console.warn('mockup width/height violations:', errors);
+  } else {
+    console.log('all 8 mockups are exactly 96×40');
+  }
+})();
+
+// Smooth-scroll on thumbnail click. Default anchor behavior would jump
+// instantly; smooth scroll feels less jarring.
+document.querySelectorAll('a.thumb').forEach(thumb => {
+  thumb.addEventListener('click', e => {
+    e.preventDefault();
+    const id = thumb.dataset.id;
+    const target = document.getElementById(id);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+
+// Mark the thumbnail of whichever section is most visible as "active".
+// IntersectionObserver fires when a section's top crosses a band 20% from
+// the viewport top — picking the section that's currently anchored at the
+// top of the reader's view.
+const idToThumb = Object.fromEntries(
+  [...document.querySelectorAll('a.thumb')].map(t => [t.dataset.id, t])
+);
+const observer = new IntersectionObserver(entries => {
+  // Find the entry currently the highest fraction visible AND intersecting.
+  const visible = entries.filter(e => e.isIntersecting);
+  if (!visible.length) return;
+  visible.sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+  const id = visible[0].target.dataset.id;
+  Object.values(idToThumb).forEach(t => t.classList.remove('active'));
+  const thumb = idToThumb[id];
+  if (thumb) {
+    thumb.classList.add('active');
+    // Keep the active thumb visible in the sidebar without yanking the page.
+    thumb.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}, {
+  // Only count a section once it's reached the top region of the viewport.
+  rootMargin: '-15% 0px -55% 0px',
+  threshold: [0, 0.25, 0.5, 0.75, 1],
+});
+document.querySelectorAll('main .screen').forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

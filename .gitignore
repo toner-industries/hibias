@@ -6,3 +6,7 @@ hifi-recent.json
 
 /target
 **/*.rs.bk
+
+# Local scratch space for design mockups, exploratory artifacts, and other
+# throwaways. Claude puts non-shippable files here.
+/scratch/

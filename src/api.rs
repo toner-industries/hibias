@@ -211,6 +211,39 @@ struct PlaylistTrackItem {
     track: Option<Track>,
 }
 
+/// `GET /me/tracks` → `{ items: [{ track: Track }] }`.
+#[derive(Debug, Deserialize)]
+struct SavedTracksPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<SavedTrackItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedTrackItem {
+    #[serde(default)]
+    track: Option<Track>,
+}
+
+/// `GET /me/albums` → `{ items: [{ album: Album }] }`.
+#[derive(Debug, Deserialize)]
+struct SavedAlbumsPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<SavedAlbumItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedAlbumItem {
+    #[serde(default)]
+    album: Option<Album>,
+}
+
+/// `GET /me/following?type=artist` → `{ artists: { items: [Artist] } }`.
+#[derive(Debug, Deserialize)]
+struct FollowedArtistsPayload {
+    #[serde(default)]
+    artists: Option<Page<Artist>>,
+}
+
 /// The set of Spotify operations the rest of the app needs. Splitting this
 /// out lets tests inject a `FakeSpotify` (see `test_support`) that returns
 /// programmed responses without touching the wire — every action handler
@@ -241,6 +274,12 @@ pub trait SpotifyApi: Send + Sync {
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
     async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>>;
     async fn save_track(&self, track_id: &str) -> Result<()>;
+    /// The user's saved/library collections, for the Library tab. Each is
+    /// fetched lazily, on first focus of its sub-tab.
+    async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>>;
+    async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>>;
+    async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>>;
+    async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>>;
 }
 
 #[async_trait]
@@ -304,6 +343,18 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn save_track(&self, track_id: &str) -> Result<()> {
         SpotifyClient::save_track(self, track_id).await
+    }
+    async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
+        SpotifyClient::get_saved_tracks(self, limit).await
+    }
+    async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>> {
+        SpotifyClient::get_saved_playlists(self, limit).await
+    }
+    async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>> {
+        SpotifyClient::get_saved_albums(self, limit).await
+    }
+    async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
+        SpotifyClient::get_followed_artists(self, limit).await
     }
 }
 
@@ -609,6 +660,54 @@ impl SpotifyClient {
         let page: PlaylistTracksPage =
             serde_json::from_str(&body).context("parse playlist tracks")?;
         Ok(page.items.into_iter().filter_map(|i| i.track).collect())
+    }
+
+    pub async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
+        let url = format!("{BASE}/me/tracks?limit={limit}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let page: SavedTracksPage =
+            serde_json::from_str(&body).context("parse saved tracks")?;
+        Ok(page.items.into_iter().filter_map(|i| i.track).collect())
+    }
+
+    pub async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>> {
+        let url = format!("{BASE}/me/playlists?limit={limit}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let page: Page<Playlist> =
+            serde_json::from_str(&body).context("parse saved playlists")?;
+        Ok(page.into_items())
+    }
+
+    pub async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>> {
+        let url = format!("{BASE}/me/albums?limit={limit}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let page: SavedAlbumsPage =
+            serde_json::from_str(&body).context("parse saved albums")?;
+        Ok(page.items.into_iter().filter_map(|i| i.album).collect())
+    }
+
+    pub async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
+        let url = format!("{BASE}/me/following?type=artist&limit={limit}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let payload: FollowedArtistsPayload =
+            serde_json::from_str(&body).context("parse followed artists")?;
+        Ok(payload.artists.map(Page::into_items).unwrap_or_default())
     }
 }
 

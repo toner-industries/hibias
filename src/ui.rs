@@ -8,7 +8,11 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 use std::time::Instant;
 
-use crate::app::{AppState, BrowseState, Cmd, CommandState, Mode, SearchState};
+use crate::app::{
+    AppState, BrowseState, Cmd, CommandState, DevicesState, LibraryState, LibraryTab, Overlay,
+    SearchState, Tab,
+};
+use crate::art::ArtCache;
 use crate::keys::{self, ModeMask};
 
 /// Fixed canvas size. Layouts compute against this regardless of the actual
@@ -18,7 +22,7 @@ use crate::keys::{self, ModeMask};
 pub const FIXED_W: u16 = 96;
 pub const FIXED_H: u16 = 40;
 
-pub fn render(f: &mut Frame, state: &mut AppState) {
+pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
     // Pin to a fixed-size top-left rect — ratatui silently clips writes
     // that fall outside the terminal buffer, so a smaller terminal just
     // crops the canvas instead of rearranging the layout.
@@ -40,38 +44,76 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
 
     let status = status_line(state);
     let status_h = if status.is_some() { 1 } else { 0 };
-    let top_h = top_height(inner.height);
 
-    let layout = Layout::default()
+    // Shared chrome: a tab strip on top, the body in the middle (per active
+    // tab), then the optional status line and the footer.
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
+        .constraints([
+            Constraint::Length(1),         // tab strip
+            Constraint::Min(0),            // body
+            Constraint::Length(status_h),  // status line
+            Constraint::Length(1),         // footer
+        ])
+        .split(inner);
+
+    render_tab_strip(f, rows[0], state.tab);
+    match state.tab {
+        Tab::NowPlaying => render_now_playing_body(f, rows[1], state, art),
+        Tab::Search => render_search_tab(f, rows[1], &state.search),
+        Tab::Library => render_library_tab(f, rows[1], &state.library),
+    }
+    if let Some((text, color)) = status {
+        let p = Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(color));
+        f.render_widget(p, rows[2]);
+    }
+    render_footer(f, rows[3], crate::app::active_mask(state));
+
+    // Transient overlays draw on top of the whole canvas.
+    match &state.overlay {
+        None => {}
+        Some(Overlay::Help) => render_help_overlay(f, area),
+        Some(Overlay::Command(cmd)) => render_command_overlay(f, area, cmd),
+        Some(Overlay::Devices(dev)) => render_devices_overlay(f, area, dev),
+        Some(Overlay::Browse(browse)) => render_browse_overlay(f, area, browse),
+    }
+}
+
+/// The top "Now Playing | Search | Library" strip. The active tab is cyan and
+/// bold; the others are dim. Mirrors the tab row in design/mockups.html.
+fn render_tab_strip(f: &mut Frame, area: Rect, active: Tab) {
+    let mut spans = Vec::new();
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        }
+        let style = if *tab == active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(tab.label(), style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Now Playing body: album art + track info up top, progress at the bottom.
+fn render_now_playing_body(f: &mut Frame, area: Rect, state: &mut AppState, art: &mut ArtCache) {
+    let top_h = top_height(area.height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(top_h),
             Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(status_h),
-            Constraint::Length(1),
         ])
-        .split(inner);
-
-    render_top(f, layout[0], state);
-    render_progress(f, layout[2], layout[3], state);
-    if let Some((text, color)) = status {
-        let p = Paragraph::new(text)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(color));
-        f.render_widget(p, layout[4]);
-    }
-    render_footer(f, layout[5], state.mode.mask());
-
-    match &state.mode {
-        Mode::NowPlaying => {}
-        Mode::Search(search) => render_search_overlay(f, area, search),
-        Mode::Help => render_help_overlay(f, area),
-        Mode::Command(cmd) => render_command_overlay(f, area, cmd),
-        Mode::Browse(browse) => render_browse_overlay(f, area, browse),
-    }
+        .split(area);
+    render_top(f, rows[0], state, art);
+    render_progress(f, rows[2], rows[3], state);
 }
 
 fn top_height(inner_h: u16) -> u16 {
@@ -120,20 +162,25 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
     None
 }
 
-fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {
-    // Only show art alongside a real track. apply_playback_inner already
-    // wipes `art` when the track clears, but tying both conditions here
-    // keeps the rendering invariant local to this function.
+fn render_top(f: &mut Frame, area: Rect, state: &AppState, art: &mut ArtCache) {
+    // Only show art alongside a real track. The cache only returns an image
+    // whose track id matches what's playing, so a stale cover is never paired
+    // with a changed track — but we also gate on `has_track` here to keep the
+    // rendering invariant local to this function.
     let has_track = state
         .playback
         .as_ref()
         .and_then(|p| p.item.as_ref())
         .is_some();
-    let want_art = state.art.is_some() && has_track && area.width >= 50 && area.height >= 4;
-    if !want_art {
+    let cover = if has_track && area.width >= 50 && area.height >= 4 {
+        art.get_for(state.current_track_id.as_deref())
+    } else {
+        None
+    };
+    let Some(cover) = cover else {
         render_info(f, area, state);
         return;
-    }
+    };
     let art_w = (area.height * 2).min(20).min(area.width / 3);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -143,9 +190,7 @@ fn render_top(f: &mut Frame, area: Rect, state: &mut AppState) {
             Constraint::Min(0),
         ])
         .split(area);
-    if let Some(art) = state.art.as_mut() {
-        f.render_stateful_widget(StatefulImage::default(), cols[0], art);
-    }
+    f.render_stateful_widget(StatefulImage::default(), cols[0], cover);
     render_info(f, cols[2], state);
 }
 
@@ -242,13 +287,7 @@ fn render_footer(f: &mut Frame, area: Rect, mode: ModeMask) {
     f.render_widget(p, area);
 }
 
-fn render_search_overlay(f: &mut Frame, area: Rect, s: &SearchState) {
-    let rect = centered(area, 70, 80);
-    f.render_widget(Clear, rect);
-    let block = Block::default().title(" search ").borders(Borders::ALL);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
+fn render_search_tab(f: &mut Frame, area: Rect, s: &SearchState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -256,7 +295,7 @@ fn render_search_overlay(f: &mut Frame, area: Rect, s: &SearchState) {
             Constraint::Length(1), // hint / count
             Constraint::Min(0),    // results
         ])
-        .split(inner);
+        .split(area);
 
     render_search_input(f, layout[0], s);
     let total = visible_total(s);
@@ -664,7 +703,7 @@ fn compute_scroll(selected: usize, total: usize, list_h: usize) -> usize {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let rows: Vec<&keys::Hotkey> = keys::for_mode(ModeMask::NOW_PLAYING).collect();
+    let rows = keys::HELP_ROWS;
     let height = (rows.len() as u16 + 4).min(area.height);
     let width = 44u16.min(area.width.saturating_sub(2));
     let rect = centered_exact(area, width, height);
@@ -673,15 +712,15 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut lines = vec![Line::from(Span::styled(
-        "Hotkeys",
-        Style::default().fg(Color::DarkGray),
-    )), Line::from("")];
-    for h in rows {
+    let mut lines = vec![
+        Line::from(Span::styled("Hotkeys", Style::default().fg(Color::DarkGray))),
+        Line::from(""),
+    ];
+    for (key, action) in rows {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<8}", h.key), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  {key:<10}"), Style::default().fg(Color::Cyan)),
             Span::raw("  "),
-            Span::raw(h.action),
+            Span::raw(*action),
         ]));
     }
     lines.push(Line::from(""));
@@ -691,6 +730,189 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     )));
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The Library tab: a sub-tab strip (Liked / Playlists / Albums / Artists)
+/// over the active section's list. Mirrors design/mockups.html.
+fn render_library_tab(f: &mut Frame, area: Rect, lib: &LibraryState) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // sub-tab strip
+            Constraint::Length(1), // header / status
+            Constraint::Min(0),    // list
+        ])
+        .split(area);
+
+    // Sub-tab strip.
+    let mut spans = Vec::new();
+    for (i, t) in LibraryTab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        let style = if *t == lib.tab {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(t.label(), style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+    // Collect the active section's display rows + status, generically.
+    let (status, labels, loading, error) = library_section_view(lib);
+    let header = if loading {
+        ("loading…".to_string(), Color::DarkGray)
+    } else if let Some(e) = error {
+        (truncate_for_hint(e, 60), Color::Red)
+    } else {
+        (status, Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(header.0).style(Style::default().fg(header.1)),
+        rows[1],
+    );
+
+    let list_h = rows[2].height as usize;
+    if list_h == 0 || labels.is_empty() {
+        return;
+    }
+    let scroll = compute_scroll(lib.selected, labels.len(), list_h);
+    let end = (scroll + list_h).min(labels.len());
+    let lines: Vec<Line> = labels[scroll..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, label)| styled_row(format!("  {label}"), scroll + offset == lib.selected))
+        .collect();
+    f.render_widget(Paragraph::new(lines), rows[2]);
+}
+
+/// Build the (status, row labels, loading, error) view for the active Library
+/// sub-tab, so the renderer stays generic over the four section types.
+fn library_section_view(lib: &LibraryState) -> (String, Vec<String>, bool, Option<&str>) {
+    match lib.tab {
+        LibraryTab::Liked => {
+            let labels = lib
+                .liked
+                .items
+                .iter()
+                .map(|t| {
+                    let artists =
+                        t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+                    if artists.is_empty() {
+                        t.name.clone()
+                    } else {
+                        format!("{} — {}", t.name, artists)
+                    }
+                })
+                .collect::<Vec<_>>();
+            (
+                format!("Liked songs · {}", lib.liked.items.len()),
+                labels,
+                lib.liked.loading,
+                lib.liked.error.as_deref(),
+            )
+        }
+        LibraryTab::Playlists => {
+            let labels = lib
+                .playlists
+                .items
+                .iter()
+                .map(|p| {
+                    let owner = p.owner.as_ref().and_then(|o| o.display_name.as_deref()).unwrap_or("");
+                    if owner.is_empty() {
+                        p.name.clone()
+                    } else {
+                        format!("{} — {}", p.name, owner)
+                    }
+                })
+                .collect::<Vec<_>>();
+            (
+                format!("Your playlists · {}", lib.playlists.items.len()),
+                labels,
+                lib.playlists.loading,
+                lib.playlists.error.as_deref(),
+            )
+        }
+        LibraryTab::Albums => {
+            let labels = lib
+                .albums
+                .items
+                .iter()
+                .map(|a| {
+                    let artists =
+                        a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ");
+                    if artists.is_empty() {
+                        a.name.clone()
+                    } else {
+                        format!("{} — {}", a.name, artists)
+                    }
+                })
+                .collect::<Vec<_>>();
+            (
+                format!("Saved albums · {}", lib.albums.items.len()),
+                labels,
+                lib.albums.loading,
+                lib.albums.error.as_deref(),
+            )
+        }
+        LibraryTab::Artists => {
+            let labels = lib.artists.items.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+            (
+                format!("Following · {}", lib.artists.items.len()),
+                labels,
+                lib.artists.loading,
+                lib.artists.error.as_deref(),
+            )
+        }
+    }
+}
+
+/// The device-picker overlay — a centered box listing Connect devices, the
+/// active one marked. Mirrors design/mockups.html.
+fn render_devices_overlay(f: &mut Frame, area: Rect, dev: &DevicesState) {
+    let desired = 4 + dev.devices.len().max(1) as u16;
+    let height = desired.min(area.height.saturating_sub(2));
+    let width = 49u16.min(area.width.saturating_sub(2));
+    let rect = centered_exact(area, width, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default().title(" devices ").borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let (status, color) = if dev.loading {
+        ("loading devices…".to_string(), Color::DarkGray)
+    } else if let Some(e) = &dev.error {
+        (truncate_for_hint(e, 45), Color::Red)
+    } else if dev.devices.is_empty() {
+        ("no devices found".to_string(), Color::DarkGray)
+    } else {
+        (
+            format!("{} devices · ↑/↓ move · enter transfer", dev.devices.len()),
+            Color::DarkGray,
+        )
+    };
+    f.render_widget(
+        Paragraph::new(status).style(Style::default().fg(color)),
+        layout[0],
+    );
+
+    let lines: Vec<Line> = dev
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let marker = if d.is_active { "✓" } else { " " };
+            let label = format!("  {marker} {}", d.name);
+            styled_row(label, i == dev.selected)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), layout[1]);
 }
 
 fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {

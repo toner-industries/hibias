@@ -5,7 +5,6 @@
 //! the run loop drives. It is frontend-agnostic: it consumes
 //! [`crate::input::Input`] values, not crossterm types.
 
-use ratatui_image::protocol::StatefulProtocol;
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -14,11 +13,12 @@ use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
 use crate::api::{
-    self, Context as PlaybackContext, Playback, RateLimited, SearchResults, SpotifyApi, Track,
+    self, Album, Artist, Context as PlaybackContext, Device, Playback, Playlist, RateLimited,
+    SearchResults, SpotifyApi, Track,
 };
 use crate::input::{Input, Key};
 use crate::keys::ModeMask;
-use crate::{art, log, recent, streaming};
+use crate::{log, recent, streaming};
 
 // ---------------------------------------------------------------------------
 // State
@@ -29,10 +29,26 @@ pub struct AppState {
     pub last_poll: Option<Instant>,
     pub error: Option<String>,
     pub rate_limited_until: Option<Instant>,
-    pub art: Option<StatefulProtocol>,
+    /// What album art the head should display, as plain data (no ratatui
+    /// types). The TUI head owns the decoded image cache (see
+    /// [`crate::art::ArtCache`]) and fetches against this; an HTTP head could
+    /// serve the URL directly. Set on track change, cleared when nothing
+    /// useful is playing.
+    pub art_request: Option<ArtRequest>,
     pub current_track_id: Option<String>,
     pub device_name: Option<String>,
-    pub mode: Mode,
+    /// The persistent top-level tab the user is on (Now Playing / Search /
+    /// Library). Switching tabs never destroys a tab's state — Search keeps
+    /// its query, Library keeps its loaded sections.
+    pub tab: Tab,
+    /// A transient surface stacked on top of the active tab (help, command
+    /// palette, device picker, or a browsed collection). `None` = just the
+    /// tab. Closing an overlay (Esc) reveals the tab underneath unchanged.
+    pub overlay: Option<Overlay>,
+    /// Search tab state. Persistent so tabbing away and back keeps the query.
+    pub search: SearchState,
+    /// Library tab state — four lazily-loaded sections.
+    pub library: LibraryState,
     /// Unix ms of the last local action (play/pause). When `/me/player`
     /// returns data with an older timestamp than this, we treat it as stale
     /// — librespot frequently fails to report state to Spotify Connect, so
@@ -78,10 +94,13 @@ impl Default for AppState {
             last_poll: None,
             error: None,
             rate_limited_until: None,
-            art: None,
+            art_request: None,
             current_track_id: None,
             device_name: None,
-            mode: Mode::default(),
+            tab: Tab::default(),
+            overlay: None,
+            search: SearchState::new(None, Vec::new(), Vec::new()),
+            library: LibraryState::default(),
             last_local_action_ms: 0,
             device_present: None,
             recent_tracks: Vec::new(),
@@ -95,36 +114,117 @@ impl Default for AppState {
     }
 }
 
-#[derive(Default)]
-pub enum Mode {
-    #[default]
-    NowPlaying,
-    Search(SearchState),
-    Help,
-    Command(CommandState),
-    Browse(BrowseState),
+/// Frontend-neutral "show this cover" signal. The core sets it; the head
+/// decides how to render (TUI decodes into [`crate::art::ArtCache`], an HTTP
+/// head could proxy the URL). Plain data so `AppState` imports nothing from
+/// any UI framework.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtRequest {
+    pub track_id: String,
+    pub url: String,
 }
 
-impl Mode {
-    pub fn mask(&self) -> ModeMask {
+/// The persistent top-level tabs, shown as a strip across the top of every
+/// screen (mirrors `design/mockups.html`).
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
+    #[default]
+    NowPlaying,
+    Search,
+    Library,
+}
+
+impl Tab {
+    pub const ALL: &'static [Tab] = &[Tab::NowPlaying, Tab::Search, Tab::Library];
+
+    pub fn next(self) -> Tab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Tab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn name(self) -> &'static str {
         match self {
-            Mode::NowPlaying => ModeMask::NOW_PLAYING,
-            Mode::Search(_) => ModeMask::SEARCH,
-            Mode::Help => ModeMask::HELP,
-            Mode::Command(_) => ModeMask::COMMAND,
-            Mode::Browse(_) => ModeMask::BROWSE,
+            Tab::NowPlaying => "now_playing",
+            Tab::Search => "search",
+            Tab::Library => "library",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::NowPlaying => "Now Playing",
+            Tab::Search => "Search",
+            Tab::Library => "Library",
+        }
+    }
+
+    pub fn mask(self) -> ModeMask {
+        match self {
+            Tab::NowPlaying => ModeMask::NOW_PLAYING,
+            Tab::Search => ModeMask::SEARCH,
+            Tab::Library => ModeMask::LIBRARY,
         }
     }
 }
 
-pub fn mode_name(s: &AppState) -> &'static str {
-    match s.mode {
-        Mode::NowPlaying => "now_playing",
-        Mode::Search(_) => "search",
-        Mode::Help => "help",
-        Mode::Command(_) => "command",
-        Mode::Browse(_) => "browse",
+/// A transient surface drawn over the active tab. Help/Command/Devices render
+/// as centered boxes; Browse fills the body. Each carries its own state inline.
+pub enum Overlay {
+    Help,
+    Command(CommandState),
+    Devices(DevicesState),
+    Browse(BrowseState),
+}
+
+impl Overlay {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Overlay::Help => "help",
+            Overlay::Command(_) => "command",
+            Overlay::Devices(_) => "devices",
+            Overlay::Browse(_) => "browse",
+        }
     }
+
+    pub fn mask(&self) -> ModeMask {
+        match self {
+            Overlay::Help => ModeMask::HELP,
+            Overlay::Command(_) => ModeMask::COMMAND,
+            Overlay::Devices(_) => ModeMask::DEVICES,
+            Overlay::Browse(_) => ModeMask::BROWSE,
+        }
+    }
+}
+
+/// Name of the surface the user is looking at — overlay if one is open, else
+/// the active tab. Used for logging and tests.
+pub fn mode_name(s: &AppState) -> &'static str {
+    match &s.overlay {
+        Some(ov) => ov.name(),
+        None => s.tab.name(),
+    }
+}
+
+/// The keymask whose footer/help should show — the overlay's if one is open
+/// (its keys replace the tab's), else the active tab's.
+pub fn active_mask(s: &AppState) -> ModeMask {
+    match &s.overlay {
+        Some(ov) => ov.mask(),
+        None => s.tab.mask(),
+    }
+}
+
+/// True when the focused surface is capturing typed characters, so the global
+/// launcher keys (`/ : ? d l tab`) must NOT steal them: the Search tab (no
+/// overlay) and the Command palette. Everywhere else those keys are live.
+pub fn is_capturing_text(s: &AppState) -> bool {
+    matches!(s.overlay, Some(Overlay::Command(_)))
+        || (s.tab == Tab::Search && s.overlay.is_none())
 }
 
 /// Album or playlist metadata, captured at the moment the user hit Enter
@@ -158,11 +258,108 @@ pub struct BrowseState {
     pub loading: bool,
     pub error: Option<String>,
     pub selected: usize,
-    /// The Search state we came from, kept here so Esc can restore the
-    /// user's query, results, and selection exactly as they left it.
-    pub prior_search: SearchState,
     /// Monotonic id so a slow fetch that resolves after the user has
     /// already navigated away can be dropped instead of clobbering state.
+    pub fetch_id: u64,
+}
+
+/// One lazily-loaded list in the Library tab. `loaded` distinguishes "never
+/// fetched" from "fetched, empty" so we don't refetch a genuinely-empty
+/// section on every focus.
+pub struct Section<T> {
+    pub items: Vec<T>,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Bumped per fetch so a slow response that lands after the user moved on
+    /// is dropped instead of clobbering newer state.
+    pub fetch_id: u64,
+}
+
+// Hand-written so `Section<T>` is Default for any `T` (the derive would
+// wrongly require `T: Default` for the `Vec<T>` field).
+impl<T> Default for Section<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            loaded: false,
+            loading: false,
+            error: None,
+            fetch_id: 0,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LibraryTab {
+    #[default]
+    Liked,
+    Playlists,
+    Albums,
+    Artists,
+}
+
+impl LibraryTab {
+    pub const ALL: &'static [LibraryTab] = &[
+        LibraryTab::Liked,
+        LibraryTab::Playlists,
+        LibraryTab::Albums,
+        LibraryTab::Artists,
+    ];
+
+    pub fn next(self) -> LibraryTab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> LibraryTab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibraryTab::Liked => "Liked",
+            LibraryTab::Playlists => "Playlists",
+            LibraryTab::Albums => "Albums",
+            LibraryTab::Artists => "Artists",
+        }
+    }
+}
+
+/// Library tab state: the active sub-tab plus its four independently-loaded
+/// sections. Each section is fetched on first focus only (rate-limit hygiene).
+#[derive(Default)]
+pub struct LibraryState {
+    pub tab: LibraryTab,
+    pub selected: usize,
+    pub liked: Section<Track>,
+    pub playlists: Section<Playlist>,
+    pub albums: Section<Album>,
+    pub artists: Section<Artist>,
+}
+
+impl LibraryState {
+    /// Number of rows in the active sub-tab — used to bound selection.
+    pub fn row_count(&self) -> usize {
+        match self.tab {
+            LibraryTab::Liked => self.liked.items.len(),
+            LibraryTab::Playlists => self.playlists.items.len(),
+            LibraryTab::Albums => self.albums.items.len(),
+            LibraryTab::Artists => self.artists.items.len(),
+        }
+    }
+}
+
+/// Device-picker overlay state. Devices are fetched once when the overlay
+/// opens — never on a timer (background device polling was removed for
+/// rate-limit reasons).
+#[derive(Default)]
+pub struct DevicesState {
+    pub devices: Vec<Device>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub selected: usize,
     pub fetch_id: u64,
 }
 
@@ -316,6 +513,7 @@ pub struct InContext {
 // Key dispatch
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub enum KeyAction {
     Stay,
     Quit,
@@ -337,6 +535,14 @@ pub enum KeyAction {
     PrevTrack,
     Reconnect,
     LikeCurrent,
+    /// Focus the Library tab and lazily load its active sub-tab.
+    OpenLibrary,
+    /// Play the selected track in the Library "Liked" sub-tab.
+    PlayLibrarySelection,
+    /// Open the device picker overlay and fetch the device list once.
+    OpenDevices,
+    /// Transfer playback to the given Connect device id (from the picker).
+    TransferToDevice(String),
 }
 
 const SEEK_STEP_MS: i64 = 10_000;
@@ -360,173 +566,259 @@ pub enum PlayAction {
 pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction {
     let mut s = state.lock().await;
     let shift = input.mods.shift;
-    match &mut s.mode {
-        Mode::NowPlaying => match input.key {
-            Key::Char('q') | Key::Esc => KeyAction::Quit,
-            Key::Char(' ') => KeyAction::TogglePlayback,
-            Key::Left if shift => KeyAction::Seek(-SEEK_STEP_MS),
-            Key::Right if shift => KeyAction::Seek(SEEK_STEP_MS),
-            Key::Char('/') => KeyAction::EnterSearch,
+
+    // Tab/Shift-Tab always cycle the top tabs — they're not printable, so even
+    // a text field (Search, Command) can't legitimately want them as input.
+    if matches!(input.key, Key::Tab) {
+        s.tab = if shift { s.tab.prev() } else { s.tab.next() };
+        s.overlay = None;
+        return tab_entry_action(s.tab);
+    }
+
+    // 1. Global launcher keys. These fire regardless of which tab/overlay is
+    //    active, EXCEPT when a text field is capturing characters (Search tab,
+    //    Command palette) — there, the printable `/ : ? d l` are literal input.
+    if !is_capturing_text(&s) {
+        match input.key {
+            Key::Char('/') => {
+                s.overlay = None;
+                return KeyAction::EnterSearch;
+            }
             Key::Char(':') => {
-                s.mode = Mode::Command(CommandState::default());
-                KeyAction::Stay
+                s.overlay = Some(Overlay::Command(CommandState::default()));
+                return KeyAction::Stay;
             }
             Key::Char('?') => {
-                s.mode = Mode::Help;
-                KeyAction::Stay
+                s.overlay = Some(Overlay::Help);
+                return KeyAction::Stay;
             }
-            _ => KeyAction::Stay,
-        },
-        Mode::Search(search) => match input.key {
-            Key::Esc => {
-                if let Some(h) = search.debounce.take() {
-                    h.abort();
-                }
-                s.mode = Mode::NowPlaying;
-                KeyAction::Stay
+            Key::Char('d') => {
+                return KeyAction::OpenDevices;
             }
-            Key::Up => {
-                if search.selected > 0 {
-                    search.selected -= 1;
-                }
-                KeyAction::Stay
+            Key::Char('l') => {
+                s.tab = Tab::Library;
+                s.overlay = None;
+                return KeyAction::OpenLibrary;
             }
-            Key::Down => {
-                let max = visible_row_count(search).saturating_sub(1);
-                if search.selected < max {
-                    search.selected += 1;
-                }
-                KeyAction::Stay
+            _ => {}
+        }
+    }
+
+    // 2. An open overlay consumes everything else.
+    if s.overlay.is_some() {
+        return dispatch_overlay(&mut s, input);
+    }
+
+    // 3. The active tab handles the rest.
+    match s.tab {
+        Tab::NowPlaying => dispatch_now_playing(&mut s, input, shift),
+        Tab::Search => dispatch_search(&mut s, input),
+        Tab::Library => dispatch_library(&mut s, input),
+    }
+}
+
+/// What to do right after landing on a tab via `tab`/`shift+tab`: Search
+/// re-seeds recents, Library lazy-loads its sub-tab, Now Playing is inert.
+fn tab_entry_action(tab: Tab) -> KeyAction {
+    match tab {
+        Tab::NowPlaying => KeyAction::Stay,
+        Tab::Search => KeyAction::EnterSearch,
+        Tab::Library => KeyAction::OpenLibrary,
+    }
+}
+
+fn dispatch_now_playing(s: &mut AppState, input: Input, shift: bool) -> KeyAction {
+    match input.key {
+        Key::Char('q') | Key::Esc => KeyAction::Quit,
+        Key::Char(' ') => KeyAction::TogglePlayback,
+        Key::Left if shift => KeyAction::Seek(-SEEK_STEP_MS),
+        Key::Right if shift => KeyAction::Seek(SEEK_STEP_MS),
+        _ => {
+            let _ = s;
+            KeyAction::Stay
+        }
+    }
+}
+
+fn dispatch_search(s: &mut AppState, input: Input) -> KeyAction {
+    let search = &mut s.search;
+    match input.key {
+        Key::Esc => {
+            if let Some(h) = search.debounce.take() {
+                h.abort();
             }
-            Key::Enter => match resolve_full_selection(search) {
-                Some(SelectionAction::PromoteQuery(q)) => {
-                    search.input = q.clone();
-                    search.cursor = q.chars().count();
-                    refilter_in_context(search);
-                    KeyAction::SearchInputChanged
-                }
-                Some(SelectionAction::Play(_)) => KeyAction::PlaySelection,
-                Some(SelectionAction::Browse(coll)) => KeyAction::OpenBrowse(coll),
-                None => KeyAction::Stay,
-            },
-            Key::Backspace => {
-                if search.cursor > 0 {
-                    let byte = char_idx_to_byte(&search.input, search.cursor - 1);
-                    search.input.remove(byte);
-                    search.cursor -= 1;
-                    refilter_in_context(search);
-                    KeyAction::SearchInputChanged
-                } else {
-                    KeyAction::Stay
-                }
+            s.tab = Tab::NowPlaying;
+            KeyAction::Stay
+        }
+        Key::Up => {
+            if search.selected > 0 {
+                search.selected -= 1;
             }
-            Key::Left => {
-                if search.cursor > 0 {
-                    search.cursor -= 1;
-                }
-                KeyAction::Stay
+            KeyAction::Stay
+        }
+        Key::Down => {
+            let max = visible_row_count(search).saturating_sub(1);
+            if search.selected < max {
+                search.selected += 1;
             }
-            Key::Right => {
-                let max = search.input.chars().count();
-                if search.cursor < max {
-                    search.cursor += 1;
-                }
-                KeyAction::Stay
-            }
-            Key::Char(c) => {
-                let byte = char_idx_to_byte(&search.input, search.cursor);
-                search.input.insert(byte, c);
-                search.cursor += 1;
+            KeyAction::Stay
+        }
+        Key::Enter => match resolve_full_selection(search) {
+            Some(SelectionAction::PromoteQuery(q)) => {
+                search.input = q.clone();
+                search.cursor = q.chars().count();
                 refilter_in_context(search);
                 KeyAction::SearchInputChanged
             }
-            _ => KeyAction::Stay,
+            Some(SelectionAction::Play(_)) => KeyAction::PlaySelection,
+            Some(SelectionAction::Browse(coll)) => KeyAction::OpenBrowse(coll),
+            None => KeyAction::Stay,
         },
-        Mode::Help => match input.key {
-            Key::Esc | Key::Char('?') | Key::Char('q') => {
-                s.mode = Mode::NowPlaying;
+        Key::Backspace => {
+            if search.cursor > 0 {
+                let byte = char_idx_to_byte(&search.input, search.cursor - 1);
+                search.input.remove(byte);
+                search.cursor -= 1;
+                refilter_in_context(search);
+                KeyAction::SearchInputChanged
+            } else {
                 KeyAction::Stay
             }
-            _ => KeyAction::Stay,
+        }
+        Key::Left => {
+            if search.cursor > 0 {
+                search.cursor -= 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Right => {
+            let max = search.input.chars().count();
+            if search.cursor < max {
+                search.cursor += 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Char(c) => {
+            let byte = char_idx_to_byte(&search.input, search.cursor);
+            search.input.insert(byte, c);
+            search.cursor += 1;
+            refilter_in_context(search);
+            KeyAction::SearchInputChanged
+        }
+        _ => KeyAction::Stay,
+    }
+}
+
+fn dispatch_library(s: &mut AppState, input: Input) -> KeyAction {
+    match input.key {
+        Key::Esc => {
+            s.tab = Tab::NowPlaying;
+            KeyAction::Stay
+        }
+        // Left/Right cycle the sub-tabs (global `tab` is reserved for the top
+        // tabs). Landing on a sub-tab lazy-loads it.
+        Key::Left | Key::Right => {
+            s.library.tab = if matches!(input.key, Key::Right) {
+                s.library.tab.next()
+            } else {
+                s.library.tab.prev()
+            };
+            s.library.selected = 0;
+            KeyAction::OpenLibrary
+        }
+        Key::Up => {
+            if s.library.selected > 0 {
+                s.library.selected -= 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Down => {
+            let max = s.library.row_count().saturating_sub(1);
+            if s.library.selected < max {
+                s.library.selected += 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Enter => library_enter_action(&s.library),
+        _ => KeyAction::Stay,
+    }
+}
+
+/// Resolve what Enter does on the selected Library row: open a collection to
+/// browse (playlists/albums), or play a track/artist directly.
+fn library_enter_action(lib: &LibraryState) -> KeyAction {
+    match lib.tab {
+        LibraryTab::Liked => match lib.liked.items.get(lib.selected).and_then(|t| t.uri.clone()) {
+            Some(_) => KeyAction::PlayLibrarySelection,
+            None => KeyAction::Stay,
         },
-        Mode::Command(cmd) => match input.key {
+        LibraryTab::Playlists => match lib.playlists.items.get(lib.selected) {
+            Some(p) => KeyAction::OpenBrowse(Collection {
+                kind: CollectionKind::Playlist,
+                uri: p.uri.clone(),
+                name: p.name.clone(),
+                subtitle: p
+                    .owner
+                    .as_ref()
+                    .and_then(|o| o.display_name.clone())
+                    .unwrap_or_default(),
+            }),
+            None => KeyAction::Stay,
+        },
+        LibraryTab::Albums => match lib.albums.items.get(lib.selected) {
+            Some(a) => match a.uri.clone() {
+                Some(uri) => KeyAction::OpenBrowse(Collection {
+                    kind: CollectionKind::Album,
+                    uri,
+                    name: a.name.clone(),
+                    subtitle: a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", "),
+                }),
+                None => KeyAction::Stay,
+            },
+            None => KeyAction::Stay,
+        },
+        // Playing an artist's context isn't wired through the synth path; for
+        // now selecting an artist is inert (artists list is name-only in v1).
+        LibraryTab::Artists => KeyAction::Stay,
+    }
+}
+
+fn dispatch_overlay(s: &mut AppState, input: Input) -> KeyAction {
+    match s.overlay.as_mut() {
+        Some(Overlay::Help) => {
+            if matches!(input.key, Key::Esc | Key::Char('?') | Key::Char('q')) {
+                s.overlay = None;
+            }
+            KeyAction::Stay
+        }
+        Some(Overlay::Command(_)) => dispatch_command(s, input),
+        Some(Overlay::Devices(dev)) => match input.key {
             Key::Esc => {
-                s.mode = Mode::NowPlaying;
+                s.overlay = None;
                 KeyAction::Stay
             }
             Key::Up => {
-                if cmd.selected > 0 {
-                    cmd.selected -= 1;
+                if dev.selected > 0 {
+                    dev.selected -= 1;
                 }
                 KeyAction::Stay
             }
             Key::Down => {
-                let max = cmd.filtered().len().saturating_sub(1);
-                if cmd.selected < max {
-                    cmd.selected += 1;
+                let max = dev.devices.len().saturating_sub(1);
+                if dev.selected < max {
+                    dev.selected += 1;
                 }
                 KeyAction::Stay
             }
-            Key::Left => {
-                if cmd.cursor > 0 {
-                    cmd.cursor -= 1;
-                }
-                KeyAction::Stay
-            }
-            Key::Right => {
-                let max = cmd.input.chars().count();
-                if cmd.cursor < max {
-                    cmd.cursor += 1;
-                }
-                KeyAction::Stay
-            }
-            Key::Backspace => {
-                if cmd.cursor > 0 {
-                    let byte = char_idx_to_byte(&cmd.input, cmd.cursor - 1);
-                    cmd.input.remove(byte);
-                    cmd.cursor -= 1;
-                    cmd.selected = 0;
-                }
-                KeyAction::Stay
-            }
-            Key::Char(c) => {
-                let byte = char_idx_to_byte(&cmd.input, cmd.cursor);
-                cmd.input.insert(byte, c);
-                cmd.cursor += 1;
-                cmd.selected = 0;
-                KeyAction::Stay
-            }
-            Key::Enter => {
-                let Some(chosen) = cmd.selected_cmd() else {
-                    return KeyAction::Stay;
-                };
-                // Dispatch — most commands close the menu first, then the
-                // run loop performs the action.
-                s.mode = Mode::NowPlaying;
-                match chosen {
-                    Cmd::PlayPause => KeyAction::TogglePlayback,
-                    Cmd::Next => KeyAction::NextTrack,
-                    Cmd::Previous => KeyAction::PrevTrack,
-                    Cmd::Like => KeyAction::LikeCurrent,
-                    Cmd::Reconnect => KeyAction::Reconnect,
-                    Cmd::Search => KeyAction::EnterSearch,
-                    Cmd::Help => {
-                        s.mode = Mode::Help;
-                        KeyAction::Stay
-                    }
-                    Cmd::Quit => KeyAction::Quit,
-                }
-            }
+            Key::Enter => match dev.devices.get(dev.selected).and_then(|d| d.id.clone()) {
+                Some(id) => KeyAction::TransferToDevice(id),
+                None => KeyAction::Stay,
+            },
             _ => KeyAction::Stay,
         },
-        Mode::Browse(browse) => match input.key {
+        Some(Overlay::Browse(browse)) => match input.key {
             Key::Esc => {
-                // Restore the search the user came from.
-                let prior = std::mem::replace(
-                    &mut browse.prior_search,
-                    SearchState::new(None, Vec::new(), Vec::new()),
-                );
-                s.mode = Mode::Search(prior);
+                s.overlay = None;
                 KeyAction::Stay
             }
             Key::Up => {
@@ -549,11 +841,88 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
                     KeyAction::PlayBrowseSelection
                 }
             }
-            // "Play the whole album/playlist" — works regardless of whether
-            // the track list loaded.
+            // "Play the whole album/playlist" — works even if the track list
+            // failed to load (403 fallback).
             Key::Char('p') => KeyAction::PlayBrowseCollection,
             _ => KeyAction::Stay,
         },
+        None => KeyAction::Stay,
+    }
+}
+
+fn dispatch_command(s: &mut AppState, input: Input) -> KeyAction {
+    let Some(Overlay::Command(cmd)) = s.overlay.as_mut() else {
+        return KeyAction::Stay;
+    };
+    match input.key {
+        Key::Esc => {
+            s.overlay = None;
+            KeyAction::Stay
+        }
+        Key::Up => {
+            if cmd.selected > 0 {
+                cmd.selected -= 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Down => {
+            let max = cmd.filtered().len().saturating_sub(1);
+            if cmd.selected < max {
+                cmd.selected += 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Left => {
+            if cmd.cursor > 0 {
+                cmd.cursor -= 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Right => {
+            let max = cmd.input.chars().count();
+            if cmd.cursor < max {
+                cmd.cursor += 1;
+            }
+            KeyAction::Stay
+        }
+        Key::Backspace => {
+            if cmd.cursor > 0 {
+                let byte = char_idx_to_byte(&cmd.input, cmd.cursor - 1);
+                cmd.input.remove(byte);
+                cmd.cursor -= 1;
+                cmd.selected = 0;
+            }
+            KeyAction::Stay
+        }
+        Key::Char(c) => {
+            let byte = char_idx_to_byte(&cmd.input, cmd.cursor);
+            cmd.input.insert(byte, c);
+            cmd.cursor += 1;
+            cmd.selected = 0;
+            KeyAction::Stay
+        }
+        Key::Enter => {
+            let Some(chosen) = cmd.selected_cmd() else {
+                return KeyAction::Stay;
+            };
+            // Most commands close the palette first, then the run loop runs
+            // the action. Help re-opens as an overlay instead.
+            s.overlay = None;
+            match chosen {
+                Cmd::PlayPause => KeyAction::TogglePlayback,
+                Cmd::Next => KeyAction::NextTrack,
+                Cmd::Previous => KeyAction::PrevTrack,
+                Cmd::Like => KeyAction::LikeCurrent,
+                Cmd::Reconnect => KeyAction::Reconnect,
+                Cmd::Search => KeyAction::EnterSearch,
+                Cmd::Help => {
+                    s.overlay = Some(Overlay::Help);
+                    KeyAction::Stay
+                }
+                Cmd::Quit => KeyAction::Quit,
+            }
+        }
+        _ => KeyAction::Stay,
     }
 }
 
@@ -962,6 +1331,9 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
 // Action handlers
 // ---------------------------------------------------------------------------
 
+/// Focus the Search tab. Search state is persistent, so we only reset and
+/// re-seed recents when the box is empty — tabbing away and back mid-query
+/// keeps the user's in-progress search intact.
 pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     let context_uri = {
         let s = state.lock().await;
@@ -973,18 +1345,30 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
     };
     log::note("enter_search", context_uri.as_deref());
 
-    {
+    let reseeded = {
         let mut s = state.lock().await;
-        let in_context = context_uri.as_ref().map(|uri| InContext {
-            playlist_uri: uri.clone(),
-            tracks: Vec::new(),
-            filtered: Vec::new(),
-        });
-        let queries = s.recent_queries.clone();
-        let tracks = s.recent_tracks.clone();
-        s.mode = Mode::Search(SearchState::new(in_context, queries, tracks));
-    }
+        s.tab = Tab::Search;
+        s.overlay = None;
+        if s.search.input.is_empty() {
+            let in_context = context_uri.as_ref().map(|uri| InContext {
+                playlist_uri: uri.clone(),
+                tracks: Vec::new(),
+                filtered: Vec::new(),
+            });
+            let queries = s.recent_queries.clone();
+            let tracks = s.recent_tracks.clone();
+            s.search = SearchState::new(in_context, queries, tracks);
+            true
+        } else {
+            false
+        }
+    };
 
+    // Only kick the in-context playlist fetch when we actually (re)opened a
+    // fresh search with that context attached.
+    if !reseeded {
+        return;
+    }
     if let Some(uri) = context_uri {
         if let Some(id) = playlist_id_from_uri(&uri) {
             let client = client.clone();
@@ -993,12 +1377,11 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
                 match client.get_playlist_tracks(&id).await {
                     Ok(tracks) => {
                         let mut s = state.lock().await;
-                        if let Mode::Search(search) = &mut s.mode {
-                            if let Some(ctx) = &mut search.in_context {
-                                if ctx.playlist_uri == uri {
-                                    ctx.tracks = tracks;
-                                    refilter_in_context(search);
-                                }
+                        let search = &mut s.search;
+                        if let Some(ctx) = &mut search.in_context {
+                            if ctx.playlist_uri == uri {
+                                ctx.tracks = tracks;
+                                refilter_in_context(search);
                             }
                         }
                     }
@@ -1010,8 +1393,10 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
                             Some(&format!("uri={uri} err={e:#}")),
                         );
                         let mut s = state.lock().await;
-                        if let Mode::Search(search) = &mut s.mode {
-                            search.in_context = None;
+                        if let Some(ctx) = &s.search.in_context {
+                            if ctx.playlist_uri == uri {
+                                s.search.in_context = None;
+                            }
                         }
                     }
                 }
@@ -1020,9 +1405,11 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
     }
 }
 
-/// Open the Browse overlay for the given collection, taking the current
-/// SearchState with us so Esc can restore it. Kicks off the track fetch in
-/// the background — Browse renders immediately with a "Loading..." placeholder.
+/// Open the Browse overlay for the given collection. Browse stacks on top of
+/// whatever tab the user was on (Search or Library); Esc just closes it,
+/// revealing that tab unchanged — no need to stash/restore search state, since
+/// the Search tab is persistent. Kicks off the track fetch in the background;
+/// Browse renders immediately with a "Loading..." placeholder.
 pub async fn enter_browse(
     client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
@@ -1039,26 +1426,19 @@ pub async fn enter_browse(
     );
     let fetch_id = {
         let mut s = state.lock().await;
-        // Pull the current SearchState out so we can stash it in Browse.
-        let prior = match std::mem::replace(&mut s.mode, Mode::NowPlaying) {
-            Mode::Search(prev) => prev,
-            // Defensive: caller should only invoke from Search.
-            other => {
-                s.mode = other;
-                log::error("enter_browse called outside Search mode", "ignored");
-                return;
-            }
-        };
-        let fetch_id = prior.request_id.wrapping_add(1);
-        s.mode = Mode::Browse(BrowseState {
+        // Monotonic per-open id so a re-open of the same collection still
+        // supersedes the prior fetch. Reuses the search request counter (it
+        // only ever moves forward) so we don't need a second counter.
+        let fetch_id = s.search.request_id.wrapping_add(1);
+        s.search.request_id = fetch_id;
+        s.overlay = Some(Overlay::Browse(BrowseState {
             collection: collection.clone(),
             tracks: Vec::new(),
             loading: true,
             error: None,
             selected: 0,
-            prior_search: prior,
             fetch_id,
-        });
+        }));
         fetch_id
     };
 
@@ -1077,7 +1457,7 @@ pub async fn enter_browse(
             },
         };
         let mut s = state_bg.lock().await;
-        let Mode::Browse(browse) = &mut s.mode else {
+        let Some(Overlay::Browse(browse)) = s.overlay.as_mut() else {
             // User navigated away; drop the result.
             log::note(
                 "browse fetch arrived but not in Browse mode anymore",
@@ -1108,20 +1488,318 @@ pub async fn enter_browse(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------
+
+/// Lazily load the active Library sub-tab. Fetches happen ONLY on first focus
+/// of a sub-tab (never on a timer) — re-focusing a loaded section is a no-op.
+/// User-initiated, so it ignores the background soft cap, but still bails on
+/// the hard rate-limit gate. Sub-tabs load independently; a 403 on one (a
+/// missing scope) leaves the others usable.
+pub async fn enter_library(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let (which, fetch_id) = {
+        let mut s = state.lock().await;
+        s.tab = Tab::Library;
+        let which = s.library.tab;
+        let (loaded, loading) = match which {
+            LibraryTab::Liked => (s.library.liked.loaded, s.library.liked.loading),
+            LibraryTab::Playlists => (s.library.playlists.loaded, s.library.playlists.loading),
+            LibraryTab::Albums => (s.library.albums.loaded, s.library.albums.loading),
+            LibraryTab::Artists => (s.library.artists.loaded, s.library.artists.loading),
+        };
+        if loaded || loading {
+            return;
+        }
+        // Bail on the hard gate; the section stays unloaded and the user can
+        // retry once the limit clears.
+        if s.rate_limited_until.map(|t| t > Instant::now()).unwrap_or(false) {
+            log::note("library load skipped (rate-limited)", Some(which.label()));
+            return;
+        }
+        let fetch_id = bump_library_fetch(&mut s.library, which);
+        (which, fetch_id)
+    };
+
+    log::note("library load", Some(which.label()));
+    let client = client.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = match which {
+            LibraryTab::Liked => client.get_saved_tracks(50).await.map(LibraryItems::Tracks),
+            LibraryTab::Playlists => {
+                client.get_saved_playlists(50).await.map(LibraryItems::Playlists)
+            }
+            LibraryTab::Albums => client.get_saved_albums(50).await.map(LibraryItems::Albums),
+            LibraryTab::Artists => {
+                client.get_followed_artists(50).await.map(LibraryItems::Artists)
+            }
+        };
+        let mut s = state.lock().await;
+        // Drop the result if the user moved to a different sub-tab or a newer
+        // fetch superseded this one.
+        if s.tab != Tab::Library || current_library_fetch(&s.library, which) != fetch_id {
+            log::note("library result dropped (stale)", Some(which.label()));
+            return;
+        }
+        apply_library_result(&mut s.library, which, result);
+    });
+}
+
+/// Play the selected track from the Library "Liked" list. Search-independent
+/// (unlike `play_selection`), so Library doesn't depend on search state.
+pub async fn play_library_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    if reconnect_if_device_offline(client, state, "play_library_selection").await {
+        return;
+    }
+    let (uri, synth) = {
+        let s = state.lock().await;
+        let lib = &s.library;
+        let Some(track) = lib.liked.items.get(lib.selected) else {
+            return;
+        };
+        let Some(uri) = track.uri.clone() else {
+            log::note("play_library_selection: track missing uri", None);
+            return;
+        };
+        let synth = Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track.clone()),
+            context: None,
+            timestamp: None,
+        };
+        (uri, synth)
+    };
+    log::note("play_library_selection", Some(&uri));
+    let result = client.play_uris(&[uri]).await;
+    let synth_to_apply = match &result {
+        Ok(()) => {
+            let ts = now_unix_ms();
+            let mut s = state.lock().await;
+            s.error = None;
+            log::mode_change("library", "now_playing");
+            s.overlay = None;
+            s.tab = Tab::NowPlaying;
+            s.last_local_action_ms = ts;
+            s.boot = false;
+            let mut pb = synth;
+            pb.timestamp = Some(ts);
+            Some(pb)
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("play_library_selection", &msg);
+            let mut s = state.lock().await;
+            if is_device_not_found(&msg) {
+                s.device_present = Some(false);
+                s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+            } else {
+                s.error = Some(msg);
+            }
+            None
+        }
+    };
+    if let Some(pb) = synth_to_apply {
+        apply_playback(state, Some(pb)).await;
+    }
+}
+
+/// Possible result payloads for a library section fetch, so one spawn site can
+/// handle all four sub-tabs.
+enum LibraryItems {
+    Tracks(Vec<Track>),
+    Playlists(Vec<Playlist>),
+    Albums(Vec<Album>),
+    Artists(Vec<Artist>),
+}
+
+fn bump_library_fetch(lib: &mut LibraryState, which: LibraryTab) -> u64 {
+    match which {
+        LibraryTab::Liked => {
+            lib.liked.loading = true;
+            lib.liked.fetch_id = lib.liked.fetch_id.wrapping_add(1);
+            lib.liked.fetch_id
+        }
+        LibraryTab::Playlists => {
+            lib.playlists.loading = true;
+            lib.playlists.fetch_id = lib.playlists.fetch_id.wrapping_add(1);
+            lib.playlists.fetch_id
+        }
+        LibraryTab::Albums => {
+            lib.albums.loading = true;
+            lib.albums.fetch_id = lib.albums.fetch_id.wrapping_add(1);
+            lib.albums.fetch_id
+        }
+        LibraryTab::Artists => {
+            lib.artists.loading = true;
+            lib.artists.fetch_id = lib.artists.fetch_id.wrapping_add(1);
+            lib.artists.fetch_id
+        }
+    }
+}
+
+fn current_library_fetch(lib: &LibraryState, which: LibraryTab) -> u64 {
+    match which {
+        LibraryTab::Liked => lib.liked.fetch_id,
+        LibraryTab::Playlists => lib.playlists.fetch_id,
+        LibraryTab::Albums => lib.albums.fetch_id,
+        LibraryTab::Artists => lib.artists.fetch_id,
+    }
+}
+
+fn apply_library_result(
+    lib: &mut LibraryState,
+    which: LibraryTab,
+    result: anyhow::Result<LibraryItems>,
+) {
+    // 403 on a section means a missing OAuth scope — surface the same re-auth
+    // hint the like flow uses, scoped to just this section.
+    let friendly = |msg: String| -> String {
+        if msg.contains("403") {
+            "locked: missing scope — delete hifi-auth.json and re-auth".into()
+        } else {
+            msg
+        }
+    };
+    match (which, result) {
+        (LibraryTab::Liked, Ok(LibraryItems::Tracks(v))) => {
+            lib.liked.items = v;
+            lib.liked.loaded = true;
+            lib.liked.loading = false;
+            lib.liked.error = None;
+        }
+        (LibraryTab::Playlists, Ok(LibraryItems::Playlists(v))) => {
+            lib.playlists.items = v;
+            lib.playlists.loaded = true;
+            lib.playlists.loading = false;
+            lib.playlists.error = None;
+        }
+        (LibraryTab::Albums, Ok(LibraryItems::Albums(v))) => {
+            lib.albums.items = v;
+            lib.albums.loaded = true;
+            lib.albums.loading = false;
+            lib.albums.error = None;
+        }
+        (LibraryTab::Artists, Ok(LibraryItems::Artists(v))) => {
+            lib.artists.items = v;
+            lib.artists.loaded = true;
+            lib.artists.loading = false;
+            lib.artists.error = None;
+        }
+        (LibraryTab::Liked, Err(e)) => {
+            lib.liked.loading = false;
+            lib.liked.error = Some(friendly(format!("{e:#}")));
+        }
+        (LibraryTab::Playlists, Err(e)) => {
+            lib.playlists.loading = false;
+            lib.playlists.error = Some(friendly(format!("{e:#}")));
+        }
+        (LibraryTab::Albums, Err(e)) => {
+            lib.albums.loading = false;
+            lib.albums.error = Some(friendly(format!("{e:#}")));
+        }
+        (LibraryTab::Artists, Err(e)) => {
+            lib.artists.loading = false;
+            lib.artists.error = Some(friendly(format!("{e:#}")));
+        }
+        // Mismatched payload/sub-tab can't happen (the spawn maps 1:1), but be
+        // defensive rather than panic.
+        (_, Ok(_)) => log::error("library", "result/sub-tab mismatch"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+/// Open the device-picker overlay and fetch the device list ONCE. Never polls
+/// on a timer (background device probing was removed for rate-limit reasons).
+pub async fn open_devices(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let fetch_id = {
+        let mut s = state.lock().await;
+        let gated = s.rate_limited_until.map(|t| t > Instant::now()).unwrap_or(false);
+        let mut dev = DevicesState {
+            loading: !gated,
+            ..Default::default()
+        };
+        if gated {
+            dev.error = Some("rate-limited — try again shortly".into());
+        }
+        dev.fetch_id = 1;
+        s.overlay = Some(Overlay::Devices(dev));
+        if gated {
+            return;
+        }
+        1u64
+    };
+
+    log::note("open_devices", None);
+    let client = client.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = client.get_devices().await;
+        let mut s = state.lock().await;
+        let Some(Overlay::Devices(dev)) = s.overlay.as_mut() else {
+            return; // overlay closed before the fetch landed
+        };
+        if dev.fetch_id != fetch_id {
+            return;
+        }
+        dev.loading = false;
+        match result {
+            Ok(list) => {
+                // Default selection to the active device if there is one.
+                dev.selected = list.iter().position(|d| d.is_active).unwrap_or(0);
+                dev.devices = list;
+            }
+            Err(e) => {
+                log::error("get_devices", &format!("{e:#}"));
+                dev.error = Some(format!("{e:#}"));
+            }
+        }
+    });
+}
+
+/// Transfer playback to the chosen device, close the picker, and poll-burst so
+/// Now Playing reflects the new device quickly.
+pub async fn transfer_to_device(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    device_id: String,
+) {
+    log::note("transfer_to_device", Some(&device_id));
+    let result = client.transfer_playback(&device_id, true).await;
+    {
+        let mut s = state.lock().await;
+        s.overlay = None;
+        match &result {
+            Ok(()) => {
+                s.error = None;
+                s.last_local_action_ms = now_unix_ms();
+                s.boot = false;
+            }
+            Err(e) => {
+                s.error = Some(format!("{e:#}"));
+                log::error("transfer_playback", &format!("{e:#}"));
+            }
+        }
+    }
+    if result.is_ok() {
+        spawn_post_play_poll(client.clone(), state.clone());
+    }
+}
+
 /// Play the currently-selected track inside the active Browse view, using
 /// the collection as the playback context (so Next/Previous walk the
 /// collection in order).
-pub async fn play_browse_selection(
-    client: &Arc<dyn SpotifyApi>,
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-) {
+pub async fn play_browse_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     if reconnect_if_device_offline(client, state, "play_browse_selection").await {
         return;
     }
     let (action, synth) = {
         let s = state.lock().await;
-        let Mode::Browse(browse) = &s.mode else { return };
+        let Some(Overlay::Browse(browse)) = &s.overlay else { return };
         if browse.tracks.is_empty() {
             return;
         }
@@ -1175,7 +1853,8 @@ pub async fn play_browse_selection(
             let mut s = state.lock().await;
             s.error = None;
             log::mode_change("browse", "now_playing");
-            s.mode = Mode::NowPlaying;
+            s.overlay = None;
+            s.tab = Tab::NowPlaying;
             s.last_local_action_ms = ts;
             s.boot = false;
             synth.map(|mut pb| {
@@ -1197,7 +1876,7 @@ pub async fn play_browse_selection(
         }
     };
     if let Some(pb) = synth_to_apply {
-        apply_playback(state, art_loader, Some(pb)).await;
+        apply_playback(state, Some(pb)).await;
     }
 }
 
@@ -1205,17 +1884,13 @@ pub async fn play_browse_selection(
 /// the fallback when `/playlists/{id}/tracks` or `/albums/{id}/tracks` 403s
 /// (Spotify locked these endpoints down for newly-created apps in late
 /// 2024); the user can still kick off playback of the whole thing.
-pub async fn play_browse_collection(
-    client: &Arc<dyn SpotifyApi>,
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-) {
+pub async fn play_browse_collection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     if reconnect_if_device_offline(client, state, "play_browse_collection").await {
         return;
     }
     let uri = {
         let s = state.lock().await;
-        let Mode::Browse(browse) = &s.mode else { return };
+        let Some(Overlay::Browse(browse)) = &s.overlay else { return };
         browse.collection.uri.clone()
     };
     log::note("play_browse_collection", Some(&uri));
@@ -1228,7 +1903,8 @@ pub async fn play_browse_collection(
             let mut s = state.lock().await;
             s.error = None;
             log::mode_change("browse", "now_playing");
-            s.mode = Mode::NowPlaying;
+            s.overlay = None;
+            s.tab = Tab::NowPlaying;
             s.last_local_action_ms = ts;
             s.boot = false;
         }
@@ -1247,7 +1923,6 @@ pub async fn play_browse_collection(
     // Bump a poll burst so we pick up the new track quickly.
     let c = client.clone();
     let s = state.clone();
-    let a = art_loader.clone();
     tokio::spawn(async move {
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1255,7 +1930,7 @@ pub async fn play_browse_collection(
                 break;
             }
             if let Ok(pb) = c.get_playback().await {
-                apply_playback(&s, &a, pb).await;
+                apply_playback(&s, pb).await;
             }
         }
     });
@@ -1264,9 +1939,7 @@ pub async fn play_browse_collection(
 pub async fn kick_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     let (q, my_id) = {
         let mut s = state.lock().await;
-        let Mode::Search(search) = &mut s.mode else {
-            return;
-        };
+        let search = &mut s.search;
         if let Some(h) = search.debounce.take() {
             h.abort();
         }
@@ -1300,30 +1973,29 @@ pub async fn kick_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppStat
                     || !results.artists.is_empty()
                     || !results.playlists.is_empty();
                 let mut s = state_task.lock().await;
-                if let Mode::Search(search) = &mut s.mode {
-                    if my_id >= search.applied_id && my_id == search.request_id {
-                        search.results = results;
-                        search.last_query = q.clone();
-                        search.applied_id = my_id;
-                        search.selected = 0;
-                        search.debounce = None;
-                        log::note(
-                            "search results applied",
-                            Some(&format!("id={my_id} q={q:?} {counts}")),
-                        );
-                        if any_hits {
-                            recent::push_query(&mut s.recent_queries, &q);
-                            recent::save_queries(&s.recent_queries);
-                        }
-                    } else {
-                        log::note(
-                            "search results dropped (stale)",
-                            Some(&format!(
-                                "id={my_id} request_id={} applied_id={}",
-                                search.request_id, search.applied_id
-                            )),
-                        );
+                let search = &mut s.search;
+                if my_id >= search.applied_id && my_id == search.request_id {
+                    search.results = results;
+                    search.last_query = q.clone();
+                    search.applied_id = my_id;
+                    search.selected = 0;
+                    search.debounce = None;
+                    log::note(
+                        "search results applied",
+                        Some(&format!("id={my_id} q={q:?} {counts}")),
+                    );
+                    if any_hits {
+                        recent::push_query(&mut s.recent_queries, &q);
+                        recent::save_queries(&s.recent_queries);
                     }
+                } else {
+                    log::note(
+                        "search results dropped (stale)",
+                        Some(&format!(
+                            "id={my_id} request_id={} applied_id={}",
+                            search.request_id, search.applied_id
+                        )),
+                    );
                 }
             }
             Err(e) => {
@@ -1332,31 +2004,22 @@ pub async fn kick_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppStat
                 let retry = e.downcast_ref::<RateLimited>().map(|r| r.0);
                 s.error = Some(format!("{e:#}"));
                 s.rate_limited_until = retry.map(|x| Instant::now() + Duration::from_secs(x));
-                if let Mode::Search(search) = &mut s.mode {
-                    search.debounce = None;
-                }
+                s.search.debounce = None;
             }
         }
     });
 
     let mut s = state.lock().await;
-    if let Mode::Search(search) = &mut s.mode {
-        if search.request_id == my_id {
-            search.debounce = Some(handle.abort_handle());
-        } else {
-            // a newer kick raced ahead; cancel this one
-            handle.abort();
-        }
+    let search = &mut s.search;
+    if search.request_id == my_id {
+        search.debounce = Some(handle.abort_handle());
     } else {
+        // a newer kick raced ahead; cancel this one
         handle.abort();
     }
 }
 
-pub async fn play_selection(
-    client: &Arc<dyn SpotifyApi>,
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-) {
+pub async fn play_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     // 1. Resolve action and capture the synth template now, while search
     //    state is still in AppState. We finalize its timestamp later (after
     //    a successful play) so it matches `last_local_action_ms` exactly.
@@ -1365,9 +2028,7 @@ pub async fn play_selection(
     }
     let (action, synth_template) = {
         let s = state.lock().await;
-        let Mode::Search(search) = &s.mode else {
-            return;
-        };
+        let search = &s.search;
         let resolved = resolve_full_selection(search);
         let action = match resolved {
             Some(SelectionAction::Play(a)) => a,
@@ -1414,7 +2075,8 @@ pub async fn play_selection(
             let mut s = state.lock().await;
             s.error = None;
             log::mode_change("search", "now_playing");
-            s.mode = Mode::NowPlaying;
+            s.overlay = None;
+            s.tab = Tab::NowPlaying;
             s.last_local_action_ms = ts;
             s.boot = false;
             synth_template.map(|mut pb| {
@@ -1441,7 +2103,7 @@ pub async fn play_selection(
             "play_selection: applying synthetic playback",
             pb.item.as_ref().map(|t| t.name.as_str()),
         );
-        apply_playback(state, art_loader, Some(pb)).await;
+        apply_playback(state, Some(pb)).await;
     }
 }
 
@@ -1502,31 +2164,18 @@ pub fn find_track_by_uri(search: &SearchState, uri: &str) -> Option<Track> {
         .cloned()
 }
 
-pub async fn apply_playback(
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-    pb: Option<Playback>,
-) {
-    apply_playback_inner(state, art_loader, pb, false).await
+pub async fn apply_playback(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) {
+    apply_playback_inner(state, pb, false).await
 }
 
 /// Apply playback bypassing `should_accept` — used for our own
 /// synthesized seed (e.g. the recently-played track shown at startup),
 /// which would otherwise be filtered out by the boot guard.
-pub async fn apply_playback_force(
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-    pb: Option<Playback>,
-) {
-    apply_playback_inner(state, art_loader, pb, true).await
+pub async fn apply_playback_force(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) {
+    apply_playback_inner(state, pb, true).await
 }
 
-async fn apply_playback_inner(
-    state: &Arc<Mutex<AppState>>,
-    art_loader: &Arc<art::ArtLoader>,
-    pb: Option<Playback>,
-    force: bool,
-) {
+async fn apply_playback_inner(state: &Arc<Mutex<AppState>>, pb: Option<Playback>, force: bool) {
     // A Playback with no `item` carries no useful track info — Spotify
     // returns this between tracks or when nothing is actively serving.
     // Collapse it to `None` so we never end up in the janky hybrid state
@@ -1562,43 +2211,31 @@ async fn apply_playback_inner(
         .map(|s| s.to_string());
 
     let has_track = pb.as_ref().and_then(|p| p.item.as_ref()).is_some();
-    let needs_art_fetch = {
-        let mut s = state.lock().await;
-        let prev = s.current_track_id.clone();
-        s.playback = pb;
-        s.last_poll = Some(Instant::now());
-        s.error = None;
-        s.rate_limited_until = None;
-        s.current_track_id = new_track_id.clone();
-        // First displayed track ends the boot phase — subsequent polls go
-        // through the normal `should_accept` freshness checks.
-        if has_track {
-            s.boot = false;
-        }
-        let track_changed = prev != new_track_id;
-        // When the track goes away (or changes), drop the old cover so the
-        // UI doesn't render last-track's art alongside the next/empty state.
-        // The new track's art is fetched async below if there is one.
-        if track_changed {
-            s.art = None;
-        }
-        new_track_id.is_some() && track_changed
-    };
-
-    if needs_art_fetch {
-        if let Some(url) = cover_url {
-            let s = state.clone();
-            let loader = art_loader.clone();
-            let id_at_fetch = new_track_id.clone();
-            tokio::spawn(async move {
-                if let Ok(proto) = loader.load(&url).await {
-                    let mut g = s.lock().await;
-                    if g.current_track_id == id_at_fetch {
-                        g.art = Some(proto);
-                    }
-                }
-            });
-        }
+    let mut s = state.lock().await;
+    let prev = s.current_track_id.clone();
+    s.playback = pb;
+    s.last_poll = Some(Instant::now());
+    s.error = None;
+    s.rate_limited_until = None;
+    s.current_track_id = new_track_id.clone();
+    // First displayed track ends the boot phase — subsequent polls go
+    // through the normal `should_accept` freshness checks.
+    if has_track {
+        s.boot = false;
+    }
+    // On track change, point the head at the new cover (or clear it when
+    // nothing useful is playing). The head owns the decoded-image cache and
+    // fetches against this — the core stays framework-free. Art for the same
+    // track across repeated polls keeps the same request, so the head's
+    // `has_or_loading` check means it's fetched at most once.
+    if prev != new_track_id {
+        s.art_request = match (&new_track_id, &cover_url) {
+            (Some(id), Some(url)) => Some(ArtRequest {
+                track_id: id.clone(),
+                url: url.clone(),
+            }),
+            _ => None,
+        };
     }
 }
 
@@ -1819,11 +2456,7 @@ pub async fn skip_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState
 /// Convenience to grab a Result wrapping the action loop should perform
 /// after a successful play. Used by the run loop to poll-burst after a
 /// user-initiated play so we pick up Spotify's view quickly.
-pub fn spawn_post_play_poll(
-    client: Arc<dyn SpotifyApi>,
-    state: Arc<Mutex<AppState>>,
-    art_loader: Arc<art::ArtLoader>,
-) {
+pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1834,7 +2467,7 @@ pub fn spawn_post_play_poll(
                 break;
             }
             if let Ok(pb) = client.get_playback().await {
-                apply_playback(&state, &art_loader, pb).await;
+                apply_playback(&state, pb).await;
             }
         }
     });
@@ -2459,7 +3092,7 @@ mod tests {
         assert_eq!(h.mode_name().await, "browse");
         {
             let s = h.state.lock().await;
-            let Mode::Browse(b) = &s.mode else {
+            let Some(Overlay::Browse(b)) = &s.overlay else {
                 panic!("expected Mode::Browse, got {}", mode_name(&s));
             };
             assert!(!b.loading, "loading flag should be cleared");
@@ -2511,7 +3144,7 @@ mod tests {
         h.settle().await;
 
         let s = h.state.lock().await;
-        let Mode::Browse(b) = &s.mode else {
+        let Some(Overlay::Browse(b)) = &s.overlay else {
             panic!("expected Browse");
         };
         assert!(!b.loading);
@@ -2602,7 +3235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn esc_in_browse_restores_prior_search() {
+    async fn esc_in_browse_reveals_search_tab() {
         let h = Harness::new();
         h.fake.set_search(
             "x",
@@ -2624,9 +3257,7 @@ mod tests {
         assert_eq!(h.mode_name().await, "search");
 
         let s = h.state.lock().await;
-        let Mode::Search(search) = &s.mode else {
-            panic!();
-        };
+        let search = &s.search;
         assert_eq!(search.input, "x");
         assert_eq!(search.results.albums.len(), 1);
     }
@@ -2801,7 +3432,7 @@ mod tests {
 
         {
             let s = h.state.lock().await;
-            let Mode::Search(search) = &s.mode else { panic!("expected Search mode") };
+            let search = &s.search;
             assert!(
                 search.is_loading(),
                 "expected is_loading() to be true while debounce/request is pending"
@@ -2838,7 +3469,7 @@ mod tests {
 
         {
             let s = h.state.lock().await;
-            let Mode::Search(search) = &s.mode else { panic!() };
+            let search = &s.search;
             assert!(!search.is_loading(), "should not be loading after settle");
             assert_eq!(search.last_query, "rock");
         }
@@ -2865,7 +3496,7 @@ mod tests {
 
         {
             let s = h.state.lock().await;
-            let Mode::Search(search) = &s.mode else { panic!() };
+            let search = &s.search;
             assert!(!search.is_loading());
         }
 
@@ -2874,6 +3505,163 @@ mod tests {
             screen.contains("no results for"),
             "expected 'no results' for genuine empty response, got:\n{screen}"
         );
+    }
+
+    // --- Tab / overlay navigation --------------------------------------
+
+    #[tokio::test]
+    async fn tab_key_cycles_top_tabs() {
+        let h = Harness::new();
+        assert_eq!(h.mode_name().await, "now_playing");
+        h.press_and_run(Key::Tab).await;
+        assert_eq!(h.mode_name().await, "search");
+        h.press_and_run(Key::Tab).await;
+        assert_eq!(h.mode_name().await, "library");
+        h.press_and_run(Key::Tab).await;
+        assert_eq!(h.mode_name().await, "now_playing");
+        // Shift-Tab goes the other way.
+        h.press_with_mods(Key::Tab, crate::input::Mods { shift: true, ..Default::default() }).await;
+        // press_with_mods only dispatches; cycle is applied in dispatch itself.
+        assert_eq!(h.mode_name().await, "library");
+    }
+
+    #[tokio::test]
+    async fn d_opens_devices_on_now_playing_but_types_into_search() {
+        let h = Harness::new();
+        // On Now Playing, 'd' is the global device-picker launcher.
+        let action = h.press(Key::Char('d')).await;
+        assert!(matches!(action, KeyAction::OpenDevices), "got {action:?}");
+
+        // In the Search tab, 'd' is literal text — never opens devices.
+        h.press_and_run(Key::Char('/')).await;
+        assert_eq!(h.mode_name().await, "search");
+        let action = h.press(Key::Char('d')).await;
+        assert!(matches!(action, KeyAction::SearchInputChanged), "got {action:?}");
+        let s = h.state.lock().await;
+        assert_eq!(s.search.input, "d");
+    }
+
+    #[tokio::test]
+    async fn esc_closes_overlay_without_changing_tab() {
+        let h = Harness::new();
+        h.press_and_run(Key::Tab).await; // -> Search tab
+        assert_eq!(h.mode_name().await, "search");
+        // Open the command palette (overlay) from the search tab... but search
+        // captures ':' as text, so switch to Library where ':' is global.
+        h.press_and_run(Key::Tab).await; // -> Library
+        assert_eq!(h.mode_name().await, "library");
+        h.press_and_run(Key::Char(':')).await; // command overlay
+        assert_eq!(h.mode_name().await, "command");
+        h.press_and_run(Key::Esc).await; // closes overlay
+        assert_eq!(h.mode_name().await, "library", "esc should reveal the tab, not jump home");
+    }
+
+    // --- Library lazy loading ------------------------------------------
+
+    #[tokio::test]
+    async fn library_loads_active_subtab_once() {
+        let h = Harness::new();
+        h.fake.set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
+
+        // Enter Library — Liked is the default sub-tab and should fetch once.
+        h.press_and_run(Key::Char('l')).await;
+        h.settle().await;
+        assert_eq!(h.mode_name().await, "library");
+        {
+            let s = h.state.lock().await;
+            assert!(s.library.liked.loaded);
+            assert_eq!(s.library.liked.items.len(), 1);
+        }
+        // Re-entering Library must NOT refetch a loaded section.
+        h.press_and_run(Key::Char('l')).await;
+        h.settle().await;
+        let n = h
+            .fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::GetSavedTracks(_)))
+            .count();
+        assert_eq!(n, 1, "Liked section should be fetched exactly once");
+    }
+
+    #[tokio::test]
+    async fn library_subtab_switch_loads_lazily() {
+        let h = Harness::new();
+        h.fake.set_saved_tracks(Ok(vec![]));
+        h.fake.set_saved_playlists(Ok(vec![dummy_playlist("spotify:playlist:p", "P", "me")]));
+
+        h.press_and_run(Key::Char('l')).await;
+        h.settle().await;
+        // Right -> Playlists sub-tab, which now lazily loads.
+        h.press_and_run(Key::Right).await;
+        h.settle().await;
+        let s = h.state.lock().await;
+        assert_eq!(s.library.tab, LibraryTab::Playlists);
+        assert!(s.library.playlists.loaded);
+        assert_eq!(s.library.playlists.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn library_403_surfaces_per_section_hint() {
+        let h = Harness::new();
+        h.fake.set_saved_tracks(Err("GET /me/tracks: 403 Forbidden".into()));
+        h.press_and_run(Key::Char('l')).await;
+        h.settle().await;
+        let s = h.state.lock().await;
+        let e = s.library.liked.error.as_ref().expect("error populated on 403");
+        assert!(e.contains("missing scope"), "expected re-auth hint, got: {e}");
+        assert!(!s.library.liked.loaded, "403 must not mark the section loaded");
+    }
+
+    #[tokio::test]
+    async fn library_playlist_enter_opens_browse() {
+        let h = Harness::new();
+        h.fake.set_saved_playlists(Ok(vec![dummy_playlist("spotify:playlist:pl", "PL", "me")]));
+        h.fake.set_playlist_tracks("pl", Ok(vec![track("spotify:track:t", "T")]));
+
+        h.press_and_run(Key::Char('l')).await;
+        h.press_and_run(Key::Right).await; // -> Playlists
+        h.settle().await;
+        h.press_and_run(Key::Enter).await; // open the selected playlist
+        h.settle().await;
+        assert_eq!(h.mode_name().await, "browse");
+        let s = h.state.lock().await;
+        let Some(Overlay::Browse(b)) = &s.overlay else { panic!("expected browse overlay") };
+        assert_eq!(b.collection.uri, "spotify:playlist:pl");
+        assert_eq!(b.tracks.len(), 1);
+    }
+
+    // --- Devices overlay -----------------------------------------------
+
+    #[tokio::test]
+    async fn devices_opens_fetches_once_and_transfers() {
+        let h = Harness::new();
+        h.fake.set_devices(Ok(vec![
+            Device { id: Some("dev1".into()), name: "Phone".into(), is_active: false },
+            Device { id: Some("dev2".into()), name: "Speaker".into(), is_active: true },
+        ]));
+
+        h.press_and_run(Key::Char('d')).await;
+        h.settle().await;
+        assert_eq!(h.mode_name().await, "devices");
+        {
+            let s = h.state.lock().await;
+            let Some(Overlay::Devices(dev)) = &s.overlay else { panic!("expected devices overlay") };
+            assert_eq!(dev.devices.len(), 2);
+            // Selection defaults to the active device.
+            assert_eq!(dev.selected, 1);
+        }
+        let n = h.fake.calls().iter().filter(|c| matches!(c, Call::GetDevices)).count();
+        assert_eq!(n, 1, "devices fetched exactly once on open");
+
+        // Enter transfers to the selected device and closes the overlay.
+        h.press_and_run(Key::Enter).await;
+        h.settle().await;
+        assert_eq!(h.mode_name().await, "now_playing");
+        let transferred = h.fake.calls().iter().any(|c| {
+            matches!(c, Call::TransferPlayback { device_id, play: true } if device_id == "dev2")
+        });
+        assert!(transferred, "expected transfer to dev2");
     }
 
     // --- 96x40 fixed-canvas exercise -----------------------------------
@@ -3157,10 +3945,6 @@ mod tests {
         {
             let mut s = h.state.lock().await;
             s.boot = false;
-            // Simulate the art fetch having completed: current_track_id is
-            // already set from seed_playback, but mark art as present so
-            // we can verify it gets cleared.
-            // (Real ArtLoader doesn't run in the test harness, so we fake it.)
             s.current_track_id = Some("seed".into());
         }
 
@@ -3168,7 +3952,6 @@ mod tests {
         // `is_playing: false`, `item: None`. This used to clobber the seed.
         apply_playback(
             &h.state,
-            &h.art_loader,
             Some(Playback {
                 is_playing: false,
                 progress_ms: None,
@@ -3180,20 +3963,23 @@ mod tests {
         .await;
 
         let s = h.state.lock().await;
-        // Either the seed survives (defended by `pb.filter`) OR the state
-        // is fully cleared. The disallowed outcome is "playback Some + item
-        // None + art Some" — the hybrid the user complained about.
+        // Either the seed survives (defended by `pb.filter`) OR the state is
+        // fully cleared. The disallowed outcome is an orphan `current_track_id`
+        // with no item — that's the key the head's ArtCache renders against, so
+        // a dangling id would pair last track's cover with an empty now-playing
+        // (the hybrid the user complained about). Art now lives in the head,
+        // keyed by `current_track_id`, so this invariant guarantees it.
         let has_item = s
             .playback
             .as_ref()
             .and_then(|p| p.item.as_ref())
             .is_some();
-        let art_present = s.art.is_some();
         assert!(
-            has_item || !art_present,
-            "expected either a track to be displayed OR art to be cleared; \
-             got playback={:?} art={art_present}",
+            has_item || s.current_track_id.is_none(),
+            "expected either a track to be displayed OR current_track_id cleared; \
+             got playback={:?} current_track_id={:?}",
             s.playback.as_ref().map(|p| p.item.as_ref().map(|t| &t.name)),
+            s.current_track_id,
         );
     }
 
@@ -3220,6 +4006,53 @@ mod tests {
         let screen = h.snapshot_sized(96, 40).await;
         print_snapshot("browse 403 warning", &screen);
         assert_border_closes("browse 403 warning", &screen);
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_library_playlists() {
+        let h = Harness::new();
+        h.fake.set_saved_playlists(Ok(vec![
+            dummy_playlist("spotify:playlist:1", "Late Night Drives Vol. 3", "chrisbolin"),
+            dummy_playlist("spotify:playlist:2", "Focus / Deep Work", "spotify"),
+            dummy_playlist("spotify:playlist:3", "Workout Bangers (Updated Weekly)", "a_friend"),
+        ]));
+        h.press_and_run(Key::Char('l')).await;
+        h.press_and_run(Key::Right).await; // -> Playlists
+        h.settle().await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("library playlists", &screen);
+        assert_border_closes("library playlists", &screen);
+        assert!(screen.contains("Now Playing") && screen.contains("Library"), "tab strip present");
+        assert!(screen.contains("Playlists"), "sub-tab strip present");
+        assert!(screen.contains("Late Night Drives"), "playlist row rendered");
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_devices_overlay() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(60_000),
+            item: Some(long_track()),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        }).await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+        }
+        h.fake.set_devices(Ok(vec![
+            Device { id: Some("a".into()), name: "hifi (cabin)".into(), is_active: true },
+            Device { id: Some("b".into()), name: "Kitchen Speaker".into(), is_active: false },
+            Device { id: Some("c".into()), name: "iPhone".into(), is_active: false },
+        ]));
+        h.press_and_run(Key::Char('d')).await;
+        h.settle().await;
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("devices overlay", &screen);
+        assert_border_closes("devices overlay", &screen);
+        assert!(screen.contains("devices"), "overlay title present");
+        assert!(screen.contains("hifi (cabin)") && screen.contains("Kitchen Speaker"), "device rows");
     }
 }
 

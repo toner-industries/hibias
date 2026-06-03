@@ -18,12 +18,13 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::api::{
-    Device, Playback, SearchResults, SpotifyApi, Track,
+    Album, Artist, Device, Playback, Playlist, SearchResults, SpotifyApi, Track,
 };
 use crate::app::{
-    apply_playback, dispatch_input, enter_browse, enter_search, kick_search, like_current_track,
-    play_browse_collection, play_browse_selection, play_selection, seek_relative,
-    skip_track, toggle_playback, AppState, KeyAction,
+    apply_playback, dispatch_input, enter_browse, enter_library, enter_search, kick_search,
+    like_current_track, open_devices, play_browse_collection, play_browse_selection,
+    play_library_selection, play_selection, seek_relative, skip_track, toggle_playback,
+    transfer_to_device, AppState, KeyAction,
 };
 use crate::input::{Input, Key, Mods};
 use crate::{art, ui};
@@ -47,6 +48,10 @@ pub enum Call {
     GetPlaylistTracks(String),
     GetRecentlyPlayed(u32),
     SaveTrack(String),
+    GetSavedTracks(u32),
+    GetSavedPlaylists(u32),
+    GetSavedAlbums(u32),
+    GetFollowedArtists(u32),
 }
 
 #[derive(Default)]
@@ -62,6 +67,10 @@ struct FakeState {
     album_tracks: HashMap<String, Result<Vec<Track>, String>>,
     /// Per-id programmable response.
     playlist_tracks: HashMap<String, Result<Vec<Track>, String>>,
+    saved_tracks: Option<Result<Vec<Track>, String>>,
+    saved_playlists: Option<Result<Vec<Playlist>, String>>,
+    saved_albums: Option<Result<Vec<Album>, String>>,
+    followed_artists: Option<Result<Vec<Artist>, String>>,
     /// Each `play()` pops the front; if empty, defaults to Ok(()).
     play_returns: Vec<Result<(), String>>,
     pause_returns: Vec<Result<(), String>>,
@@ -140,6 +149,22 @@ impl FakeSpotify {
         self.with(|s| {
             s.playlist_tracks.insert(id.to_string(), r);
         });
+    }
+
+    pub fn set_saved_tracks(&self, r: Result<Vec<Track>, String>) {
+        self.with(|s| s.saved_tracks = Some(r));
+    }
+
+    pub fn set_saved_playlists(&self, r: Result<Vec<Playlist>, String>) {
+        self.with(|s| s.saved_playlists = Some(r));
+    }
+
+    pub fn set_saved_albums(&self, r: Result<Vec<Album>, String>) {
+        self.with(|s| s.saved_albums = Some(r));
+    }
+
+    pub fn set_followed_artists(&self, r: Result<Vec<Artist>, String>) {
+        self.with(|s| s.followed_artists = Some(r));
     }
 
     pub fn queue_play(&self, r: Result<(), String>) {
@@ -303,16 +328,52 @@ impl SpotifyApi for FakeSpotify {
         self.record(Call::SaveTrack(track_id.to_string()));
         Ok(())
     }
+
+    async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
+        self.record(Call::GetSavedTracks(limit));
+        match self.with(|s| s.saved_tracks.clone()) {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>> {
+        self.record(Call::GetSavedPlaylists(limit));
+        match self.with(|s| s.saved_playlists.clone()) {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>> {
+        self.record(Call::GetSavedAlbums(limit));
+        match self.with(|s| s.saved_albums.clone()) {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
+        self.record(Call::GetFollowedArtists(limit));
+        match self.with(|s| s.followed_artists.clone()) {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
-/// Headless test harness — owns an AppState, a programmable FakeSpotify,
-/// and an art loader, and provides press/run/snapshot affordances that
-/// match what the real run loop does.
+/// Headless test harness — owns an AppState and a programmable FakeSpotify,
+/// and provides press/run/snapshot affordances that match what the real run
+/// loop does. Album art is a head concern (see `ArtCache`) and is never
+/// produced in tests, so the harness holds no art loader.
 pub struct Harness {
     pub fake: Arc<FakeSpotify>,
     pub client: Arc<dyn SpotifyApi>,
     pub state: Arc<Mutex<AppState>>,
-    pub art_loader: Arc<art::ArtLoader>,
 }
 
 impl Default for Harness {
@@ -325,15 +386,11 @@ impl Harness {
     pub fn new() -> Self {
         let fake = Arc::new(FakeSpotify::new());
         let client: Arc<dyn SpotifyApi> = fake.clone();
-        // ArtLoader without picker — image fetching is short-circuited when
-        // `enabled()` is false, which is what happens in tests.
-        let art_loader = Arc::new(art::ArtLoader::new(reqwest::Client::new()));
         let state = Arc::new(Mutex::new(AppState::default()));
         Self {
             fake,
             client,
             state,
-            art_loader,
         }
     }
 
@@ -372,19 +429,23 @@ impl Harness {
             }
             KeyAction::EnterSearch => enter_search(&self.client, &self.state).await,
             KeyAction::SearchInputChanged => kick_search(&self.client, &self.state).await,
-            KeyAction::PlaySelection => {
-                play_selection(&self.client, &self.state, &self.art_loader).await
-            }
-            KeyAction::OpenBrowse(c) => {
-                enter_browse(&self.client, &self.state, c).await
-            }
+            KeyAction::PlaySelection => play_selection(&self.client, &self.state).await,
+            KeyAction::OpenBrowse(c) => enter_browse(&self.client, &self.state, c).await,
             KeyAction::PlayBrowseSelection => {
-                play_browse_selection(&self.client, &self.state, &self.art_loader).await
+                play_browse_selection(&self.client, &self.state).await
             }
             KeyAction::PlayBrowseCollection => {
-                play_browse_collection(&self.client, &self.state, &self.art_loader).await
+                play_browse_collection(&self.client, &self.state).await
             }
             KeyAction::LikeCurrent => like_current_track(&self.client, &self.state).await,
+            KeyAction::OpenLibrary => enter_library(&self.client, &self.state).await,
+            KeyAction::PlayLibrarySelection => {
+                play_library_selection(&self.client, &self.state).await
+            }
+            KeyAction::OpenDevices => open_devices(&self.client, &self.state).await,
+            KeyAction::TransferToDevice(id) => {
+                transfer_to_device(&self.client, &self.state, id).await
+            }
         }
     }
 
@@ -398,7 +459,7 @@ impl Harness {
     /// Force-apply a `Playback` to the state, bypassing `should_accept`. Used
     /// to set up scenarios that assume a track is already loaded.
     pub async fn seed_playback(&self, pb: Playback) {
-        apply_playback(&self.state, &self.art_loader, Some(pb)).await;
+        apply_playback(&self.state, Some(pb)).await;
     }
 
     pub async fn mode_name(&self) -> &'static str {
@@ -430,8 +491,11 @@ impl Harness {
         let mut terminal = Terminal::new(backend).expect("test backend");
         {
             let mut s = self.state.lock().await;
+            // Tests never produce art (no image protocol), so an empty cache
+            // renders identically to production with art disabled.
+            let mut art = art::ArtCache::new();
             terminal
-                .draw(|f| ui::render(f, &mut s))
+                .draw(|f| ui::render(f, &mut s, &mut art))
                 .expect("draw failed");
         }
         let buf = terminal.backend().buffer().clone();

@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     //   (a) the "Recently played" section in the search overlay, and
     //   (b) the initial now-playing display, so users don't see a stale
     //       track from whatever device /me/player happened to return at boot.
-    spawn_boot_seed(client.clone(), state.clone(), art_loader.clone());
+    spawn_boot_seed(client.clone(), state.clone());
 
     let mut terminal = setup_terminal()?;
     install_panic_hook();
@@ -86,11 +86,7 @@ async fn main() -> Result<()> {
     result
 }
 
-fn spawn_boot_seed(
-    client: Arc<dyn SpotifyApi>,
-    state: Arc<Mutex<AppState>>,
-    art_loader: Arc<art::ArtLoader>,
-) {
+fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
         match client.get_recently_played(20).await {
             Ok(tracks) => {
@@ -111,7 +107,7 @@ fn spawn_boot_seed(
                         context: None,
                         timestamp: None,
                     };
-                    apply_playback_force(&state, &art_loader, Some(synth)).await;
+                    apply_playback_force(&state, Some(synth)).await;
                 }
             }
             Err(e) => {
@@ -127,7 +123,7 @@ fn spawn_boot_seed(
                     let mut seed = pb;
                     seed.is_playing = false;
                     seed.timestamp = None;
-                    apply_playback_force(&state, &art_loader, Some(seed)).await;
+                    apply_playback_force(&state, Some(seed)).await;
                 }
             }
         }
@@ -186,12 +182,53 @@ async fn run(
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
 ) -> Result<()> {
-    let poll_handle = spawn_playback_poll(client.clone(), state.clone(), art_loader.clone());
+    let poll_handle = spawn_playback_poll(client.clone(), state.clone());
 
-    let mut events = EventStream::new();
+    // The decoded album-art cache lives here in the head, not in AppState —
+    // the core only signals what to show via `state.art_request`. Behind its
+    // own mutex so the async fetch task and the (sync) render closure can both
+    // reach it; lock order is always state-then-art_cache.
+    let art_cache = Arc::new(Mutex::new(art::ArtCache::new()));
+
+    // Read terminal events on a dedicated task and forward them over a
+    // channel. The render loop selects on the *channel*, not on
+    // `EventStream::next()` directly: a `select!` that loses the race cancels
+    // (drops) the non-winning future, and crossterm's EventStream drops any
+    // partially-read multi-byte escape sequence (arrow keys!) when its future
+    // is cancelled. `mpsc::Receiver::recv()` is cancellation-safe and buffers,
+    // so no keypress is ever lost to the redraw tick.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_reader = tokio::spawn(async move {
+        let mut events = EventStream::new();
+        while let Some(ev) = events.next().await {
+            if event_tx.send(ev).is_err() {
+                break; // render loop has exited
+            }
+        }
+    });
+
     let mut redraw = tokio::time::interval(Duration::from_millis(100));
 
     loop {
+        // Fetch art for the current track into the head-owned cache. The
+        // `has_or_loading` guard means we spawn at most one fetch per track id
+        // regardless of how many redraw ticks pass.
+        let art_req = { state.lock().await.art_request.clone() };
+        if let Some(req) = art_req {
+            let mut cache = art_cache.lock().await;
+            if !cache.has_or_loading(&req.track_id) {
+                cache.begin_loading(req.track_id.clone());
+                drop(cache);
+                let loader = art_loader.clone();
+                let cache = art_cache.clone();
+                tokio::spawn(async move {
+                    if let Ok(proto) = loader.load(&req.url).await {
+                        cache.lock().await.store(req.track_id, proto);
+                    }
+                });
+            }
+        }
+
         // Mirror the client's rate-limit gate into UI state. The client is
         // the source of truth (`send_logged` writes it on any 429); we just
         // surface it here for the status line.
@@ -199,12 +236,13 @@ async fn run(
         {
             let mut s = state.lock().await;
             s.rate_limited_until = client_rl;
-            terminal.draw(|f| ui::render(f, &mut s))?;
+            let mut art = art_cache.lock().await;
+            terminal.draw(|f| ui::render(f, &mut s, &mut art))?;
         }
 
         tokio::select! {
             _ = redraw.tick() => {}
-            ev = events.next() => match ev {
+            ev = event_rx.recv() => match ev {
                 Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                     let inp = input_from_crossterm(k.code, k.modifiers);
                     if inp.is_ctrl_c() {
@@ -233,24 +271,32 @@ async fn run(
                             spawn_reconnect(&client, &state, "user: :reconnect");
                         }
                         KeyAction::LikeCurrent => like_current_track(&client, &state).await,
+                        KeyAction::OpenLibrary => app::enter_library(&client, &state).await,
+                        KeyAction::PlayLibrarySelection => {
+                            app::play_library_selection(&client, &state).await
+                        }
+                        KeyAction::OpenDevices => app::open_devices(&client, &state).await,
+                        KeyAction::TransferToDevice(id) => {
+                            app::transfer_to_device(&client, &state, id).await
+                        }
                         KeyAction::EnterSearch => app::enter_search(&client, &state).await,
                         KeyAction::OpenBrowse(coll) => app::enter_browse(&client, &state, coll).await,
                         KeyAction::PlayBrowseSelection => {
-                            play_browse_selection(&client, &state, &art_loader).await;
+                            play_browse_selection(&client, &state).await;
                         }
                         KeyAction::PlayBrowseCollection => {
-                            play_browse_collection(&client, &state, &art_loader).await;
+                            play_browse_collection(&client, &state).await;
                         }
                         KeyAction::SearchInputChanged => app::kick_search(&client, &state).await,
                         KeyAction::PlaySelection => {
-                            play_selection(&client, &state, &art_loader).await;
+                            play_selection(&client, &state).await;
                             // After a play, poll /me/player briefly so we
                             // can pick up Spotify's view *if* it actually
                             // updates (it may not — librespot frequently
                             // fails to report state). Stale polls are
                             // silently dropped by apply_playback's
                             // should_accept check.
-                            spawn_post_play_poll(client.clone(), state.clone(), art_loader.clone());
+                            spawn_post_play_poll(client.clone(), state.clone());
                         }
                     }
                 }
@@ -265,6 +311,7 @@ async fn run(
     }
 
     poll_handle.abort();
+    event_reader.abort();
     Ok(())
 }
 
@@ -281,7 +328,6 @@ const PLAYBACK_POLL_PAUSED: Duration = Duration::from_secs(30);
 fn spawn_playback_poll(
     client: Arc<dyn SpotifyApi>,
     state: Arc<Mutex<AppState>>,
-    art_loader: Arc<art::ArtLoader>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Track soft-cap engagement so we log only on edge transitions
@@ -324,7 +370,7 @@ fn spawn_playback_poll(
             }
             match client.get_playback().await {
                 Ok(pb) => {
-                    app::apply_playback(&state, &art_loader, pb).await;
+                    app::apply_playback(&state, pb).await;
                 }
                 Err(e) => {
                     let retry = e.downcast_ref::<RateLimited>().map(|r| r.0);

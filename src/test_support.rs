@@ -172,9 +172,6 @@ impl SpotifyApi for FakeSpotify {
     fn clear_device_id(&self) {
         self.with(|s| s.device_id = None);
     }
-    fn device_id_for_log(&self) -> Option<String> {
-        self.with(|s| s.device_id.clone())
-    }
     fn rate_limited_until(&self) -> Option<Instant> {
         self.with(|s| {
             // Mirror SpotifyClient's lazy clear.
@@ -189,6 +186,10 @@ impl SpotifyApi for FakeSpotify {
     }
     fn clear_rate_limit(&self) {
         self.with(|s| s.rate_limited_until = None);
+    }
+    fn background_throttled(&self) -> bool {
+        // Tests don't simulate the sliding-window counter.
+        false
     }
 
     async fn get_playback(&self) -> Result<Option<Playback>> {

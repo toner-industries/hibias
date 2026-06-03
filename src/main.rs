@@ -186,7 +186,6 @@ async fn run(
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
 ) -> Result<()> {
-    let dev_handle = spawn_devices_probe(client.clone(), state.clone());
     let poll_handle = spawn_playback_poll(client.clone(), state.clone(), art_loader.clone());
 
     let mut events = EventStream::new();
@@ -265,82 +264,7 @@ async fn run(
     }
 
     poll_handle.abort();
-    dev_handle.abort();
     Ok(())
-}
-
-/// Periodic device probe — logs Spotify's view of our device every 5s.
-/// Surfaces "device drops out of active state" issues.
-fn spawn_devices_probe(
-    client: Arc<dyn SpotifyApi>,
-    state: Arc<Mutex<AppState>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            {
-                let s = state.lock().await;
-                if s.rate_limited_until
-                    .map(|t| t > Instant::now())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-            }
-            match client.get_devices().await {
-                Ok(devs) => {
-                    let our_id = client.device_id_for_log();
-                    let summary = devs
-                        .iter()
-                        .map(|d| {
-                            let mark = match (&our_id, d.id.as_deref()) {
-                                (Some(o), Some(i)) if o == i => "*",
-                                _ => " ",
-                            };
-                            format!(
-                                "{mark}{}(active={},id={})",
-                                d.name,
-                                d.is_active,
-                                d.id.as_deref().unwrap_or("?")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    log::note("devices probe", Some(&summary));
-                    // Update our "is the librespot device still registered?"
-                    // flag. Only meaningful once we've actually started a
-                    // device (our_id is set). We do NOT auto-reconnect here
-                    // — the probe runs every 5s and repeated reconnect
-                    // attempts hammer Spotify. Instead, the next user
-                    // play/pause/seek/skip will trigger the reconnect, or
-                    // they can run `:reconnect` manually.
-                    if let Some(id) = our_id {
-                        let now_present = devs.iter().any(|d| d.id.as_deref() == Some(id.as_str()));
-                        let mut s = state.lock().await;
-                        let was_present = s.device_present;
-                        s.device_present = Some(now_present);
-                        if was_present == Some(true) && !now_present {
-                            log::error(
-                                "device dropped",
-                                "librespot Spirc lost its Connect cloud registration — next user action will reconnect",
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    if let Some(secs) = e.downcast_ref::<RateLimited>().map(|r| r.0) {
-                        let mut s = state.lock().await;
-                        s.rate_limited_until =
-                            Some(Instant::now() + Duration::from_secs(secs));
-                    }
-                    log::note("devices probe failed", Some(&format!("{e:#}")));
-                }
-            }
-        }
-    })
 }
 
 /// Poll /me/player every 5s and apply the result.
@@ -353,6 +277,9 @@ fn spawn_playback_poll(
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
+        // Track soft-cap engagement so we log only on edge transitions
+        // (engaged → released, released → engaged) instead of every 5s tick.
+        let mut throttle_engaged = false;
         loop {
             interval.tick().await;
             {
@@ -363,6 +290,20 @@ fn spawn_playback_poll(
                 {
                     continue;
                 }
+            }
+            if client.background_throttled() {
+                if !throttle_engaged {
+                    log::note(
+                        "playback poll throttled",
+                        Some("self-imposed soft cap reached"),
+                    );
+                    throttle_engaged = true;
+                }
+                continue;
+            }
+            if throttle_engaged {
+                log::note("playback poll throttle released", None);
+                throttle_engaged = false;
             }
             match client.get_playback().await {
                 Ok(pb) => {

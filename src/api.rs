@@ -2,13 +2,26 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
 use crate::log;
 
 const BASE: &str = "https://api.spotify.com/v1";
+
+/// Sliding window we count outbound requests over to estimate our load on
+/// Spotify's per-app limiter (Spotify uses ~30s rolling internally).
+const THROTTLE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Soft cap for background traffic over `THROTTLE_WINDOW`. When exceeded,
+/// background pollers skip their tick; user-initiated requests still go
+/// through. Sized well below the level that has historically tripped a 429
+/// (sustained ~12/30s with two pollers), with headroom for user bursts on
+/// top of the current single-poller baseline of ~3/30s.
+const BACKGROUND_SOFT_CAP: usize = 20;
 
 pub struct SpotifyClient {
     http: reqwest::Client,
@@ -26,6 +39,11 @@ pub struct SpotifyClient {
     /// We learned the hard way that piling extra requests on a 429 turns a
     /// short server-side back-off into a multi-hour one.
     rate_limited_until: Mutex<Option<Instant>>,
+    /// Timestamps of recent outbound requests. Used by
+    /// `background_throttled` to slow down pollers before we actually
+    /// trigger a 429. Pruned on every read/write so it stays bounded by
+    /// `THROTTLE_WINDOW`.
+    recent_requests: Mutex<VecDeque<Instant>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,9 +218,12 @@ struct PlaylistTrackItem {
 pub trait SpotifyApi: Send + Sync {
     fn set_device_id(&self, id: String);
     fn clear_device_id(&self);
-    fn device_id_for_log(&self) -> Option<String>;
     fn rate_limited_until(&self) -> Option<Instant>;
     fn clear_rate_limit(&self);
+    /// True when our own 30s sliding-window request counter has crossed the
+    /// background soft cap. Background pollers should skip their tick when
+    /// this returns true; user-initiated requests ignore it.
+    fn background_throttled(&self) -> bool;
 
     async fn get_playback(&self) -> Result<Option<Playback>>;
     async fn play(&self) -> Result<()>;
@@ -228,14 +249,14 @@ impl SpotifyApi for SpotifyClient {
     fn clear_device_id(&self) {
         SpotifyClient::clear_device_id(self)
     }
-    fn device_id_for_log(&self) -> Option<String> {
-        SpotifyClient::device_id_for_log(self)
-    }
     fn rate_limited_until(&self) -> Option<Instant> {
         SpotifyClient::rate_limited_until(self)
     }
     fn clear_rate_limit(&self) {
         SpotifyClient::clear_rate_limit(self)
+    }
+    fn background_throttled(&self) -> bool {
+        SpotifyClient::background_throttled(self)
     }
     async fn get_playback(&self) -> Result<Option<Playback>> {
         SpotifyClient::get_playback(self).await
@@ -283,12 +304,51 @@ impl SpotifyApi for SpotifyClient {
 
 impl SpotifyClient {
     pub fn new(auth: Auth) -> Result<Self> {
+        // Rehydrate any persisted rate-limit deadline so a restart doesn't
+        // wipe the gate. Spotify's penalty windows are measured in hours; if
+        // we forget across `ctrl-c` we walk straight back into a fresh 429
+        // on the very first request after relaunch.
+        let rehydrated = load_rate_limit_until();
+        if let Some(t) = rehydrated {
+            let secs = t.saturating_duration_since(Instant::now()).as_secs();
+            log::note(
+                "rate_limit gate rehydrated from disk",
+                Some(&format!("retry in {secs}s")),
+            );
+        }
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             auth,
             device_id: Mutex::new(None),
-            rate_limited_until: Mutex::new(None),
+            rate_limited_until: Mutex::new(rehydrated),
+            recent_requests: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Append `now` to the sliding window and prune entries older than
+    /// `THROTTLE_WINDOW`. Called once per outbound wire request.
+    fn record_request(&self) {
+        let now = Instant::now();
+        let mut q = self.recent_requests.lock().expect("recent_requests poisoned");
+        prune_window(&mut q, now);
+        q.push_back(now);
+    }
+
+    /// Number of outbound requests within the last `THROTTLE_WINDOW`.
+    /// Pruning here keeps the window honest even if no requests are being
+    /// issued (e.g. while the rate-limit gate is engaged).
+    fn recent_request_count(&self) -> usize {
+        let now = Instant::now();
+        let mut q = self.recent_requests.lock().expect("recent_requests poisoned");
+        prune_window(&mut q, now);
+        q.len()
+    }
+
+    /// Soft cap consumers (background pollers) check before issuing a
+    /// request. Logging once-per-engagement is the caller's job — we don't
+    /// want to spam the log every 5s while throttled.
+    pub fn background_throttled(&self) -> bool {
+        self.recent_request_count() >= BACKGROUND_SOFT_CAP
     }
 
     /// Returns the current rate-limit deadline if one is in effect (i.e. in
@@ -298,6 +358,11 @@ impl SpotifyClient {
         match *guard {
             Some(t) if t > Instant::now() => Some(t),
             _ => {
+                if guard.is_some() {
+                    // Expired — also drop the file so a future restart
+                    // doesn't re-rehydrate a stale deadline.
+                    delete_rate_limit_file();
+                }
                 *guard = None;
                 None
             }
@@ -309,11 +374,13 @@ impl SpotifyClient {
     /// the next 429 will re-set the gate; this just gives the user a try.
     pub fn clear_rate_limit(&self) {
         *self.rate_limited_until.lock().expect("rate_limit poisoned") = None;
+        delete_rate_limit_file();
     }
 
     fn note_rate_limit(&self, secs: u64) {
-        *self.rate_limited_until.lock().expect("rate_limit poisoned") =
-            Some(Instant::now() + std::time::Duration::from_secs(secs));
+        let until = Instant::now() + Duration::from_secs(secs);
+        *self.rate_limited_until.lock().expect("rate_limit poisoned") = Some(until);
+        save_rate_limit_until(secs);
     }
 
     pub fn set_device_id(&self, id: String) {
@@ -326,10 +393,6 @@ impl SpotifyClient {
 
     fn device_id(&self) -> Option<String> {
         self.device_id.lock().expect("device_id poisoned").clone()
-    }
-
-    pub fn device_id_for_log(&self) -> Option<String> {
-        self.device_id()
     }
 
     async fn bearer(&self) -> Result<String> {
@@ -560,6 +623,11 @@ impl SpotifyClient {
             anyhow::bail!(RateLimited(secs.max(1)));
         }
 
+        // Record the request *before* sending so the count reflects the
+        // request we're about to make (matters for any concurrent caller
+        // racing the same window).
+        self.record_request();
+
         let req_id = log::next_request_id();
         log::api_req(req_id, method, url, body_json);
         let started = Instant::now();
@@ -616,6 +684,82 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
+}
+
+/// Drop entries older than `THROTTLE_WINDOW` from the front of `q`.
+/// Shared by `record_request` and `recent_request_count` so both see the
+/// same view of "what's still in the window".
+fn prune_window(q: &mut VecDeque<Instant>, now: Instant) {
+    while let Some(&front) = q.front() {
+        if now.duration_since(front) > THROTTLE_WINDOW {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Path for the persisted rate-limit deadline. Honors `HIFI_RATELIMIT_FILE`
+/// for tests / non-default deployments; otherwise sits alongside
+/// `hifi-auth.json` in the working directory.
+fn rate_limit_state_path() -> PathBuf {
+    if let Ok(p) = std::env::var("HIFI_RATELIMIT_FILE") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from("hifi-ratelimit.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRateLimit {
+    until_unix_ms: u64,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn save_rate_limit_until(secs_from_now: u64) {
+    let until_unix_ms = now_unix_ms().saturating_add(secs_from_now.saturating_mul(1000));
+    let path = rate_limit_state_path();
+    let payload = PersistedRateLimit { until_unix_ms };
+    match serde_json::to_string(&payload) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, s) {
+                log::error("persist rate_limit", &format!("{e:#}"));
+            }
+        }
+        Err(e) => log::error("persist rate_limit (serialize)", &format!("{e:#}")),
+    }
+}
+
+fn delete_rate_limit_file() {
+    let path = rate_limit_state_path();
+    // ENOENT is fine; anything else is unexpected but non-fatal.
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::error("clear rate_limit file", &format!("{e:#}"));
+        }
+    }
+}
+
+/// Read the persisted deadline (if any) and translate it from Unix-ms back
+/// into an `Instant` measured against the current monotonic clock. Returns
+/// `None` if the file is missing, malformed, or already expired.
+fn load_rate_limit_until() -> Option<Instant> {
+    let path = rate_limit_state_path();
+    let s = std::fs::read_to_string(&path).ok()?;
+    let persisted: PersistedRateLimit = serde_json::from_str(&s).ok()?;
+    let now = now_unix_ms();
+    if persisted.until_unix_ms <= now {
+        // Stale; drop the file so we don't keep reading it on every boot.
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let remaining_ms = persisted.until_unix_ms - now;
+    Some(Instant::now() + Duration::from_millis(remaining_ms))
 }
 
 #[cfg(test)]
@@ -782,5 +926,91 @@ mod tests {
         ));
         *gate.lock().unwrap() = None; // mirrors clear_rate_limit
         assert!(read_gate(&gate).is_none());
+    }
+
+    /// Exercise the prune step directly: anything older than the window
+    /// drops out, anything newer stays.
+    #[test]
+    fn prune_window_drops_old_entries_only() {
+        let now = Instant::now();
+        let mut q: VecDeque<Instant> = VecDeque::new();
+        q.push_back(now - Duration::from_secs(60)); // way old
+        q.push_back(now - Duration::from_secs(31)); // just outside window
+        q.push_back(now - Duration::from_secs(29)); // inside
+        q.push_back(now - Duration::from_secs(1)); // inside
+        prune_window(&mut q, now);
+        assert_eq!(q.len(), 2);
+    }
+
+    /// Counting + soft-cap engagement via `recent_request_count`-equivalent
+    /// path (we drive the deque directly because we don't want this test to
+    /// require a live `SpotifyClient` / HTTP).
+    #[test]
+    fn background_soft_cap_engages_at_threshold() {
+        let now = Instant::now();
+        let mut q: VecDeque<Instant> = VecDeque::new();
+        for i in 0..(BACKGROUND_SOFT_CAP - 1) {
+            q.push_back(now - Duration::from_secs(i as u64 % 10));
+        }
+        prune_window(&mut q, now);
+        assert!(
+            q.len() < BACKGROUND_SOFT_CAP,
+            "len={} should be below soft cap {}",
+            q.len(),
+            BACKGROUND_SOFT_CAP
+        );
+
+        // One more pushes us to the cap.
+        q.push_back(now);
+        prune_window(&mut q, now);
+        assert!(q.len() >= BACKGROUND_SOFT_CAP);
+    }
+
+    /// Single combined test for save / load / expired-purge / delete. Kept
+    /// as one `#[test]` because `HIFI_RATELIMIT_FILE` is process-global and
+    /// splitting into multiple tests would race under cargo's parallel
+    /// runner.
+    #[test]
+    fn rate_limit_persistence_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "hifi-ratelimit-test-{}.json",
+            std::process::id()
+        ));
+        // SAFETY: env writes are unsafe in 2024 edition. Only this test
+        // touches HIFI_RATELIMIT_FILE, so the access is effectively serial.
+        unsafe {
+            std::env::set_var("HIFI_RATELIMIT_FILE", &path);
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // (1) future deadline → save and reload survives.
+        save_rate_limit_until(3600);
+        let loaded = load_rate_limit_until().expect("future deadline should rehydrate");
+        let remaining = loaded.saturating_duration_since(Instant::now()).as_secs();
+        assert!(
+            (3590..=3600).contains(&remaining),
+            "remaining={remaining} should be ~3600s"
+        );
+
+        // (2) delete wipes the file; next load is empty.
+        delete_rate_limit_file();
+        assert!(load_rate_limit_until().is_none());
+
+        // (3) a past deadline on disk is dropped (and the file removed) so
+        // we don't re-rehydrate stale state on every boot.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&PersistedRateLimit {
+                until_unix_ms: now_unix_ms().saturating_sub(60_000),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_rate_limit_until().is_none());
+        assert!(!path.exists(), "expired file should be deleted");
+
+        unsafe {
+            std::env::remove_var("HIFI_RATELIMIT_FILE");
+        }
     }
 }

@@ -3,6 +3,7 @@ hifi.toml
 hifi-auth.json
 hifi.log.sqlite*
 hifi-recent.json
+hifi-ratelimit.json
 
 /target
 **/*.rs.bk

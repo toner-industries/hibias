@@ -49,6 +49,8 @@ pub struct AppState {
     pub search: SearchState,
     /// Library tab state — four lazily-loaded sections.
     pub library: LibraryState,
+    /// Vertical focus within the current tab (content rows vs. the tab strip).
+    pub focus: Focus,
     /// Unix ms of the last local action (play/pause). When `/me/player`
     /// returns data with an older timestamp than this, we treat it as stale
     /// — librespot frequently fails to report state to Spotify Connect, so
@@ -101,6 +103,7 @@ impl Default for AppState {
             overlay: None,
             search: SearchState::new(None, Vec::new(), Vec::new()),
             library: LibraryState::default(),
+            focus: Focus::default(),
             last_local_action_ms: 0,
             device_present: None,
             recent_tracks: Vec::new(),
@@ -170,6 +173,18 @@ impl Tab {
             Tab::Library => ModeMask::LIBRARY,
         }
     }
+}
+
+/// Where vertical (up/down) navigation currently sits within a tab. Arrowing
+/// up past the first content row moves focus onto the top tab strip, where
+/// left/right switch tabs and down/enter drop back into the content.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    /// On the top tab strip — left/right cycle tabs, down/enter enters content.
+    Tabs,
+    /// Inside the active tab's body — up/down walk its rows.
+    #[default]
+    Content,
 }
 
 /// A transient surface drawn over the active tab. Help/Command/Devices render
@@ -569,9 +584,11 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
 
     // Tab/Shift-Tab always cycle the top tabs — they're not printable, so even
     // a text field (Search, Command) can't legitimately want them as input.
+    // A `tab` press lands you *in* the content of the new tab.
     if matches!(input.key, Key::Tab) {
         s.tab = if shift { s.tab.prev() } else { s.tab.next() };
         s.overlay = None;
+        s.focus = Focus::Content;
         return tab_entry_action(s.tab);
     }
 
@@ -582,6 +599,7 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
         match input.key {
             Key::Char('/') => {
                 s.overlay = None;
+                s.focus = Focus::Content;
                 return KeyAction::EnterSearch;
             }
             Key::Char(':') => {
@@ -598,6 +616,7 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
             Key::Char('l') => {
                 s.tab = Tab::Library;
                 s.overlay = None;
+                s.focus = Focus::Content;
                 return KeyAction::OpenLibrary;
             }
             _ => {}
@@ -609,11 +628,42 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
         return dispatch_overlay(&mut s, input);
     }
 
+    // 2.5 The top tab strip is itself a focusable row, reached by arrowing up
+    //     past the first content item. While focused, left/right switch tabs.
+    if s.focus == Focus::Tabs {
+        return dispatch_tabs_focus(&mut s, input);
+    }
+
     // 3. The active tab handles the rest.
     match s.tab {
         Tab::NowPlaying => dispatch_now_playing(&mut s, input, shift),
         Tab::Search => dispatch_search(&mut s, input),
         Tab::Library => dispatch_library(&mut s, input),
+    }
+}
+
+/// Keys while the top tab strip is focused. Left/right pick a tab (loading its
+/// content live underneath), down/enter drop into that content, esc backs into
+/// the content without changing tabs.
+fn dispatch_tabs_focus(s: &mut AppState, input: Input) -> KeyAction {
+    match input.key {
+        Key::Left => {
+            s.tab = s.tab.prev();
+            tab_entry_action(s.tab)
+        }
+        Key::Right => {
+            s.tab = s.tab.next();
+            tab_entry_action(s.tab)
+        }
+        Key::Down | Key::Enter => {
+            s.focus = Focus::Content;
+            tab_entry_action(s.tab)
+        }
+        Key::Esc => {
+            s.focus = Focus::Content;
+            KeyAction::Stay
+        }
+        _ => KeyAction::Stay,
     }
 }
 
@@ -633,10 +683,12 @@ fn dispatch_now_playing(s: &mut AppState, input: Input, shift: bool) -> KeyActio
         Key::Char(' ') => KeyAction::TogglePlayback,
         Key::Left if shift => KeyAction::Seek(-SEEK_STEP_MS),
         Key::Right if shift => KeyAction::Seek(SEEK_STEP_MS),
-        _ => {
-            let _ = s;
+        // Now Playing has no list, so Up always rises to the tab strip.
+        Key::Up => {
+            s.focus = Focus::Tabs;
             KeyAction::Stay
         }
+        _ => KeyAction::Stay,
     }
 }
 
@@ -653,6 +705,9 @@ fn dispatch_search(s: &mut AppState, input: Input) -> KeyAction {
         Key::Up => {
             if search.selected > 0 {
                 search.selected -= 1;
+            } else {
+                // Above the first result — rise to the tab strip.
+                s.focus = Focus::Tabs;
             }
             KeyAction::Stay
         }
@@ -729,6 +784,9 @@ fn dispatch_library(s: &mut AppState, input: Input) -> KeyAction {
         Key::Up => {
             if s.library.selected > 0 {
                 s.library.selected -= 1;
+            } else {
+                // Above the first row — rise to the tab strip.
+                s.focus = Focus::Tabs;
             }
             KeyAction::Stay
         }
@@ -3554,6 +3612,69 @@ mod tests {
         assert_eq!(h.mode_name().await, "command");
         h.press_and_run(Key::Esc).await; // closes overlay
         assert_eq!(h.mode_name().await, "library", "esc should reveal the tab, not jump home");
+    }
+
+    // --- Up/down focus model (content <-> tab strip) -------------------
+
+    #[tokio::test]
+    async fn up_from_now_playing_rises_to_tab_strip_then_arrows_switch_tabs() {
+        let h = Harness::new();
+        // Now Playing has no list, so Up goes straight to the tab strip.
+        h.press_and_run(Key::Up).await;
+        {
+            let s = h.state.lock().await;
+            assert_eq!(s.focus, Focus::Tabs);
+            assert_eq!(s.tab, Tab::NowPlaying);
+        }
+        // On the strip, Right/Left switch the top tab without leaving the strip.
+        h.press_and_run(Key::Right).await;
+        {
+            let s = h.state.lock().await;
+            assert_eq!(s.focus, Focus::Tabs, "still on the tab strip");
+            assert_eq!(s.tab, Tab::Search);
+        }
+        h.press_and_run(Key::Right).await;
+        assert_eq!(h.state.lock().await.tab, Tab::Library);
+        // Down drops into the content of the selected tab.
+        h.press_and_run(Key::Down).await;
+        let s = h.state.lock().await;
+        assert_eq!(s.focus, Focus::Content);
+        assert_eq!(s.tab, Tab::Library);
+    }
+
+    #[tokio::test]
+    async fn up_at_top_of_search_results_rises_to_tabs() {
+        let h = Harness::new();
+        h.fake.set_search(
+            "q",
+            Ok(SearchResults {
+                tracks: vec![track("spotify:track:1", "One"), track("spotify:track:2", "Two")],
+                ..Default::default()
+            }),
+        );
+        h.press_and_run(Key::Char('/')).await;
+        h.type_str("q").await;
+        h.settle().await;
+        // Move down one, then up twice: first Up returns to row 0, second Up
+        // (at the top) rises to the tab strip.
+        h.press_and_run(Key::Down).await;
+        h.press_and_run(Key::Up).await;
+        assert_eq!(h.state.lock().await.focus, Focus::Content);
+        h.press_and_run(Key::Up).await;
+        assert_eq!(h.state.lock().await.focus, Focus::Tabs);
+    }
+
+    #[tokio::test]
+    async fn esc_on_tab_strip_returns_to_content() {
+        let h = Harness::new();
+        h.press_and_run(Key::Char('l')).await; // Library, focus = Content
+        h.settle().await;
+        h.press_and_run(Key::Up).await; // selected is 0 -> rise to tabs
+        assert_eq!(h.state.lock().await.focus, Focus::Tabs);
+        h.press_and_run(Key::Esc).await; // esc backs into content, not quit
+        let s = h.state.lock().await;
+        assert_eq!(s.focus, Focus::Content);
+        assert_eq!(s.tab, Tab::Library, "esc on the strip stays on the same tab");
     }
 
     // --- Library lazy loading ------------------------------------------

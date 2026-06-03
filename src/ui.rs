@@ -9,8 +9,8 @@ use ratatui_image::StatefulImage;
 use std::time::Instant;
 
 use crate::app::{
-    AppState, BrowseState, Cmd, CommandState, DevicesState, LibraryState, LibraryTab, Overlay,
-    SearchState, Tab,
+    AppState, BrowseState, Cmd, CommandState, DevicesState, Focus, LibraryState, LibraryTab,
+    Overlay, SearchState, Tab,
 };
 use crate::art::ArtCache;
 use crate::keys::{self, ModeMask};
@@ -58,7 +58,8 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         ])
         .split(inner);
 
-    render_tab_strip(f, rows[0], state.tab);
+    let tabs_focused = state.overlay.is_none() && state.focus == Focus::Tabs;
+    render_tab_strip(f, rows[0], state.tab, tabs_focused);
     match state.tab {
         Tab::NowPlaying => render_now_playing_body(f, rows[1], state, art),
         Tab::Search => render_search_tab(f, rows[1], &state.search),
@@ -70,7 +71,12 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
             .style(Style::default().fg(color));
         f.render_widget(p, rows[2]);
     }
-    render_footer(f, rows[3], crate::app::active_mask(state));
+    if tabs_focused {
+        // Replace the per-tab footer with tab-strip navigation hints.
+        render_tab_footer(f, rows[3]);
+    } else {
+        render_footer(f, rows[3], crate::app::active_mask(state));
+    }
 
     // Transient overlays draw on top of the whole canvas.
     match &state.overlay {
@@ -83,21 +89,49 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
 }
 
 /// The top "Now Playing | Search | Library" strip. The active tab is cyan and
-/// bold; the others are dim. Mirrors the tab row in design/mockups.html.
-fn render_tab_strip(f: &mut Frame, area: Rect, active: Tab) {
+/// bold; the others are dim. When the strip itself is focused (the user
+/// arrowed up onto it), the active tab is shown as a filled pill so it's clear
+/// left/right will switch tabs. Mirrors the tab row in design/mockups.html.
+fn render_tab_strip(f: &mut Frame, area: Rect, active: Tab, focused: bool) {
     let mut spans = Vec::new();
     for (i, tab) in Tab::ALL.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
         }
         let style = if *tab == active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            if focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            }
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(tab.label(), style));
+        let label = if *tab == active && focused {
+            format!(" {} ", tab.label())
+        } else {
+            tab.label().to_string()
+        };
+        spans.push(Span::styled(label, style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Footer shown while the tab strip is focused.
+fn render_tab_footer(f: &mut Frame, area: Rect) {
+    let spans = vec![
+        Span::styled("[←/→]", Style::default().fg(Color::Cyan)),
+        Span::raw(" switch tab   "),
+        Span::styled("[↓]", Style::default().fg(Color::Cyan)),
+        Span::raw(" enter   "),
+        Span::styled("[esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" back"),
+    ];
+    let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    f.render_widget(p, area);
 }
 
 /// Now Playing body: album art + track info up top, progress at the bottom.

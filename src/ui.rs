@@ -282,14 +282,23 @@ fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_progress(f: &mut Frame, label_area: Rect, bar_area: Rect, state: &AppState) {
     let Some(pb) = &state.playback else { return };
     let Some(track) = &pb.item else { return };
-    let progress_ms = displayed_progress(state).min(track.duration_ms);
+    let raw_ms = displayed_progress(state);
+    let progress_ms = raw_ms.min(track.duration_ms);
     let ratio = (progress_ms as f64 / track.duration_ms.max(1) as f64).clamp(0.0, 1.0);
-    let label = format!(
-        "{}  {} / {}",
-        if pb.is_playing { "▶" } else { "⏸" },
-        fmt_dur(progress_ms),
-        fmt_dur(track.duration_ms),
-    );
+    // While playing, pulse between a filled and a hollow triangle so it's
+    // visibly "alive" even on a track that's between progress-bar ticks. The
+    // phase is driven by the real-time playback position (which advances on
+    // its own between polls), toggling each 500ms for ~one pulse per second.
+    let symbol = if pb.is_playing {
+        if (raw_ms / 500) % 2 == 0 {
+            "▶"
+        } else {
+            "▷"
+        }
+    } else {
+        "⏸"
+    };
+    let label = format!("{symbol}  {} / {}", fmt_dur(progress_ms), fmt_dur(track.duration_ms));
     f.render_widget(Paragraph::new(label), label_area);
     let gauge = Gauge::default()
         .ratio(ratio)

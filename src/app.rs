@@ -1307,7 +1307,14 @@ pub async fn reconnect_now(
                 s.streaming = Some(new);
                 s.reconnecting = false;
             }
-            wait_then_transfer(client.as_ref(), &device_id_for_transfer).await;
+            // Transferring playback to our freshly-registered device makes
+            // Spotify resume the track at its retained server-side position.
+            // The periodic poll wouldn't pick that up for up to 30s, so the
+            // now-playing view would sit at the stale seed (often 0:00) until
+            // then. Re-poll immediately so the real position lands within ~1.5s.
+            if wait_then_transfer(client.as_ref(), &device_id_for_transfer).await {
+                spawn_post_play_poll(client.clone(), state.clone());
+            }
         }
         Err(e) => {
             let msg = format!("{e:#}");
@@ -1342,7 +1349,10 @@ pub async fn reconnect_if_device_offline(
     offline
 }
 
-pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
+/// Returns `true` once playback has been transferred to our device — the
+/// caller uses this to know the server-side position is now authoritative for
+/// us and worth re-polling immediately.
+pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) -> bool {
     for attempt in 0..24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Bail the whole loop if the rate-limit gate trips mid-probe; we
@@ -1350,7 +1360,7 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
         // we're meant to be backing off.
         if client.rate_limited_until().is_some() {
             log::note("wait_then_transfer: aborted (rate-limited)", None);
-            return;
+            return false;
         }
         match client.get_devices().await {
             Ok(devices) => {
@@ -1364,17 +1374,22 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
                         )),
                     );
                     match client.transfer_playback(device_id, false).await {
-                        Ok(_) => log::note("transfer_playback ok", None),
-                        Err(e) => log::error("transfer_playback", &format!("{e:#}")),
+                        Ok(_) => {
+                            log::note("transfer_playback ok", None);
+                            return true;
+                        }
+                        Err(e) => {
+                            log::error("transfer_playback", &format!("{e:#}"));
+                            return false;
+                        }
                     }
-                    return;
                 }
             }
             // get_devices/transfer_playback returning RateLimited is the
             // signal that the gate is set; abort and let the user retry.
             Err(e) if e.downcast_ref::<RateLimited>().is_some() => {
                 log::note("wait_then_transfer: aborted (RateLimited)", None);
-                return;
+                return false;
             }
             Err(e) => log::note("get_devices failed", Some(&format!("{e:#}"))),
         }
@@ -1383,6 +1398,7 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) {
         "wait_then_transfer",
         "device never appeared in /me/player/devices after 12s",
     );
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2524,8 +2540,15 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
             if client.rate_limited_until().is_some() {
                 break;
             }
-            if let Ok(pb) = client.get_playback().await {
-                apply_playback(&state, pb).await;
+            // Only apply a *real* track. An empty (204/None) result here is the
+            // "nothing to resume / hasn't caught up" race — applying it would
+            // clobber the seed with "Nothing playing." After a user-initiated
+            // play, should_accept already rejects None for 60s; at boot
+            // (last_local_action_ms == 0) it wouldn't, so filter explicitly.
+            if let Ok(Some(pb)) = client.get_playback().await {
+                if pb.item.is_some() {
+                    apply_playback(&state, Some(pb)).await;
+                }
             }
         }
     });

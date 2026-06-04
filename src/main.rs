@@ -88,6 +88,29 @@ async fn main() -> Result<()> {
 
 fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
+        // The authoritative current player state comes first. If a track is
+        // already playing (or paused) on the account, seed from it so its real
+        // position shows on the very first paint. Otherwise we'd display the
+        // recents seed at 0:00 until the periodic poll corrects it ~30s later —
+        // a track resumed at 4:00 would read 0:00 for that whole window.
+        let seeded_from_live = match client.get_playback().await {
+            Ok(Some(pb)) if pb.item.is_some() => {
+                log::note(
+                    "boot seed via live playback",
+                    pb.item.as_ref().map(|t| t.name.as_str()),
+                );
+                apply_playback_force(&state, Some(pb)).await;
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                log::note("boot live playback unavailable", Some(&format!("{e:#}")));
+                false
+            }
+        };
+
+        // Always load recents: the Search tab seeds from them when its input is
+        // empty, and they're the fallback display when nothing is live.
         match client.get_recently_played(20).await {
             Ok(tracks) => {
                 log::note(
@@ -99,15 +122,22 @@ fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
                     let mut g = state.lock().await;
                     g.recent_tracks = tracks;
                 }
-                if let Some(t) = first {
-                    let synth = Playback {
-                        is_playing: false,
-                        progress_ms: Some(0),
-                        item: Some(t),
-                        context: None,
-                        timestamp: None,
-                    };
-                    apply_playback_force(&state, Some(synth)).await;
+                // The recents seed is a 0:00 placeholder for "nothing is
+                // playing — here's your history." Only apply it when nothing is
+                // already on screen: between our initial get_playback and now,
+                // the boot transfer's post-play poll may have landed the real,
+                // in-progress position, and this force-apply would clobber it.
+                if !seeded_from_live && state.lock().await.playback.is_none() {
+                    if let Some(t) = first {
+                        let synth = Playback {
+                            is_playing: false,
+                            progress_ms: Some(0),
+                            item: Some(t),
+                            context: None,
+                            timestamp: None,
+                        };
+                        apply_playback_force(&state, Some(synth)).await;
+                    }
                 }
             }
             Err(e) => {
@@ -115,16 +145,6 @@ fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
                     "recently_played unavailable",
                     Some(&format!("{e:#} (likely missing scope — run `just reauth`)")),
                 );
-                if let Ok(Some(pb)) = client.get_playback().await {
-                    log::note(
-                        "boot seed via /me/player fallback",
-                        pb.item.as_ref().map(|t| t.name.as_str()),
-                    );
-                    let mut seed = pb;
-                    seed.is_playing = false;
-                    seed.timestamp = None;
-                    apply_playback_force(&state, Some(seed)).await;
-                }
             }
         }
     });

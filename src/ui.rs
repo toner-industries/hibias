@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 use ratatui_image::StatefulImage;
@@ -359,11 +359,19 @@ fn render_progress(f: &mut Frame, label_area: Rect, bar_area: Rect, state: &AppS
     };
     let label = format!("{symbol}  {} / {}", fmt_dur(progress_ms), fmt_dur(track.duration_ms));
     f.render_widget(Paragraph::new(label), label_area);
-    let gauge = Gauge::default()
-        .ratio(ratio)
-        .label("")
-        .gauge_style(Style::default().fg(Color::Green));
-    f.render_widget(gauge, bar_area);
+    // Solid progress bar: spaces with a background color render at full cell
+    // height in every cell, so there's no center-cell discrepancy. (ratatui's
+    // Gauge special-cased its centered label cell, painting it as a background
+    // space while the rest of the bar used the `█` glyph — and since `█`
+    // renders a touch shorter than a cell, the lone center cell stuck up as a
+    // "hump" once the fill crossed the midpoint.)
+    let total = bar_area.width as usize;
+    let filled = ((ratio * total as f64).round() as usize).min(total);
+    let bar = Line::from(vec![
+        Span::styled(" ".repeat(filled), Style::default().bg(Color::Green)),
+        Span::styled(" ".repeat(total - filled), Style::default().bg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(bar), bar_area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, mode: ModeMask) {
@@ -1076,6 +1084,65 @@ mod tests {
         assert!(is_browse_forbidden("Insufficient client scope"));
         assert!(!is_browse_forbidden("rate limited; retry after 30s"));
         assert!(!is_browse_forbidden("connection refused"));
+    }
+
+    #[test]
+    fn progress_bar_fill_is_uniform_across_the_midpoint() {
+        use crate::api::{Album, Playback, Track};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        // ratio = 180/300 = 0.6, i.e. just past the midpoint — the region where
+        // the old Gauge widget drew a "hump" by special-casing its center cell.
+        let track = Track {
+            id: Some("x".into()),
+            uri: None,
+            name: "Song".into(),
+            duration_ms: 300_000,
+            artists: vec![],
+            album: Album::default(),
+        };
+        let state = AppState {
+            // Paused so displayed_progress returns the stored value verbatim,
+            // keeping the rendered ratio deterministic (no elapsed-time drift).
+            playback: Some(Playback {
+                is_playing: false,
+                progress_ms: Some(180_000),
+                item: Some(track),
+                context: None,
+                timestamp: None,
+            }),
+            last_poll: None,
+            ..Default::default()
+        };
+
+        let width: u16 = 30;
+        let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+        terminal
+            .draw(|f| {
+                let label_area = Rect::new(0, 0, width, 1);
+                let bar_area = Rect::new(0, 1, width, 1);
+                render_progress(f, label_area, bar_area, &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let filled = (0.6 * f64::from(width)).round() as u16; // 18
+
+        // Every filled cell is identical — a space on a green background. In
+        // particular the center column matches its neighbors, which is exactly
+        // what the Gauge widget broke (it painted the center cell differently,
+        // producing the visible hump once the fill crossed it).
+        for x in 0..filled {
+            let cell = &buf[(x, 1)];
+            assert_eq!(cell.symbol(), " ", "filled cell {x} symbol");
+            assert_eq!(cell.bg, Color::Green, "filled cell {x} bg");
+        }
+        // Unfilled cells are the dim track, also uniform.
+        for x in filled..width {
+            assert_eq!(buf[(x, 1)].bg, Color::DarkGray, "unfilled cell {x} bg");
+        }
     }
 
     #[test]

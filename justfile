@@ -4,12 +4,15 @@ default:
 
 # Start the TUI in a detached tmux session named `hifi` (no attach)
 start:
-    @cargo build --release --quiet
+    @echo "==> Building hifi (release)…"
+    cargo build --release
     @if tmux has-session -t hifi 2>/dev/null; then echo "hifi: already running"; else tmux new-session -d -s hifi 'target/release/hifi' && echo "hifi: started (use 'just attach' to interact)"; fi
 
 # Start (if needed) and attach to the TUI; detach with Ctrl-b d
 run:
-    @cargo build --release --quiet
+    @echo "==> Building hifi (release)… (first build can take ~30s; rebuilds are quick)"
+    cargo build --release
+    @echo "==> Launching hifi in tmux — detach with Ctrl-b d, stop with 'just stop'"
     @tmux new-session -A -s hifi 'target/release/hifi'
 
 # Attach to a running hifi tmux session

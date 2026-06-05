@@ -338,40 +338,85 @@ fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// Progress-bar / play-symbol palette, kept as RGB (not named ANSI colors) so
+/// the leading bar cell and the play glyph can be *blended* between the two —
+/// named colors can't be interpolated.
+const BAR_FILLED: (u8, u8, u8) = (46, 204, 64); // green
+const BAR_EMPTY: (u8, u8, u8) = (74, 74, 74); // dark gray
+
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// Linear blend from `a` (t=0) to `b` (t=1), clamped.
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+    Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
 fn render_progress(f: &mut Frame, label_area: Rect, bar_area: Rect, state: &AppState) {
     let Some(pb) = &state.playback else { return };
     let Some(track) = &pb.item else { return };
     let raw_ms = displayed_progress(state);
     let progress_ms = raw_ms.min(track.duration_ms);
     let ratio = (progress_ms as f64 / track.duration_ms.max(1) as f64).clamp(0.0, 1.0);
-    // While playing, pulse between a filled and a hollow triangle so it's
-    // visibly "alive" even on a track that's between progress-bar ticks. The
-    // phase is driven by the real-time playback position (which advances on
-    // its own between polls), toggling each 500ms for ~one pulse per second.
-    let symbol = if pb.is_playing {
-        if (raw_ms / 500) % 2 == 0 {
-            "▶"
-        } else {
-            "▷"
-        }
+
+    // The play glyph stays put and instead "breathes": it rests in the filled
+    // green for ~1.5s, then dips to gray for ~0.5s, on a 2s cycle. Driven by
+    // the real-time playback position so it animates between polls. Under an
+    // automated harness it never flashes (rests green) so screenshots are
+    // stable; when paused it's a steady gray ⏸.
+    let (symbol, symbol_color) = if pb.is_playing {
+        let dipped = !crate::testmode::under_test() && (raw_ms % 2000) < 500;
+        let color = if dipped { rgb(BAR_EMPTY) } else { rgb(BAR_FILLED) };
+        ("▶", color)
     } else {
-        "⏸"
+        ("⏸", rgb(BAR_EMPTY))
     };
-    let label = format!("{symbol}  {} / {}", fmt_dur(progress_ms), fmt_dur(track.duration_ms));
-    f.render_widget(Paragraph::new(label), label_area);
-    // Solid progress bar: spaces with a background color render at full cell
-    // height in every cell, so there's no center-cell discrepancy. (ratatui's
-    // Gauge special-cased its centered label cell, painting it as a background
-    // space while the rest of the bar used the `█` glyph — and since `█`
-    // renders a touch shorter than a cell, the lone center cell stuck up as a
-    // "hump" once the fill crossed the midpoint.)
-    let total = bar_area.width as usize;
-    let filled = ((ratio * total as f64).round() as usize).min(total);
-    let bar = Line::from(vec![
-        Span::styled(" ".repeat(filled), Style::default().bg(Color::Green)),
-        Span::styled(" ".repeat(total - filled), Style::default().bg(Color::DarkGray)),
+    let label = Line::from(vec![
+        Span::styled(symbol, Style::default().fg(symbol_color)),
+        Span::raw(format!(
+            "  {} / {}",
+            fmt_dur(progress_ms),
+            fmt_dur(track.duration_ms)
+        )),
     ]);
-    f.render_widget(Paragraph::new(bar), bar_area);
+    f.render_widget(Paragraph::new(label), label_area);
+
+    // Progress bar: completed cells solid green, empty cells dark gray, and a
+    // single *leading* cell that fades gray→green by the sub-cell progress.
+    // Spaces with a bg colour fill the whole cell (no glyph "hump"). Because
+    // the leading cell tracks the fractional position, a long track — where one
+    // cell is many seconds — still shows the bar visibly creeping forward on
+    // that one active character, instead of sitting frozen between whole-cell
+    // ticks. The cell locks solid green as the song crosses into the next one.
+    let total = bar_area.width as usize;
+    let exact = ratio * total as f64;
+    let filled = (exact.floor() as usize).min(total);
+    let frac = (exact - filled as f64).clamp(0.0, 1.0);
+
+    let mut spans = Vec::new();
+    if filled > 0 {
+        spans.push(Span::styled(
+            " ".repeat(filled),
+            Style::default().bg(rgb(BAR_FILLED)),
+        ));
+    }
+    if filled < total {
+        spans.push(Span::styled(
+            " ".to_string(),
+            Style::default().bg(lerp_rgb(BAR_EMPTY, BAR_FILLED, frac)),
+        ));
+        let trailing = total - filled - 1;
+        if trailing > 0 {
+            spans.push(Span::styled(
+                " ".repeat(trailing),
+                Style::default().bg(rgb(BAR_EMPTY)),
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), bar_area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, mode: ModeMask) {
@@ -463,6 +508,10 @@ fn render_search_input(f: &mut Frame, area: Rect, s: &SearchState) {
 fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
     let mut lines: Vec<Line> = Vec::new();
     let mut row = 0usize;
+    // Visual line index (within `lines`, which also holds headers and blank
+    // separators) of the selected row — so the list can scroll to keep it on
+    // screen instead of letting the selection walk off the bottom unseen.
+    let mut selected_line: Option<usize> = None;
 
     // Empty input → show only the two "recents" sections; the live search
     // sections below would all be empty anyway.
@@ -479,6 +528,7 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                 s.recent_queries.iter().map(|q| format!("  {q}")),
                 &mut row,
                 s.selected,
+                &mut selected_line,
             );
             push_section(
                 &mut lines,
@@ -492,11 +542,12 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                 }),
                 &mut row,
                 s.selected,
+                &mut selected_line,
             );
         }
         // No wrap — long row labels clip at the right edge instead of
         // taking up two rows each and pushing later rows off-screen.
-        f.render_widget(Paragraph::new(lines), area);
+        render_scrolled(f, area, lines, selected_line);
         return;
     }
 
@@ -510,6 +561,9 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                     t.name,
                     t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
                 );
+                if row == s.selected {
+                    selected_line = Some(lines.len());
+                }
                 lines.push(styled_row(label, row == s.selected));
                 row += 1;
             }
@@ -525,7 +579,7 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
             t.name,
             t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
         )
-    }), &mut row, s.selected);
+    }), &mut row, s.selected, &mut selected_line);
 
     push_section(&mut lines, "Albums", s.results.albums.iter().map(|a| {
         let artists = a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -534,7 +588,7 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         } else {
             format!("  {} — {}", a.name, artists)
         }
-    }), &mut row, s.selected);
+    }), &mut row, s.selected, &mut selected_line);
 
     push_section(
         &mut lines,
@@ -542,6 +596,7 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         s.results.artists.iter().map(|a| format!("  {}", a.name)),
         &mut row,
         s.selected,
+        &mut selected_line,
     );
 
     push_section(
@@ -557,8 +612,24 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         }),
         &mut row,
         s.selected,
+        &mut selected_line,
     );
 
+    render_scrolled(f, area, lines, selected_line);
+}
+
+/// Render `lines` into `area`, scrolled vertically so the row at `selected_line`
+/// stays visible. Search results (section headers + items across four sections)
+/// routinely overflow the results viewport; without this the selection could
+/// move past the last visible row with nothing scrolling into view.
+fn render_scrolled(f: &mut Frame, area: Rect, mut lines: Vec<Line>, selected_line: Option<usize>) {
+    let height = area.height as usize;
+    if height == 0 || lines.is_empty() {
+        return;
+    }
+    let offset = compute_scroll(selected_line.unwrap_or(0), lines.len(), height);
+    lines.drain(..offset);
+    lines.truncate(height);
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -578,6 +649,7 @@ fn push_section<I: Iterator<Item = String>>(
     items: I,
     row: &mut usize,
     selected: usize,
+    selected_line: &mut Option<usize>,
 ) {
     let collected: Vec<String> = items.collect();
     if collected.is_empty() {
@@ -585,6 +657,9 @@ fn push_section<I: Iterator<Item = String>>(
     }
     push_header(lines, title);
     for label in collected {
+        if *row == selected {
+            *selected_line = Some(lines.len());
+        }
         lines.push(styled_row(label, *row == selected));
         *row += 1;
     }
@@ -1056,6 +1131,11 @@ fn displayed_progress(s: &AppState) -> u64 {
     if !pb.is_playing {
         return base;
     }
+    // Under an automated harness, don't fold in wall-clock elapsed time — that
+    // keeps the progress bar and play glyph byte-stable across screenshots.
+    if crate::testmode::under_test() {
+        return base;
+    }
     let Some(polled) = s.last_poll else {
         return base;
     };
@@ -1128,20 +1208,72 @@ mod tests {
             .unwrap();
 
         let buf = terminal.backend().buffer();
-        let filled = (0.6 * f64::from(width)).round() as u16; // 18
+        // 0.6 * 30 = 18.0 exactly, so there's no partial leading cell here.
+        let filled = (0.6 * f64::from(width)).floor() as u16; // 18
 
-        // Every filled cell is identical — a space on a green background. In
+        // Every filled cell is identical — a space on the solid green bg. In
         // particular the center column matches its neighbors, which is exactly
         // what the Gauge widget broke (it painted the center cell differently,
         // producing the visible hump once the fill crossed it).
         for x in 0..filled {
             let cell = &buf[(x, 1)];
             assert_eq!(cell.symbol(), " ", "filled cell {x} symbol");
-            assert_eq!(cell.bg, Color::Green, "filled cell {x} bg");
+            assert_eq!(cell.bg, rgb(BAR_FILLED), "filled cell {x} bg");
         }
         // Unfilled cells are the dim track, also uniform.
         for x in filled..width {
-            assert_eq!(buf[(x, 1)].bg, Color::DarkGray, "unfilled cell {x} bg");
+            assert_eq!(buf[(x, 1)].bg, rgb(BAR_EMPTY), "unfilled cell {x} bg");
+        }
+    }
+
+    #[test]
+    fn progress_bar_leading_cell_fades_by_subcell_progress() {
+        use crate::api::{Album, Playback, Track};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        // ratio = 5.5/10 = 0.55 → 5 solid cells, leading cell (index 5) half
+        // way through, then 4 empty cells.
+        let track = Track {
+            id: Some("x".into()),
+            uri: None,
+            name: "Song".into(),
+            duration_ms: 100_000,
+            artists: vec![],
+            album: Album::default(),
+        };
+        let state = AppState {
+            playback: Some(Playback {
+                is_playing: false,
+                progress_ms: Some(55_000),
+                item: Some(track),
+                context: None,
+                timestamp: None,
+            }),
+            last_poll: None,
+            ..Default::default()
+        };
+
+        let width: u16 = 10;
+        let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+        terminal
+            .draw(|f| {
+                render_progress(f, Rect::new(0, 0, width, 1), Rect::new(0, 1, width, 1), &state);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        for x in 0..5 {
+            assert_eq!(buf[(x, 1)].bg, rgb(BAR_FILLED), "solid cell {x}");
+        }
+        // The leading cell is a blend — neither fully green nor fully gray.
+        let lead = buf[(5, 1)].bg;
+        assert_eq!(lead, lerp_rgb(BAR_EMPTY, BAR_FILLED, 0.5), "leading blend");
+        assert_ne!(lead, rgb(BAR_FILLED));
+        assert_ne!(lead, rgb(BAR_EMPTY));
+        for x in 6..width {
+            assert_eq!(buf[(x, 1)].bg, rgb(BAR_EMPTY), "trailing cell {x}");
         }
     }
 
@@ -1158,5 +1290,53 @@ mod tests {
         assert_eq!(compute_scroll(99, 100, 10), 90);
         // List fits entirely: no scroll.
         assert_eq!(compute_scroll(7, 8, 10), 0);
+    }
+
+    #[test]
+    fn search_results_scroll_keeps_last_selection_visible() {
+        use crate::api::{Artist, SearchResults, Track};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        // 12 tracks + a section header = 13 lines, far more than the 6-row area.
+        let tracks: Vec<Track> = (0..12)
+            .map(|i| Track {
+                id: Some(format!("t{i}")),
+                uri: None,
+                name: format!("Track {i:02}"),
+                duration_ms: 1000,
+                artists: vec![Artist {
+                    uri: None,
+                    name: "Artist".into(),
+                }],
+                album: Default::default(),
+            })
+            .collect();
+        let mut s = SearchState::new(None, vec![], vec![]);
+        s.input = "q".into();
+        s.results = SearchResults {
+            tracks,
+            ..Default::default()
+        };
+        s.selected = 11; // the last row
+
+        let (width, height) = (40u16, 6u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| render_search_results(f, Rect::new(0, 0, width, height), &s))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The selected last row scrolled into view; the first scrolled off.
+        assert!(text.contains("Track 11"), "last row should be visible:\n{text}");
+        assert!(
+            !text.contains("Track 00"),
+            "first row should have scrolled off:\n{text}"
+        );
     }
 }

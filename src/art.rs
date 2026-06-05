@@ -8,7 +8,15 @@ pub struct ArtLoader {
 
 impl ArtLoader {
     pub fn new(http: reqwest::Client) -> Self {
-        let picker = Picker::from_query_stdio().ok();
+        // Art is skipped only when an automated harness is driving the app
+        // (`HIFI_TEST=1`) — see `testmode`. That keeps VHS/e2e screenshots
+        // clean text, deterministic, and network-free. There is no user-facing
+        // way to turn art off, so a real run always probes for it.
+        let picker = if crate::testmode::under_test() {
+            None
+        } else {
+            Picker::from_query_stdio().ok()
+        };
         Self { picker, http }
     }
 

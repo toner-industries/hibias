@@ -45,6 +45,10 @@ pub struct SpotifyClient {
     /// trigger a 429. Pruned on every read/write so it stays bounded by
     /// `THROTTLE_WINDOW`.
     recent_requests: Mutex<VecDeque<Instant>>,
+    /// When `HIFI_RECORD` is set, every successful read response is teed
+    /// (untruncated) into a replay cassette — see [`CassetteRecorder`]. `None`
+    /// in normal operation.
+    recorder: Option<CassetteRecorder>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,12 +393,20 @@ impl SpotifyClient {
                 Some(&format!("retry in {secs}s")),
             );
         }
+        let recorder = std::env::var("HIFI_RECORD")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(CassetteRecorder::new);
+        if let Some(rec) = &recorder {
+            log::note("cassette recording enabled", Some(&rec.summary()));
+        }
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             auth,
             device_id: Mutex::new(None),
             rate_limited_until: Mutex::new(rehydrated),
             recent_requests: Mutex::new(VecDeque::new()),
+            recorder,
         })
     }
 
@@ -812,6 +824,12 @@ impl SpotifyClient {
         if !status.is_success() {
             anyhow::bail!("{method} {url}: {status}: {body_text}");
         }
+        // Tee the full, untruncated body into the cassette when recording.
+        // Unlike the SQLite log (capped at 32 KB), this keeps large library
+        // pages intact, so recorded cassettes cover every screen.
+        if let Some(rec) = &self.recorder {
+            rec.record(method, url, status.as_u16(), &body_text);
+        }
         Ok((status, body_text))
     }
 }
@@ -1015,10 +1033,16 @@ impl Cassette {
         serde_json::from_str(&text).context("parse cassette json")
     }
 
+    /// Write the cassette as pretty JSON, atomically (temp file + rename) so a
+    /// crash mid-write — the recorder rewrites this live — can't leave a
+    /// truncated, unparseable cassette behind.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let text = serde_json::to_string_pretty(self).context("serialize cassette")?;
-        std::fs::write(path, text).with_context(|| format!("write cassette {}", path.display()))
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
     }
 
     /// Mine a cassette out of the SQLite event log the app writes. Pairs each
@@ -1081,6 +1105,53 @@ impl Cassette {
             }
         }
         Ok(cassette)
+    }
+}
+
+/// Tees successful read responses into a [`Cassette`] on disk as the real
+/// client runs. Enabled by `HIFI_RECORD=<path>`. Unlike mining the SQLite log,
+/// this captures full untruncated bodies, so even the large library pages make
+/// it into the cassette. Seeds from any existing file at `path`, so repeated
+/// record sessions accumulate coverage rather than overwrite it.
+pub struct CassetteRecorder {
+    path: PathBuf,
+    cassette: Mutex<Cassette>,
+}
+
+impl CassetteRecorder {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let cassette = Cassette::load(&path).unwrap_or_default();
+        Self {
+            path,
+            cassette: Mutex::new(cassette),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let n = self.cassette.lock().expect("recorder poisoned").len();
+        format!("{} (seeded with {n} endpoints)", self.path.display())
+    }
+
+    /// Record one response. No-op unless it's a successful, non-empty read we
+    /// know how to replay (`cassette_key` returns `Some`). Rewrites the file
+    /// only when the stored body actually changes, to avoid churn on identical
+    /// polls.
+    pub fn record(&self, method: &str, url: &str, status: u16, body: &str) {
+        if !(200..300).contains(&status) || body.is_empty() {
+            return;
+        }
+        let Some(key) = cassette_key(method, url) else {
+            return;
+        };
+        let mut cassette = self.cassette.lock().expect("recorder poisoned");
+        if cassette.get(&key) == Some(body) {
+            return;
+        }
+        cassette.insert(key, body.to_string());
+        if let Err(e) = cassette.save(&self.path) {
+            log::note("cassette record failed", Some(&format!("{e:#}")));
+        }
     }
 }
 
@@ -1685,5 +1756,37 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn recorder_captures_reads_skips_the_rest_and_persists() {
+        let path = std::env::temp_dir().join("hifi_recorder_test.json");
+        let _ = std::fs::remove_file(&path);
+        let b = "https://api.spotify.com/v1";
+        {
+            let rec = CassetteRecorder::new(&path);
+            // A successful read is captured under its logical key...
+            rec.record("GET", &format!("{b}/search?q=beatles&type=track"), 200, SEARCH_JSON);
+            // ...mutations, non-2xx, and empty bodies are skipped.
+            rec.record("PUT", &format!("{b}/me/player/play"), 200, "{}");
+            rec.record("GET", &format!("{b}/me/player"), 500, "err");
+            rec.record("GET", &format!("{b}/me/player/queue"), 204, "");
+        }
+        // What landed on disk is a valid, replayable cassette.
+        let loaded = Cassette::load(&path).expect("cassette written");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("search:beatles"), Some(SEARCH_JSON));
+
+        // A second recorder seeds from the file (coverage accumulates) and a
+        // changed body for an existing key overwrites it.
+        {
+            let rec = CassetteRecorder::new(&path);
+            rec.record("GET", &format!("{b}/me/player"), 200, PLAYBACK_JSON);
+        }
+        let loaded = Cassette::load(&path).expect("cassette written");
+        assert_eq!(loaded.len(), 2, "search retained + playback added");
+        assert!(loaded.get("playback").unwrap().contains("My Song"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

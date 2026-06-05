@@ -6,7 +6,13 @@
 //   cargo run --bin hifi-cassette                       # hifi.log.sqlite -> cassette.json
 //   cargo run --bin hifi-cassette -- <log.sqlite> <out.json>
 //
-// Then drive the UI offline against the recording:
+// This is the zero-cost path, but the log caps bodies at 32 KB, so large
+// library pages get truncated and dropped. For full coverage, record a live
+// session instead (captures untruncated bodies as you browse):
+//
+//   HIFI_RECORD=cassette.json cargo run --bin hifi      # then visit every screen
+//
+// Either way, drive the UI offline against the result:
 //
 //   HIFI_REPLAY=cassette.json cargo run --bin hifi
 

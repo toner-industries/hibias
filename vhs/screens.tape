@@ -22,7 +22,11 @@ Set Width 820
 Set Height 700
 
 # --- Launch offline against the cassette --------------------------------
-Type "HIFI_REPLAY=cassette.json target/debug/hifi"
+# HIFI_TEST=1 marks this as a harness run, which disables album art (VHS's
+# xterm.js mis-renders the image widget as duplicated text; real terminals are
+# fine). HIFI_REPLAY serves recorded data offline. Two orthogonal switches:
+# "under test" vs. "where data comes from".
+Type "HIFI_TEST=1 HIFI_REPLAY=cassette.json target/debug/hifi"
 Enter
 Sleep 3s
 Screenshot scratch/vhs/01-now-playing.png

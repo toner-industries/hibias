@@ -24,6 +24,7 @@ mod recent;
 mod streaming;
 #[cfg(test)]
 mod test_support;
+mod testmode;
 mod ui;
 
 use api::{Playback, RateLimited, SpotifyApi, SpotifyClient};

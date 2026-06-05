@@ -4,6 +4,9 @@ hifi-auth.json
 hifi.log.sqlite*
 hifi-recent.json
 hifi-ratelimit.json
+# Replay cassettes are distilled from the (ignored) log and contain real
+# listening data — searches, library, now-playing. Keep them local.
+cassette*.json
 
 /target
 **/*.rs.bk

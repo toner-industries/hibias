@@ -1,9 +1,9 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -200,6 +200,16 @@ struct AlbumTracksPage {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueResponse {
+    // `/me/player/queue` returns the upcoming tracks here (the currently
+    // playing item is a separate `currently_playing` field we don't need).
+    // Entries can be tracks or podcast episodes; episodes still parse into
+    // Track since every field but `name` is defaulted.
+    #[serde(default = "Vec::new")]
+    queue: Vec<Track>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PlaylistTracksPage {
     #[serde(default = "Vec::new")]
     items: Vec<PlaylistTrackItem>,
@@ -273,6 +283,10 @@ pub trait SpotifyApi: Send + Sync {
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
     async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>>;
+    /// The user's upcoming play queue (`/me/player/queue`). Fetched on demand
+    /// when the Now Playing tab is shown — never on a timer, to keep request
+    /// volume low.
+    async fn get_queue(&self) -> Result<Vec<Track>>;
     async fn save_track(&self, track_id: &str) -> Result<()>;
     /// The user's saved/library collections, for the Library tab. Each is
     /// fetched lazily, on first focus of its sub-tab.
@@ -340,6 +354,9 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn get_recently_played(&self, limit: u32) -> Result<Vec<Track>> {
         SpotifyClient::get_recently_played(self, limit).await
+    }
+    async fn get_queue(&self) -> Result<Vec<Track>> {
+        SpotifyClient::get_queue(self).await
     }
     async fn save_track(&self, track_id: &str) -> Result<()> {
         SpotifyClient::save_track(self, track_id).await
@@ -632,6 +649,22 @@ impl SpotifyClient {
         Ok(out)
     }
 
+    pub async fn get_queue(&self) -> Result<Vec<Track>> {
+        let url = format!("{BASE}/me/player/queue");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (status, body) = self.send_logged(req, "GET", &url, None).await?;
+        // No active session yields a 204 / empty body — no queue to show.
+        if status == reqwest::StatusCode::NO_CONTENT || body.is_empty() {
+            return Ok(Vec::new());
+        }
+        let page: QueueResponse =
+            serde_json::from_str(&body).context("parse /me/player/queue")?;
+        Ok(page.queue)
+    }
+
     pub async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
         // The /albums/{id}/tracks endpoint returns Track objects without a
         // nested `album` (Track defaults that field). Limit 50 is plenty
@@ -877,6 +910,361 @@ fn load_rate_limit_until() -> Option<Instant> {
     }
     let remaining_ms = persisted.until_unix_ms - now;
     Some(Instant::now() + Duration::from_millis(remaining_ms))
+}
+
+// ---------------------------------------------------------------------------
+// Record / replay: an offline `SpotifyApi` backed by captured responses.
+//
+// The app already logs every request/response to `hifi.log.sqlite`. A cassette
+// is just that data distilled into a `{logical-key -> response body}` map that
+// `ReplaySpotify` serves without touching the network — so the UI can be
+// exercised infinitely with zero rate-limit risk. See `Cassette::from_log`.
+// ---------------------------------------------------------------------------
+
+/// Maps a recorded `(method, url)` to the logical key its endpoint is stored
+/// under. Returns `None` for requests we don't replay (mutations: play, pause,
+/// seek, transfer, …) — those have no body worth serving back.
+// Used by the `hifi-cassette` bin and tests; the `hifi` bin only replays.
+#[allow(dead_code)]
+fn cassette_key(method: &str, url: &str) -> Option<String> {
+    let path = url.strip_prefix(BASE)?;
+    let (path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let key = match (method, path) {
+        ("GET", "/me/player") => "playback".to_string(),
+        ("GET", "/me/player/devices") => "devices".to_string(),
+        ("GET", "/me/player/queue") => "queue".to_string(),
+        ("GET", "/me/player/recently-played") => "recently_played".to_string(),
+        ("GET", "/me/tracks") => "saved_tracks".to_string(),
+        ("GET", "/me/playlists") => "saved_playlists".to_string(),
+        ("GET", "/me/albums") => "saved_albums".to_string(),
+        ("GET", "/me/following") => "followed_artists".to_string(),
+        ("GET", "/search") => format!("search:{}", query.and_then(|q| query_param(q, "q"))?),
+        ("GET", p) if p.starts_with("/albums/") && p.ends_with("/tracks") => {
+            let id = p
+                .trim_start_matches("/albums/")
+                .trim_end_matches("/tracks");
+            format!("album_tracks:{id}")
+        }
+        ("GET", p) if p.starts_with("/playlists/") && p.ends_with("/tracks") => {
+            let id = p
+                .trim_start_matches("/playlists/")
+                .trim_end_matches("/tracks");
+            format!("playlist_tracks:{id}")
+        }
+        _ => return None,
+    };
+    Some(key)
+}
+
+/// Extract and percent-decode a single query parameter value.
+#[allow(dead_code)]
+fn query_param(query: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    query.split('&').find_map(|pair| {
+        pair.strip_prefix(&prefix).map(|raw| {
+            urlencoding::decode(raw)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| raw.to_string())
+        })
+    })
+}
+
+/// A set of recorded Spotify responses keyed by logical endpoint. Persisted as
+/// plain JSON so cassettes are easy to inspect, hand-edit, and diff.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Cassette {
+    /// logical request key (see `cassette_key`) -> raw recorded JSON body
+    entries: HashMap<String, String>,
+}
+
+// Several methods (new/insert/keys/save/from_log) are used only by the
+// `hifi-cassette` bin and tests; the `hifi` bin uses just load/get/len.
+#[allow(dead_code)]
+impl Cassette {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, body: impl Into<String>) {
+        self.entries.insert(key.into(), body.into());
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read cassette {}", path.display()))?;
+        serde_json::from_str(&text).context("parse cassette json")
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let text = serde_json::to_string_pretty(self).context("serialize cassette")?;
+        std::fs::write(path, text).with_context(|| format!("write cassette {}", path.display()))
+    }
+
+    /// Mine a cassette out of the SQLite event log the app writes. Pairs each
+    /// `api_req` with its `api_resp`, keeps successful / untruncated / non-empty
+    /// bodies, maps each to a logical key, and lets the most recent recording
+    /// win.
+    ///
+    /// `request_id` resets to 1 on every process start, so it is *not* unique
+    /// across runs. We therefore pair in row (`id`) order — a request stashes
+    /// its `(method, url)` under its id; the next response carrying that id
+    /// consumes it. A new run's `api_req` overwrites the stash before its own
+    /// response arrives, so cross-run ids never mis-pair.
+    pub fn from_log(db_path: impl AsRef<Path>) -> Result<Self> {
+        let db_path = db_path.as_ref();
+        let conn = rusqlite::Connection::open(db_path)
+            .with_context(|| format!("open log db {}", db_path.display()))?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, request_id, method, url, status, body \
+             FROM events \
+             WHERE kind IN ('api_req', 'api_resp') AND request_id IS NOT NULL \
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,         // kind
+                row.get::<_, i64>(1)?,            // request_id
+                row.get::<_, Option<String>>(2)?, // method
+                row.get::<_, Option<String>>(3)?, // url
+                row.get::<_, Option<i64>>(4)?,    // status
+                row.get::<_, Option<String>>(5)?, // body
+            ))
+        })?;
+
+        let mut pending: HashMap<i64, (String, String)> = HashMap::new();
+        let mut cassette = Cassette::new();
+        for row in rows {
+            let (kind, request_id, method, url, status, body) = row?;
+            match kind.as_str() {
+                "api_req" => {
+                    if let (Some(m), Some(u)) = (method, url) {
+                        pending.insert(request_id, (m, u));
+                    }
+                }
+                "api_resp" => {
+                    let ok = matches!(status, Some(s) if (200..300).contains(&s));
+                    let body = match body {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    if !ok || body.is_empty() || body.contains("…[truncated]") {
+                        continue;
+                    }
+                    if let Some((m, u)) = pending.get(&request_id) {
+                        if let Some(key) = cassette_key(m, u) {
+                            cassette.entries.insert(key, body);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(cassette)
+    }
+}
+
+/// An offline [`SpotifyApi`] that serves recorded responses from a [`Cassette`].
+/// Reads return real captured JSON; mutations are no-ops, except play/pause
+/// (and play_uris/play_context) which flip an in-memory `is_playing` flag so
+/// the Now Playing screen visibly responds. It is never rate-limited — that is
+/// the whole point.
+pub struct ReplaySpotify {
+    cassette: Cassette,
+    device_id: Mutex<Option<String>>,
+    /// Once the user toggles playback, overrides the recorded snapshot's
+    /// `is_playing` so play/pause feel live offline.
+    play_override: Mutex<Option<bool>>,
+}
+
+impl ReplaySpotify {
+    pub fn new(cassette: Cassette) -> Self {
+        Self {
+            cassette,
+            device_id: Mutex::new(None),
+            play_override: Mutex::new(None),
+        }
+    }
+
+    /// Parse the body stored under `key` into `T`, or `None` if the cassette
+    /// has no such recording (parse failures are logged and treated as a miss
+    /// so a single bad entry never crashes the offline app).
+    fn parsed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let body = self.cassette.get(key)?;
+        match serde_json::from_str(body) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::note("replay parse failed", Some(&format!("key={key} err={e}")));
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SpotifyApi for ReplaySpotify {
+    fn set_device_id(&self, id: String) {
+        *self.device_id.lock().expect("replay device_id poisoned") = Some(id);
+    }
+    fn clear_device_id(&self) {
+        *self.device_id.lock().expect("replay device_id poisoned") = None;
+    }
+    fn rate_limited_until(&self) -> Option<Instant> {
+        None
+    }
+    fn clear_rate_limit(&self) {}
+    fn background_throttled(&self) -> bool {
+        false
+    }
+
+    async fn get_playback(&self) -> Result<Option<Playback>> {
+        let mut pb: Option<Playback> = self.parsed("playback");
+        let over = *self.play_override.lock().expect("replay play_override poisoned");
+        if let (Some(p), Some(playing)) = (pb.as_mut(), over) {
+            p.is_playing = playing;
+        }
+        Ok(pb)
+    }
+
+    async fn play(&self) -> Result<()> {
+        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        Ok(())
+    }
+    async fn pause(&self) -> Result<()> {
+        *self.play_override.lock().expect("replay play_override poisoned") = Some(false);
+        Ok(())
+    }
+
+    async fn get_devices(&self) -> Result<Vec<Device>> {
+        Ok(self
+            .parsed::<DevicesPayload>("devices")
+            .map(|p| p.devices)
+            .unwrap_or_default())
+    }
+
+    async fn transfer_playback(&self, _device_id: &str, _play: bool) -> Result<()> {
+        Ok(())
+    }
+    async fn seek_to(&self, _position_ms: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn next_track(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn previous_track(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn play_uris(&self, _uris: &[String]) -> Result<()> {
+        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        Ok(())
+    }
+    async fn play_context(&self, _context_uri: &str, _offset_uri: Option<&str>) -> Result<()> {
+        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        Ok(())
+    }
+
+    async fn search(&self, q: &str) -> Result<SearchResults> {
+        let payload: SearchPayload = match self.parsed(&format!("search:{q}")) {
+            Some(p) => p,
+            None => return Ok(SearchResults::default()),
+        };
+        Ok(SearchResults {
+            tracks: payload.tracks.map(Page::into_items).unwrap_or_default(),
+            albums: payload.albums.map(Page::into_items).unwrap_or_default(),
+            artists: payload.artists.map(Page::into_items).unwrap_or_default(),
+            playlists: payload.playlists.map(Page::into_items).unwrap_or_default(),
+        })
+    }
+
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
+        Ok(self
+            .parsed::<AlbumTracksPage>(&format!("album_tracks:{album_id}"))
+            .map(|p| p.items)
+            .unwrap_or_default())
+    }
+
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        Ok(self
+            .parsed::<PlaylistTracksPage>(&format!("playlist_tracks:{playlist_id}"))
+            .map(|p| p.items.into_iter().filter_map(|i| i.track).collect())
+            .unwrap_or_default())
+    }
+
+    async fn get_recently_played(&self, _limit: u32) -> Result<Vec<Track>> {
+        let page: RecentlyPlayedPage = match self.parsed("recently_played") {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for it in page.items.into_iter().filter_map(|i| i.track) {
+            let key = it.uri.clone().unwrap_or_else(|| it.name.clone());
+            if seen.insert(key) {
+                out.push(it);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_queue(&self) -> Result<Vec<Track>> {
+        Ok(self
+            .parsed::<QueueResponse>("queue")
+            .map(|p| p.queue)
+            .unwrap_or_default())
+    }
+
+    async fn save_track(&self, _track_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_saved_tracks(&self, _limit: u32) -> Result<Vec<Track>> {
+        Ok(self
+            .parsed::<SavedTracksPage>("saved_tracks")
+            .map(|p| p.items.into_iter().filter_map(|i| i.track).collect())
+            .unwrap_or_default())
+    }
+
+    async fn get_saved_playlists(&self, _limit: u32) -> Result<Vec<Playlist>> {
+        Ok(self
+            .parsed::<Page<Playlist>>("saved_playlists")
+            .map(Page::into_items)
+            .unwrap_or_default())
+    }
+
+    async fn get_saved_albums(&self, _limit: u32) -> Result<Vec<Album>> {
+        Ok(self
+            .parsed::<SavedAlbumsPage>("saved_albums")
+            .map(|p| p.items.into_iter().filter_map(|i| i.album).collect())
+            .unwrap_or_default())
+    }
+
+    async fn get_followed_artists(&self, _limit: u32) -> Result<Vec<Artist>> {
+        Ok(self
+            .parsed::<FollowedArtistsPayload>("followed_artists")
+            .and_then(|p| p.artists)
+            .map(Page::into_items)
+            .unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -1128,6 +1516,174 @@ mod tests {
 
         unsafe {
             std::env::remove_var("HIFI_RATELIMIT_FILE");
+        }
+    }
+
+    // ----- record / replay -------------------------------------------------
+
+    const PLAYBACK_JSON: &str = r#"{
+        "is_playing": true, "progress_ms": 1234,
+        "item": {"id":"t1","uri":"spotify:track:t1","name":"My Song","duration_ms":1000,
+                 "artists":[{"name":"A"}],"album":{"name":"Alb","images":[]}}
+    }"#;
+    const SEARCH_JSON: &str = r#"{
+        "tracks": {"items": [
+            {"id":"t1","uri":"spotify:track:t1","name":"Hit","duration_ms":1000,
+             "artists":[{"name":"A"}],"album":{"name":"Alb","images":[]}}
+        ]}
+    }"#;
+    const DEVICES_JSON: &str = r#"{"devices":[{"id":"d1","name":"hifi","is_active":true}]}"#;
+
+    #[test]
+    fn cassette_key_maps_read_endpoints() {
+        let k = |m, u: &str| cassette_key(m, u);
+        let b = "https://api.spotify.com/v1";
+        assert_eq!(k("GET", &format!("{b}/me/player")).as_deref(), Some("playback"));
+        assert_eq!(
+            k("GET", &format!("{b}/me/player/devices")).as_deref(),
+            Some("devices")
+        );
+        assert_eq!(k("GET", &format!("{b}/me/player/queue")).as_deref(), Some("queue"));
+        assert_eq!(
+            k("GET", &format!("{b}/me/tracks?limit=50")).as_deref(),
+            Some("saved_tracks")
+        );
+        // search q is percent-decoded so it matches what `search(q)` builds.
+        assert_eq!(
+            k("GET", &format!("{b}/search?q=the%20beatles&type=track&limit=8")).as_deref(),
+            Some("search:the beatles")
+        );
+        assert_eq!(
+            k("GET", &format!("{b}/albums/abc123/tracks?limit=50")).as_deref(),
+            Some("album_tracks:abc123")
+        );
+        assert_eq!(
+            k("GET", &format!("{b}/playlists/p9/tracks?limit=100")).as_deref(),
+            Some("playlist_tracks:p9")
+        );
+        // Mutations and unknown endpoints are not replayed.
+        assert_eq!(k("PUT", &format!("{b}/me/player/play")), None);
+        assert_eq!(k("POST", &format!("{b}/me/player/next")), None);
+        assert_eq!(k("GET", "https://example.com/whatever"), None);
+    }
+
+    #[test]
+    fn cassette_roundtrips_through_json() {
+        let mut c = Cassette::new();
+        c.insert("playback", PLAYBACK_JSON);
+        c.insert("search:beatles", SEARCH_JSON);
+        let path = std::env::temp_dir().join("hifi_cassette_roundtrip.json");
+        c.save(&path).expect("save");
+        let loaded = Cassette::load(&path).expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("playback"), Some(PLAYBACK_JSON));
+        assert_eq!(loaded.get("search:beatles"), Some(SEARCH_JSON));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn replay_serves_recorded_playback() {
+        let mut c = Cassette::new();
+        c.insert("playback", PLAYBACK_JSON);
+        let replay = ReplaySpotify::new(c);
+        let pb = replay.get_playback().await.unwrap().expect("playback");
+        assert!(pb.is_playing);
+        assert_eq!(pb.item.as_ref().unwrap().name, "My Song");
+    }
+
+    #[tokio::test]
+    async fn replay_play_pause_overrides_is_playing() {
+        let mut c = Cassette::new();
+        c.insert("playback", PLAYBACK_JSON); // recorded as is_playing: true
+        let replay = ReplaySpotify::new(c);
+
+        replay.pause().await.unwrap();
+        assert!(!replay.get_playback().await.unwrap().unwrap().is_playing);
+
+        replay.play().await.unwrap();
+        assert!(replay.get_playback().await.unwrap().unwrap().is_playing);
+    }
+
+    #[tokio::test]
+    async fn replay_search_parses_recorded_body() {
+        let mut c = Cassette::new();
+        c.insert("search:beatles", SEARCH_JSON);
+        let replay = ReplaySpotify::new(c);
+        let results = replay.search("beatles").await.unwrap();
+        assert_eq!(results.tracks.len(), 1);
+        assert_eq!(results.tracks[0].name, "Hit");
+    }
+
+    #[tokio::test]
+    async fn replay_missing_keys_return_empty_not_error() {
+        let replay = ReplaySpotify::new(Cassette::new());
+        assert!(replay.get_playback().await.unwrap().is_none());
+        assert!(replay.get_devices().await.unwrap().is_empty());
+        assert!(replay.get_queue().await.unwrap().is_empty());
+        assert!(replay.search("nothing recorded").await.unwrap().tracks.is_empty());
+        assert!(replay.get_album_tracks("missing").await.unwrap().is_empty());
+        // Never rate-limited — that's the whole point of offline replay.
+        assert!(replay.rate_limited_until().is_none());
+    }
+
+    #[test]
+    fn from_log_pairs_by_run_and_prefers_latest_untruncated() {
+        // Build a throwaway log DB shaped like the real one, with two "runs"
+        // that both reuse request_id 1 (the counter resets per process), a
+        // skipped mutation, a truncated body, and a 500 — then assert
+        // extraction pairs correctly within each run and keeps the latest.
+        let path = std::env::temp_dir().join("hifi_from_log_test.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let b = "https://api.spotify.com/v1";
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL, ts_unix_ms INTEGER NOT NULL, kind TEXT NOT NULL,
+                    request_id INTEGER, method TEXT, url TEXT, status INTEGER,
+                    latency_ms INTEGER, body TEXT, detail TEXT);",
+            )
+            .unwrap();
+            let mut ins = |kind: &str, rid: i64, method: Option<&str>, url: Option<&str>, status: Option<i64>, body: Option<&str>| {
+                conn.execute(
+                    "INSERT INTO events (ts, ts_unix_ms, kind, request_id, method, url, status, latency_ms, body, detail)
+                     VALUES ('t', 0, ?1, ?2, ?3, ?4, ?5, 0, ?6, NULL)",
+                    rusqlite::params![kind, rid, method, url, status, body],
+                )
+                .unwrap();
+            };
+            let old_pb = PLAYBACK_JSON.replace("My Song", "Old Song");
+            // run 1
+            ins("api_req", 1, Some("GET"), Some(&format!("{b}/me/player")), None, None);
+            ins("api_resp", 1, None, None, Some(200), Some(&old_pb));
+            ins("api_req", 2, Some("GET"), Some(&format!("{b}/search?q=beatles&type=track&limit=8")), None, None);
+            ins("api_resp", 2, None, None, Some(200), Some(SEARCH_JSON));
+            ins("api_req", 3, Some("PUT"), Some(&format!("{b}/me/player/play")), None, None); // mutation
+            ins("api_resp", 3, None, None, Some(204), Some(""));
+            ins("api_req", 4, Some("GET"), Some(&format!("{b}/me/player/devices")), None, None);
+            ins("api_resp", 4, None, None, Some(200), Some("{\"devices\":[]} …[truncated]")); // dropped
+            // run 2 (request_id resets to 1) — newer playback must win.
+            ins("api_req", 1, Some("GET"), Some(&format!("{b}/me/player")), None, None);
+            ins("api_resp", 1, None, None, Some(200), Some(PLAYBACK_JSON));
+            ins("api_req", 2, Some("GET"), Some(&format!("{b}/me/player/devices")), None, None);
+            ins("api_resp", 2, None, None, Some(500), Some("server error")); // non-2xx dropped
+        }
+
+        let cassette = Cassette::from_log(&path).expect("from_log");
+        // playback: latest run wins ("My Song", not "Old Song").
+        let pb = cassette.get("playback").expect("playback present");
+        assert!(pb.contains("My Song") && !pb.contains("Old Song"));
+        // search captured from run 1.
+        assert!(cassette.get("search:beatles").is_some());
+        // truncated devices + 500 devices + mutation are all excluded.
+        assert!(cassette.get("devices").is_none());
+        assert_eq!(cassette.len(), 2, "only playback + search should survive");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 }

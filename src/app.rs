@@ -64,6 +64,11 @@ pub struct AppState {
     /// Recently played tracks fetched from /me/player/recently-played.
     /// Shown in the search overlay when the input is empty.
     pub recent_tracks: Vec<Track>,
+    /// Upcoming tracks from /me/player/queue, shown as "Up Next" on the Now
+    /// Playing screen. Fetched on demand (on entering the tab / after a skip),
+    /// never on a timer — so it can be slightly stale until the tab is
+    /// re-entered. Empty when nothing is queued or nothing is playing.
+    pub queue: Vec<Track>,
     /// Queries the user has searched for previously, most-recent-first.
     /// Persisted to `hifi-recent.json` so it survives restarts.
     pub recent_queries: Vec<String>,
@@ -107,6 +112,7 @@ impl Default for AppState {
             last_local_action_ms: 0,
             device_present: None,
             recent_tracks: Vec::new(),
+            queue: Vec::new(),
             recent_queries: Vec::new(),
             boot: true,
             streaming_failed: None,
@@ -223,6 +229,16 @@ pub fn mode_name(s: &AppState) -> &'static str {
         Some(ov) => ov.name(),
         None => s.tab.name(),
     }
+}
+
+/// True when the Now Playing screen is the visible surface — its tab is active
+/// and no overlay covers it. The run loop watches this across a keypress: when
+/// it flips false → true, Now Playing just came into view and its Up Next queue
+/// is (re)fetched. This catches every path uniformly — tab nav, Esc out of
+/// Search/Library, and closing an overlay — without threading an action through
+/// each.
+pub fn now_playing_visible(s: &AppState) -> bool {
+    s.tab == Tab::NowPlaying && s.overlay.is_none()
 }
 
 /// The keymask whose footer/help should show — the overlay's if one is open
@@ -671,6 +687,8 @@ fn dispatch_tabs_focus(s: &mut AppState, input: Input) -> KeyAction {
 /// re-seeds recents, Library lazy-loads its sub-tab, Now Playing is inert.
 fn tab_entry_action(tab: Tab) -> KeyAction {
     match tab {
+        // Now Playing's queue refresh is driven by the run loop's
+        // visibility transition (see `now_playing_visible`), not an action.
         Tab::NowPlaying => KeyAction::Stay,
         Tab::Search => KeyAction::EnterSearch,
         Tab::Library => KeyAction::OpenLibrary,
@@ -2242,6 +2260,28 @@ pub async fn apply_playback(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) 
     apply_playback_inner(state, pb, false).await
 }
 
+/// Apply a polled playback result and, if it advanced to a new track while the
+/// user is watching Now Playing, refresh the Up Next queue — it's now stale.
+/// This is the only background queue refresh: it's event-driven (a real track
+/// change the poll observed), not a timer, and gated to the Now Playing tab so
+/// we never spend a request on a queue the user can't see. The playback poll
+/// uses this instead of bare [`apply_playback`].
+pub async fn apply_polled_playback(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    pb: Option<Playback>,
+) {
+    let before = { state.lock().await.current_track_id.clone() };
+    apply_playback(state, pb).await;
+    let advanced_in_view = {
+        let s = state.lock().await;
+        s.current_track_id != before && s.current_track_id.is_some() && now_playing_visible(&s)
+    };
+    if advanced_in_view {
+        refresh_queue(client, state).await;
+    }
+}
+
 /// Apply playback bypassing `should_accept` — used for our own
 /// synthesized seed (e.g. the recently-played track shown at startup),
 /// which would otherwise be filtered out by the boot guard.
@@ -2525,6 +2565,42 @@ pub async fn skip_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState
             }
         }
     }
+}
+
+/// Refresh the "Up Next" queue shown on Now Playing. Called on demand — when
+/// the user lands on the Now Playing tab, or right after a skip — never on a
+/// timer, to keep request volume low. Respects the hard rate-limit gate but
+/// ignores the soft background-throttle cap, since it's user-initiated. The
+/// queue is non-critical: the fetch runs on a spawned task so it never blocks
+/// the UI, and a failure is logged (not surfaced) and leaves the prior list
+/// untouched.
+pub async fn refresh_queue(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("refresh_queue: skipped (rate-limited)", None);
+            return;
+        }
+        // With nothing playing there's no queue to show, and Now Playing
+        // renders its placeholder instead — don't spend a request on it.
+        if s.playback.as_ref().and_then(|p| p.item.as_ref()).is_none() {
+            return;
+        }
+    }
+    let client = client.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        match client.get_queue().await {
+            Ok(queue) => {
+                log::note("refresh_queue", Some(&format!("len={}", queue.len())));
+                state.lock().await.queue = queue;
+            }
+            Err(e) => log::note("refresh_queue failed", Some(&format!("{e:#}"))),
+        }
+    });
 }
 
 /// Convenience to grab a Result wrapping the action loop should perform
@@ -3930,6 +4006,223 @@ mod tests {
         let screen = h.snapshot_sized(96, 40).await;
         print_snapshot("now_playing + rate-limited", &screen);
         assert_border_closes("now_playing + rate-limited", &screen);
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_fetches_and_stores_when_playing() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:cur", "Current")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        h.fake.set_queue(Ok(vec![
+            track("spotify:track:n1", "Next One"),
+            track("spotify:track:n2", "Next Two"),
+        ]));
+
+        refresh_queue(&h.client, &h.state).await;
+        h.settle().await;
+
+        assert!(h.fake.calls().contains(&Call::GetQueue));
+        assert_eq!(h.state.lock().await.queue.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_is_skipped_when_nothing_is_playing() {
+        let h = Harness::new();
+        h.fake.set_queue(Ok(vec![track("spotify:track:n1", "Next One")]));
+
+        refresh_queue(&h.client, &h.state).await;
+        h.settle().await;
+
+        // No current track → no request spent, queue stays empty.
+        assert!(!h.fake.calls().contains(&Call::GetQueue));
+        assert!(h.state.lock().await.queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_is_skipped_when_rate_limited() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:cur", "Current")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        h.fake.set_queue(Ok(vec![track("spotify:track:n1", "Next One")]));
+        h.state.lock().await.rate_limited_until = Some(Instant::now() + Duration::from_secs(30));
+
+        refresh_queue(&h.client, &h.state).await;
+        h.settle().await;
+
+        assert!(!h.fake.calls().contains(&Call::GetQueue));
+    }
+
+    #[tokio::test]
+    async fn polled_track_change_refreshes_queue_on_now_playing() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:cur", "Current")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        h.fake.set_queue(Ok(vec![track("spotify:track:n1", "Next One")]));
+
+        // The poll observes the track advancing to a new song.
+        apply_polled_playback(
+            &h.client,
+            &h.state,
+            Some(Playback {
+                is_playing: true,
+                progress_ms: Some(0),
+                item: Some(track("spotify:track:next", "Next")),
+                context: None,
+                timestamp: Some(now_unix_ms()),
+            }),
+        )
+        .await;
+        h.settle().await;
+
+        assert!(h.fake.calls().contains(&Call::GetQueue));
+        assert_eq!(h.state.lock().await.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn polled_track_change_does_not_refresh_queue_off_now_playing() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:cur", "Current")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        h.fake.set_queue(Ok(vec![track("spotify:track:n1", "Next One")]));
+        h.state.lock().await.tab = Tab::Library;
+
+        apply_polled_playback(
+            &h.client,
+            &h.state,
+            Some(Playback {
+                is_playing: true,
+                progress_ms: Some(0),
+                item: Some(track("spotify:track:next", "Next")),
+                context: None,
+                timestamp: Some(now_unix_ms()),
+            }),
+        )
+        .await;
+        h.settle().await;
+
+        // The queue is hidden behind another tab — don't spend a request on it.
+        assert!(!h.fake.calls().contains(&Call::GetQueue));
+    }
+
+    #[tokio::test]
+    async fn polled_same_track_does_not_refresh_queue() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:cur", "Current")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        h.fake.set_queue(Ok(vec![track("spotify:track:n1", "Next One")]));
+
+        // A routine poll that finds the same track playing must not refetch.
+        apply_polled_playback(
+            &h.client,
+            &h.state,
+            Some(Playback {
+                is_playing: true,
+                progress_ms: Some(30_000),
+                item: Some(track("spotify:track:cur", "Current")),
+                context: None,
+                timestamp: Some(now_unix_ms()),
+            }),
+        )
+        .await;
+        h.settle().await;
+
+        assert!(!h.fake.calls().contains(&Call::GetQueue));
+    }
+
+    #[tokio::test]
+    async fn tab_nav_back_to_now_playing_makes_it_visible_again() {
+        let h = Harness::new();
+        // Default is Now Playing (visible). Tab away, then a Tab from Library
+        // lands back on Now Playing — the run loop watches exactly this
+        // false→true flip to refresh the queue.
+        assert!(now_playing_visible(&*h.state.lock().await));
+        h.state.lock().await.tab = Tab::Library;
+        assert!(!now_playing_visible(&*h.state.lock().await));
+        h.press(Key::Tab).await; // Library → Now Playing
+        assert!(now_playing_visible(&*h.state.lock().await));
+    }
+
+    #[tokio::test]
+    async fn esc_from_search_makes_now_playing_visible() {
+        let h = Harness::new();
+        h.state.lock().await.tab = Tab::Search;
+        assert!(!now_playing_visible(&*h.state.lock().await));
+        h.press(Key::Esc).await;
+        assert!(now_playing_visible(&*h.state.lock().await));
+    }
+
+    #[tokio::test]
+    async fn closing_an_overlay_makes_now_playing_visible() {
+        let h = Harness::new();
+        // Open the device picker over Now Playing, then Esc to close it.
+        h.press_and_run(Key::Char('d')).await;
+        assert!(!now_playing_visible(&*h.state.lock().await));
+        h.press(Key::Esc).await;
+        assert!(now_playing_visible(&*h.state.lock().await));
+    }
+
+    #[tokio::test]
+    async fn ui_at_96x40_now_playing_with_up_next() {
+        let h = Harness::new();
+        h.seed_playback(Playback {
+            is_playing: true,
+            progress_ms: Some(42_000),
+            item: Some(track("spotify:track:cur", "Current Song")),
+            context: None,
+            timestamp: Some(now_unix_ms()),
+        })
+        .await;
+        {
+            let mut s = h.state.lock().await;
+            s.boot = false;
+            s.device_name = Some("hifi".into());
+            // The leading entry duplicates the now-playing track (a stale
+            // queue) and should be filtered out of "Up Next".
+            s.queue = vec![
+                track("spotify:track:cur", "Current Song"),
+                track("spotify:track:n1", "Next One"),
+                track("spotify:track:n2", "Next Two"),
+            ];
+        }
+        let screen = h.snapshot_sized(96, 40).await;
+        print_snapshot("now_playing + up next", &screen);
+        assert_border_closes("now_playing + up next", &screen);
+        assert!(screen.contains("Up Next"), "expected Up Next header");
+        assert!(screen.contains("Next One"), "expected first queued track");
+        assert!(
+            !screen.contains("1. Current Song"),
+            "stale now-playing entry should be filtered from the queue"
+        );
     }
 
     #[tokio::test]

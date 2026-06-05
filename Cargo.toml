@@ -36,5 +36,9 @@ path = "src/main.rs"
 name = "hifi-diag"
 path = "src/bin/diag.rs"
 
+[[bin]]
+name = "hifi-cassette"
+path = "src/bin/cassette.rs"
+
 [profile.release]
 debug = 1

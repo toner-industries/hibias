@@ -46,15 +46,30 @@ async fn main() -> Result<()> {
     }
     log::note("app start", None);
 
-    eprintln!("Authenticating...");
-    let auth = match auth::Auth::init().await.context("authenticate") {
-        Ok(a) => a,
-        Err(e) => {
-            log::error("auth::init", &format!("{e:#}"));
-            return Err(e);
-        }
+    // Offline replay: when HIFI_REPLAY points at a cassette, serve recorded
+    // responses instead of hitting Spotify — no auth, no librespot, no rate
+    // limits. Build a cassette with `cargo run --bin hifi-cassette`.
+    let replay_path = std::env::var("HIFI_REPLAY").ok().filter(|s| !s.is_empty());
+    let client: Arc<dyn SpotifyApi> = if let Some(path) = replay_path.as_deref() {
+        let cassette = api::Cassette::load(path)
+            .with_context(|| format!("load replay cassette {path}"))?;
+        eprintln!(
+            "REPLAY mode — serving {} recorded endpoints from {path} (offline, no Spotify calls)",
+            cassette.len()
+        );
+        log::note("replay mode", Some(path));
+        Arc::new(api::ReplaySpotify::new(cassette))
+    } else {
+        eprintln!("Authenticating...");
+        let auth = match auth::Auth::init().await.context("authenticate") {
+            Ok(a) => a,
+            Err(e) => {
+                log::error("auth::init", &format!("{e:#}"));
+                return Err(e);
+            }
+        };
+        Arc::new(SpotifyClient::new(auth)?)
     };
-    let client: Arc<dyn SpotifyApi> = Arc::new(SpotifyClient::new(auth)?);
 
     eprintln!("Probing terminal for image support...");
     let art_loader = Arc::new(art::ArtLoader::new(reqwest::Client::new()));
@@ -70,8 +85,11 @@ async fn main() -> Result<()> {
 
     // Start the Connect device in the background so we can render the TUI
     // immediately — librespot's Spirc handshake usually takes a couple of
-    // seconds and we don't want to block the screen on it.
-    spawn_reconnect(&client, &state, "boot");
+    // seconds and we don't want to block the screen on it. Skipped in replay
+    // mode: there is no real session to bring up offline.
+    if replay_path.is_none() {
+        spawn_reconnect(&client, &state, "boot");
+    }
 
     // Kick off a recently-played fetch in the background. Doubles as:
     //   (a) the "Recently played" section in the search overlay, and
@@ -146,6 +164,14 @@ fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
                     Some(&format!("{e:#} (likely missing scope — run `just reauth`)")),
                 );
             }
+        }
+
+        // The default landing tab is Now Playing, so the Up Next queue is
+        // visible from the first frame — but no keypress fires the usual
+        // visibility-transition refresh. Seed it here when something's actually
+        // playing (a recents placeholder has no queue worth fetching).
+        if seeded_from_live {
+            app::refresh_queue(&client, &state).await;
         }
     });
 }
@@ -270,12 +296,25 @@ async fn run(
                         log::note("quit", Some("ctrl-c"));
                         break;
                     }
-                    let mode_before = mode_name(&*state.lock().await).to_string();
+                    let (mode_before, np_before) = {
+                        let s = state.lock().await;
+                        (mode_name(&s).to_string(), app::now_playing_visible(&s))
+                    };
                     log::key(&input::label(inp), &mode_before);
                     let action = dispatch_input(inp, &state).await;
-                    let mode_after = mode_name(&*state.lock().await).to_string();
+                    let (mode_after, np_after) = {
+                        let s = state.lock().await;
+                        (mode_name(&s).to_string(), app::now_playing_visible(&s))
+                    };
                     if mode_before != mode_after {
                         log::mode_change(&mode_before, &mode_after);
+                    }
+                    // Now Playing just came into view (tab nav, Esc out of a
+                    // tab, or closing an overlay) — its Up Next queue may be
+                    // stale, so refresh it. refresh_queue is a no-op when
+                    // nothing's playing or we're rate-limited.
+                    if np_after && !np_before {
+                        app::refresh_queue(&client, &state).await;
                     }
                     match action {
                         KeyAction::Quit => {
@@ -285,8 +324,14 @@ async fn run(
                         KeyAction::Stay => {}
                         KeyAction::TogglePlayback => toggle_playback(&client, &state).await,
                         KeyAction::Seek(delta_ms) => seek_relative(&client, &state, delta_ms).await,
-                        KeyAction::NextTrack => skip_track(&client, &state, true).await,
-                        KeyAction::PrevTrack => skip_track(&client, &state, false).await,
+                        KeyAction::NextTrack => {
+                            skip_track(&client, &state, true).await;
+                            app::refresh_queue(&client, &state).await;
+                        }
+                        KeyAction::PrevTrack => {
+                            skip_track(&client, &state, false).await;
+                            app::refresh_queue(&client, &state).await;
+                        }
                         KeyAction::Reconnect => {
                             spawn_reconnect(&client, &state, "user: :reconnect");
                         }
@@ -390,7 +435,7 @@ fn spawn_playback_poll(
             }
             match client.get_playback().await {
                 Ok(pb) => {
-                    app::apply_playback(&state, pb).await;
+                    app::apply_polled_playback(&client, &state, pb).await;
                 }
                 Err(e) => {
                     let retry = e.downcast_ref::<RateLimited>().map(|r| r.0);

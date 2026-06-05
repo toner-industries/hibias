@@ -147,7 +147,66 @@ fn render_now_playing_body(f: &mut Frame, area: Rect, state: &mut AppState, art:
         ])
         .split(area);
     render_top(f, rows[0], state, art);
+    render_up_next(f, rows[1], state);
     render_progress(f, rows[2], rows[3], state);
+}
+
+/// "Up Next": a compact peek at the upcoming queue, shown in the gap between
+/// the now-playing header and the progress bar. The data is fetched on demand
+/// (see [`crate::app::refresh_queue`]) so it can be briefly stale; empty when
+/// nothing is queued or nothing is playing.
+fn render_up_next(f: &mut Frame, area: Rect, state: &AppState) {
+    // Only meaningful alongside a current track. Without one the queue is
+    // empty and Now Playing shows its placeholder instead.
+    let current_id = state
+        .playback
+        .as_ref()
+        .and_then(|p| p.item.as_ref())
+        .and_then(|t| t.id.as_deref());
+    if current_id.is_none() || area.height < 2 {
+        return;
+    }
+    // Skip a stale leading entry that's actually the track now playing — the
+    // fetched queue can lag a track behind until it's re-fetched.
+    let upcoming: Vec<_> = state
+        .queue
+        .iter()
+        .filter(|t| t.id.as_deref() != current_id)
+        .take(5)
+        .collect();
+    if upcoming.is_empty() {
+        return;
+    }
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Up Next",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for (i, t) in upcoming.iter().enumerate() {
+        let artists = t
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label = if artists.is_empty() {
+            t.name.clone()
+        } else {
+            format!("{} — {artists}", t.name)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}. ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::raw(label),
+        ]));
+    }
+    // No wrap: long rows truncate at the canvas width rather than reflowing,
+    // and any lines past the available height clip cleanly.
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn top_height(inner_h: u16) -> u16 {

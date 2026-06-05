@@ -23,8 +23,8 @@ use crate::api::{
 use crate::app::{
     apply_playback, dispatch_input, enter_browse, enter_library, enter_search, kick_search,
     like_current_track, open_devices, play_browse_collection, play_browse_selection,
-    play_library_selection, play_selection, seek_relative, skip_track, toggle_playback,
-    transfer_to_device, AppState, KeyAction,
+    play_library_selection, play_selection, refresh_queue, seek_relative, skip_track,
+    toggle_playback, transfer_to_device, AppState, KeyAction,
 };
 use crate::input::{Input, Key, Mods};
 use crate::{art, ui};
@@ -47,6 +47,7 @@ pub enum Call {
     GetAlbumTracks(String),
     GetPlaylistTracks(String),
     GetRecentlyPlayed(u32),
+    GetQueue,
     SaveTrack(String),
     GetSavedTracks(u32),
     GetSavedPlaylists(u32),
@@ -61,6 +62,7 @@ struct FakeState {
     playback: Option<Result<Option<Playback>, String>>,
     devices: Option<Result<Vec<Device>, String>>,
     recently_played: Option<Result<Vec<Track>, String>>,
+    queue: Option<Result<Vec<Track>, String>>,
     /// Per-query programmable response.
     search: HashMap<String, Result<SearchResults, String>>,
     /// Per-id programmable response.
@@ -131,6 +133,10 @@ impl FakeSpotify {
 
     pub fn set_recently_played(&self, r: Result<Vec<Track>, String>) {
         self.with(|s| s.recently_played = Some(r));
+    }
+
+    pub fn set_queue(&self, r: Result<Vec<Track>, String>) {
+        self.with(|s| s.queue = Some(r));
     }
 
     pub fn set_search(&self, query: &str, r: Result<SearchResults, String>) {
@@ -324,6 +330,15 @@ impl SpotifyApi for FakeSpotify {
         }
     }
 
+    async fn get_queue(&self) -> Result<Vec<Track>> {
+        self.record(Call::GetQueue);
+        match self.with(|s| s.queue.clone()) {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn save_track(&self, track_id: &str) -> Result<()> {
         self.record(Call::SaveTrack(track_id.to_string()));
         Ok(())
@@ -421,8 +436,14 @@ impl Harness {
             KeyAction::Stay | KeyAction::Quit => {}
             KeyAction::TogglePlayback => toggle_playback(&self.client, &self.state).await,
             KeyAction::Seek(d) => seek_relative(&self.client, &self.state, d).await,
-            KeyAction::NextTrack => skip_track(&self.client, &self.state, true).await,
-            KeyAction::PrevTrack => skip_track(&self.client, &self.state, false).await,
+            KeyAction::NextTrack => {
+                skip_track(&self.client, &self.state, true).await;
+                refresh_queue(&self.client, &self.state).await;
+            }
+            KeyAction::PrevTrack => {
+                skip_track(&self.client, &self.state, false).await;
+                refresh_queue(&self.client, &self.state).await;
+            }
             KeyAction::Reconnect => {
                 // Tests don't drive the real librespot session — they assert
                 // on the higher-level state machine instead.

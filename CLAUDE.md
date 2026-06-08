@@ -26,11 +26,11 @@ lightweight binary, no browser tab or desktop app required.
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | **head** | `main.rs` | terminal setup, the auth-vs-replay boot branch, background tasks, the `select!` run loop |
-| **logic** | `app.rs` | `AppState`, `KeyAction`, `dispatch_input`, async action handlers |
+| **logic** | `app/` | `AppState` + async handlers (`mod.rs`); `dispatch.rs` (`KeyAction`, pure `dispatch_input`); `freshness.rs` (`should_accept`); `tests.rs`. All re-exported, so callers use `crate::app::*` |
 | **view** | `ui.rs` | ratatui rendering only — reads `AppState` + `ArtCache` |
 | **data** | `api.rs` | `SpotifyApi` trait, `SpotifyClient` (live), `ReplaySpotify` (offline), rate-limit gate |
 
-**Hard rule:** crossterm/ratatui types never cross into `app.rs` — it consumes
+**Hard rule:** crossterm/ratatui types never cross into `app/` — it consumes
 the frontend-neutral `input::Input`, not crossterm events. Decoded album art
 lives in `art::ArtCache` owned by the run loop, **never** in `AppState` (keeps
 the core free of ratatui types — the seam that lets a non-TUI head reuse it).

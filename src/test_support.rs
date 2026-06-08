@@ -4,8 +4,12 @@
 //!
 //! Wires up an `AppState`, a programmable `FakeSpotify`, and ratatui's
 //! `TestBackend` so we can drive the same code paths the run loop uses
-//! (`dispatch_key` → `KeyAction` → action handler) and inspect the
+//! (`dispatch_input` → `KeyAction` → action handler) and inspect the
 //! resulting state + rendered screen, all without a TTY or the network.
+//!
+//! NOTE: `Harness::run` hand-mirrors the `match action` dispatch in
+//! `main.rs::run`. They must stay in sync — a new `KeyAction` wired only into
+//! `main.rs` won't be exercised by tests until it's added here too.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -21,7 +25,7 @@ use crate::api::{
     Album, Artist, Device, Playback, Playlist, SearchResults, SpotifyApi, Track,
 };
 use crate::app::{
-    apply_playback, dispatch_input, enter_browse, enter_library, enter_search, kick_search,
+    apply_playback_force, dispatch_input, enter_browse, enter_library, enter_search, kick_search,
     like_current_track, open_devices, play_browse_collection, play_browse_selection,
     play_library_selection, play_selection, refresh_queue, seek_relative, skip_track,
     toggle_playback, transfer_to_device, AppState, KeyAction,
@@ -478,9 +482,10 @@ impl Harness {
     }
 
     /// Force-apply a `Playback` to the state, bypassing `should_accept`. Used
-    /// to set up scenarios that assume a track is already loaded.
+    /// to set up scenarios that assume a track is already loaded — `_force` so
+    /// the seed lands regardless of any prior local action in the test.
     pub async fn seed_playback(&self, pb: Playback) {
-        apply_playback(&self.state, Some(pb)).await;
+        apply_playback_force(&self.state, Some(pb)).await;
     }
 
     pub async fn mode_name(&self) -> &'static str {
@@ -500,9 +505,10 @@ impl Harness {
         }
     }
 
-    /// Render the current UI into a 80x40 in-memory buffer and return the
-    /// concatenated text. Trailing whitespace on each line is trimmed for
-    /// readability in assertions.
+    /// Render the current UI into a 100x40 in-memory buffer and return the
+    /// concatenated text. (The UI canvas itself is 96 wide — `ui::FIXED_W` —
+    /// so columns 96–99 are always blank padding.) Trailing whitespace on each
+    /// line is trimmed for readability in assertions.
     pub async fn snapshot(&self) -> String {
         self.snapshot_sized(100, 40).await
     }

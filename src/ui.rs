@@ -453,7 +453,10 @@ fn render_search_tab(f: &mut Frame, area: Rect, s: &SearchState) {
         .split(area);
 
     render_search_input(f, layout[0], s);
-    let total = visible_total(s);
+    // Single source of truth shared with the dispatcher's selection clamp —
+    // this count MUST match what `render_search_results` draws, or selection
+    // and scroll desync.
+    let total = crate::app::visible_row_count(s);
     let loading = s.is_loading();
     let hint = if s.input.is_empty() {
         if total == 0 {
@@ -676,18 +679,6 @@ fn styled_row(label: String, selected: bool) -> Line<'static> {
     } else {
         Line::from(label)
     }
-}
-
-fn visible_total(s: &SearchState) -> usize {
-    if s.input.is_empty() {
-        return s.recent_queries.len() + s.recent_tracks.len();
-    }
-    let in_ctx = s.in_context.as_ref().map(|c| c.filtered.len()).unwrap_or(0);
-    in_ctx
-        + s.results.tracks.len()
-        + s.results.albums.len()
-        + s.results.artists.len()
-        + s.results.playlists.len()
 }
 
 fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {

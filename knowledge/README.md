@@ -1,5 +1,10 @@
 # spotify-player Knowledge Base
 
+> ⚠️ **This documents a DIFFERENT project, not hifi.** These notes describe the
+> reference implementation `spotify-player`. hifi does not share its crate
+> layout, dependencies, or architecture. Do not treat anything here as a
+> description of hifi's code — see the repo root `CLAUDE.md` for hifi itself.
+
 Reference notes on the [aome510/spotify-player](https://github.com/aome510/spotify-player) codebase, captured to inform the design of `hifi`. The cloned source lives at `../spotify-player/` (gitignored).
 
 ## Index

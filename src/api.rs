@@ -1,3 +1,14 @@
+//! Spotify Web API layer: domain types, the `SpotifyApi` trait, the live
+//! `SpotifyClient`, the offline `ReplaySpotify`/`Cassette` record-replay system,
+//! and the rate-limit circuit breaker.
+//!
+//! COMPILED THREE TIMES. As `crate::api` for the `hifi` binary (which only
+//! *replays* — it never builds a cassette), and `#[path]`-included by
+//! `bin/diag.rs` and `bin/cassette.rs` (hifi is a binary-only crate, no
+//! lib.rs). Items marked `#[allow(dead_code)]` (e.g. `Cassette::from_log`,
+//! `cassette_key`) are live in one binary and unused in another — do NOT delete
+//! them as "dead" or strip the allow without checking all three build targets.
+
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -942,6 +953,13 @@ fn load_rate_limit_until() -> Option<Instant> {
 /// Maps a recorded `(method, url)` to the logical key its endpoint is stored
 /// under. Returns `None` for requests we don't replay (mutations: play, pause,
 /// seek, transfer, …) — those have no body worth serving back.
+///
+/// CONTRACT: the keys produced here MUST match the literals `ReplaySpotify`
+/// reads back (`get_playback` → `"playback"`, `search` → `"search:{q}"`,
+/// `get_album_tracks` → `"album_tracks:{id}"`, …). They are written and read in
+/// two different places; if they drift, replay silently returns empty (a miss
+/// is swallowed in `ReplaySpotify::parsed`), so the offline app just shows a
+/// blank screen with no error. Change one side, change the other.
 // Used by the `hifi-cassette` bin and tests; the `hifi` bin only replays.
 #[allow(dead_code)]
 fn cassette_key(method: &str, url: &str) -> Option<String> {

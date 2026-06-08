@@ -1002,6 +1002,10 @@ fn dispatch_command(s: &mut AppState, input: Input) -> KeyAction {
     }
 }
 
+/// The number of selectable rows in the Search tab. Single source of truth for
+/// two consumers that MUST agree: the Down-key selection clamp here in the
+/// dispatcher, and `ui::render_search_tab` (count display + scroll math). If
+/// they disagree, the selection can point at a row the renderer never draws.
 pub fn visible_row_count(s: &SearchState) -> usize {
     if s.showing_recents() {
         return s.recent_queries.len() + s.recent_tracks.len();

@@ -67,7 +67,7 @@ lost to a redraw tick.
 | `HIFI_REPLAY` | — | offline replay from a cassette (`main.rs`) |
 | `HIFI_RECORD` | — | record live responses into a cassette (`api.rs`) |
 | `HIFI_TEST` | off | under-test mode; disables art (`testmode.rs`) |
-| `HIFI_CLIENT_ID` | `hifi.toml` / built-in | Spotify OAuth client id (`auth.rs`) |
+| `HIFI_CLIENT_ID` | `hifi.toml` → auth file → stdin prompt | Spotify OAuth client id (`auth.rs`) |
 | `HIFI_AUTH_FILE` | `hifi-auth.json` | stored OAuth token path (`auth.rs`) |
 | `HIFI_RECENT_FILE` | `hifi-recent.json` | recent-search persistence (`recent.rs`) |
 | `HIFI_RATELIMIT_FILE` | `hifi-ratelimit.json` | persisted 429 deadline (`api.rs`) |

@@ -29,17 +29,35 @@ struct StoredTokens {
     access_token: String,
     refresh_token: String,
     expires_at_unix: u64,
+    // Remembered from the first run so release users never touch a config
+    // file. Optional: auth files written by older builds don't have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
 }
 
 impl Auth {
     pub async fn init() -> Result<Self> {
-        let client_id = resolve_client_id()
-            .ok_or_else(|| anyhow!("no client_id; set HIFI_CLIENT_ID or hifi.toml"))?;
         let http = reqwest::Client::builder().build()?;
         let path = auth_state_path();
+        let stored = load_tokens(&path);
 
-        let tokens = match load_tokens(&path) {
-            Some(t) => t,
+        let client_id = match resolve_client_id()
+            .or_else(|| stored.as_ref().and_then(|t| t.client_id.clone()))
+        {
+            Some(id) => id,
+            None => prompt_for_client_id(&path)?,
+        };
+
+        let tokens = match stored {
+            Some(mut t) => {
+                // Backfill the id into auth files from before it was stored
+                // (or after the user switched ids) so the prompt stays one-time.
+                if t.client_id.as_deref() != Some(&client_id) {
+                    t.client_id = Some(client_id.clone());
+                    save_tokens(&path, &t)?;
+                }
+                t
+            }
             None => {
                 eprintln!("First-run authentication needed.");
                 let t = run_oauth_flow(&client_id, &http).await?;
@@ -139,6 +157,7 @@ async fn run_oauth_flow(client_id: &str, http: &reqwest::Client) -> Result<Store
             .refresh_token
             .ok_or_else(|| anyhow!("token response missing refresh_token"))?,
         expires_at_unix: now + resp.expires_in,
+        client_id: Some(client_id.to_string()),
     })
 }
 
@@ -170,6 +189,7 @@ async fn refresh(
             .refresh_token
             .unwrap_or_else(|| refresh_token.to_string()),
         expires_at_unix: now + resp.expires_in,
+        client_id: Some(client_id.to_string()),
     })
 }
 
@@ -460,4 +480,42 @@ fn resolve_client_id() -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let cfg: ConfigFile = toml::from_str(&s).ok()?;
     cfg.client_id
+}
+
+/// Interactive fallback when no client id is configured anywhere: walk the
+/// user through creating a Spotify app and read the id from stdin. Runs
+/// before the TUI takes over the terminal, so plain line input works.
+fn prompt_for_client_id(auth_path: &Path) -> Result<String> {
+    use std::io::{BufRead, Write};
+
+    eprintln!();
+    eprintln!("hifi needs a Spotify client id (free, one-time setup):");
+    eprintln!("  1. Open https://developer.spotify.com/dashboard and create an app");
+    eprintln!("  2. Add redirect URI:  {REDIRECT_URI}");
+    eprintln!("  3. Select the \"Web API\" scope and save");
+    eprintln!("  4. Copy the app's Client ID and paste it below");
+    eprintln!();
+    eprintln!(
+        "It will be remembered in {} for future launches.",
+        auth_path.display()
+    );
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("Client ID: ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            anyhow::bail!("stdin closed while waiting for a client id");
+        }
+        let id = line.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            eprintln!("That doesn't look like a client id (expected letters and digits only) — try again.");
+            continue;
+        }
+        return Ok(id.to_string());
+    }
 }

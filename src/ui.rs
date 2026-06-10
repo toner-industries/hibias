@@ -362,15 +362,27 @@ fn render_progress(f: &mut Frame, label_area: Rect, bar_area: Rect, state: &AppS
     let progress_ms = raw_ms.min(track.duration_ms);
     let ratio = (progress_ms as f64 / track.duration_ms.max(1) as f64).clamp(0.0, 1.0);
 
-    // The play glyph stays put and instead "breathes": it rests in the filled
-    // green for ~1.5s, then dips to gray for ~0.5s, on a 2s cycle. Driven by
-    // the real-time playback position so it animates between polls. Under an
-    // automated harness it never flashes (rests green) so screenshots are
-    // stable; when paused it's a steady gray ⏸.
+    // The play glyph stays put and instead "breathes": on a 2s cycle it eases
+    // up from gray to filled green and back, gradually fading between the two
+    // like the progress bar's leading cell rather than snapping between them.
+    // The cycle *starts* at gray so pressing play reads as gray pause → gray
+    // triangle → animation, the triangle picking up exactly where the pause
+    // glyph's color left off. Driven by the real-time playback position so it
+    // animates between polls. The pulse is biased toward green (squared) so it
+    // rests bright and only dips to gray briefly. Under an automated harness it
+    // never flashes (rests green) so screenshots are stable; when paused it's a
+    // steady gray ⏸.
     let (symbol, symbol_color) = if pb.is_playing {
-        let dipped = !crate::testmode::under_test() && (raw_ms % 2000) < 500;
-        let color = if dipped { rgb(BAR_EMPTY) } else { rgb(BAR_FILLED) };
-        ("▶", color)
+        let dip = if crate::testmode::under_test() {
+            0.0
+        } else {
+            let phase = (raw_ms % 2000) as f64 / 2000.0;
+            // Raised cosine: 1 (gray) at phase 0, 0 (green) at phase 0.5, back
+            // to 1. Squared to dwell near green and make the gray dip brief.
+            let pulse = (1.0 + (2.0 * std::f64::consts::PI * phase).cos()) / 2.0;
+            pulse * pulse
+        };
+        ("▶", lerp_rgb(BAR_FILLED, BAR_EMPTY, dip))
     } else {
         ("⏸", rgb(BAR_EMPTY))
     };

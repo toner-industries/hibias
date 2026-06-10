@@ -29,14 +29,23 @@ mod ui;
 
 use api::{Playback, RateLimited, SpotifyApi, SpotifyClient};
 use app::{
-    apply_playback_force, dispatch_input, like_current_track, mode_name,
-    play_browse_collection, play_browse_selection, play_selection, seek_relative, skip_track,
-    spawn_post_play_poll, spawn_reconnect, toggle_playback, AppState, KeyAction,
+    apply_playback_force, dispatch_input, like_current_track, mode_name, play_browse_collection,
+    play_browse_selection, play_selection, seek_relative, skip_track, spawn_post_play_poll,
+    spawn_reconnect, toggle_playback, AppState, KeyAction,
 };
 use input::{Input, Key, Mods};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = hifi_main().await;
+    // The log writer is a detached thread draining a channel; returning from
+    // main kills it mid-queue, silently dropping the newest events (the quit
+    // keypress, a fatal auth error). Drain it before the process exits.
+    log::flush();
+    result
+}
+
+async fn hifi_main() -> Result<()> {
     let log_path = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join("hifi.log.sqlite");
@@ -52,8 +61,8 @@ async fn main() -> Result<()> {
     // limits. Build a cassette with `cargo run --bin hifi-cassette`.
     let replay_path = std::env::var("HIFI_REPLAY").ok().filter(|s| !s.is_empty());
     let client: Arc<dyn SpotifyApi> = if let Some(path) = replay_path.as_deref() {
-        let cassette = api::Cassette::load(path)
-            .with_context(|| format!("load replay cassette {path}"))?;
+        let cassette =
+            api::Cassette::load(path).with_context(|| format!("load replay cassette {path}"))?;
         eprintln!(
             "REPLAY mode — serving {} recorded endpoints from {path} (offline, no Spotify calls)",
             cassette.len()
@@ -189,6 +198,8 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        log::error("panic", &info.to_string());
+        log::flush();
         original(info);
     }));
 }

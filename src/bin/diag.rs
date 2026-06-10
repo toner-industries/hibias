@@ -14,17 +14,24 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "../api.rs"]
+mod api;
 #[path = "../auth.rs"]
 mod auth;
 #[path = "../log.rs"]
 mod log;
-#[path = "../api.rs"]
-mod api;
 
 use api::SpotifyClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = diag_main().await;
+    // Drain the log-writer thread before exit or the last events are lost.
+    log::flush();
+    result
+}
+
+async fn diag_main() -> Result<()> {
     let _ = log::init(&std::path::PathBuf::from("hifi.log.sqlite"));
     log::note("diag start", None);
 

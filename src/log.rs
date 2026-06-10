@@ -37,8 +37,15 @@ impl Event {
     }
 }
 
+/// Messages to the writer thread: an event to insert, or a flush request
+/// answered once everything queued before it has been written.
+enum Msg {
+    Event(Event),
+    Flush(Sender<()>),
+}
+
 pub struct Logger {
-    tx: Sender<Event>,
+    tx: Sender<Msg>,
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
@@ -69,13 +76,20 @@ pub fn init(path: &Path) -> Result<()> {
         ",
     )?;
 
-    let (tx, rx) = mpsc::channel::<Event>();
+    let (tx, rx) = mpsc::channel::<Msg>();
     thread::Builder::new()
         .name("log-writer".into())
         .spawn(move || {
             let mut conn = conn;
-            while let Ok(e) = rx.recv() {
-                let _ = insert(&mut conn, &e);
+            while let Ok(m) = rx.recv() {
+                match m {
+                    Msg::Event(e) => {
+                        let _ = insert(&mut conn, &e);
+                    }
+                    Msg::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
             }
         })?;
 
@@ -114,7 +128,21 @@ pub fn next_request_id() -> i64 {
 
 fn send(e: Event) {
     if let Some(l) = LOGGER.get() {
-        let _ = l.tx.send(e);
+        let _ = l.tx.send(Msg::Event(e));
+    }
+}
+
+/// Block until every event queued so far is on disk. The writer is a detached
+/// thread draining a channel; returning from `main` kills it mid-queue, so any
+/// process exit without a flush silently loses the most recent events — in
+/// practice the quit keypress and the "quit" note. Bounded wait so a wedged
+/// writer can't hang shutdown.
+pub fn flush() {
+    if let Some(l) = LOGGER.get() {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if l.tx.send(Msg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
     }
 }
 
@@ -231,4 +259,37 @@ fn gmtime(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = if mo <= 2 { y + 1 } else { y };
     (y as i32, mo, d, h, mi, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: events queued right before process exit used to be lost —
+    // the writer thread died with `main` before draining the channel, so the
+    // final quit keypress never reached the DB. `flush()` must guarantee
+    // everything sent before it is on disk.
+    #[test]
+    fn flush_makes_queued_events_durable() {
+        let path =
+            std::env::temp_dir().join(format!("hifi-log-flush-test-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        init(&path).expect("init logger");
+
+        for i in 0..50 {
+            note(&format!("flush-test-marker-{i}"), None);
+        }
+        flush();
+
+        let conn = Connection::open(&path).expect("open log db");
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE detail LIKE 'flush-test-marker-%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(n, 50, "all events sent before flush() must be written");
+    }
 }

@@ -7,42 +7,44 @@ desktop app.
 
 ## Requirements
 
-- Spotify **Premium** (required by librespot and remote playback control)
+- Spotify **Premium** (required by librespot, remote playback control, and —
+  since Feb 2026 — Spotify's developer dashboard itself)
 - A terminal at least **96×40** characters — the UI is a fixed-size canvas
 
 ## Install
 
-### Option A: download a release
+### Option A: one-line install (macOS Apple Silicon)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/toner-industries/hifi/main/install.sh | sh
+```
+
+This downloads the latest release, installs it to `~/.local/bin`, and — because
+the download never touches a browser — never triggers macOS Gatekeeper.
+
+### Option B: manual download
 
 1. Grab the binary for your platform from the
-   [Releases page](https://github.com/chrisbolin/hifi/releases) and unpack it.
-2. Make it executable and put it somewhere convenient:
+   [Releases page](https://github.com/toner-industries/hifi/releases) and
+   unpack it: `tar -xzf hifi-*.tar.gz`
+2. Browser downloads are quarantined, so macOS will refuse to run it
+   ("Apple could not verify…" — **don't** click *Move to Trash*). Clear the
+   flag and put the binary on your PATH:
 
    ```bash
-   chmod +x hifi
-   mv hifi ~/.local/bin/    # or anywhere on your PATH
+   xattr -d com.apple.quarantine hifi
+   mv hifi ~/.local/bin/
    ```
 
-   On macOS, if Gatekeeper blocks the unsigned binary, clear the quarantine
-   flag first: `xattr -d com.apple.quarantine hifi`.
-3. Run it:
+   (Alternatively: System Settings → Privacy & Security → "Open Anyway".)
 
-   ```bash
-   cd ~/music            # any directory you'll keep using — see note below
-   hifi
-   ```
-
-   Note: hifi stores its state (login token `hifi-auth.json`, recent searches,
-   event log) in the directory you run it from, so launch it from the same
-   directory each time.
-
-### Option B: build from source
+### Option C: build from source
 
 Requires the Rust toolchain (`cargo`); `tmux` and
 [`just`](https://github.com/casey/just) are optional, used by `just run`.
 
 ```bash
-git clone https://github.com/chrisbolin/hifi.git
+git clone https://github.com/toner-industries/hifi.git
 cd hifi
 just run        # build + launch in a tmux session (detach: Ctrl-b d, stop: just stop)
 # or, without tmux/just:
@@ -51,20 +53,30 @@ cargo run --release --bin hifi
 
 ## First launch
 
-No configuration is needed up front — hifi walks you through setup the first
-time you run it:
+Run `hifi` from a directory you'll keep using — it stores its state (login
+token `hifi-auth.json`, recent searches, event log) in the working directory:
 
-1. **Spotify client id**: hifi prompts you to create a (free) Spotify app at
-   <https://developer.spotify.com/dashboard> — add redirect URI
-   `http://127.0.0.1:8989/login`, select the **Web API** scope — and paste the
-   app's Client ID into the terminal. It's remembered for future launches.
-   (To skip the prompt, set `HIFI_CLIENT_ID` or put
-   `client_id = "..."` in a `hifi.toml` in the working directory.)
-2. **Spotify login**: your browser opens for Spotify login (OAuth/PKCE); the
-   token is cached in `hifi-auth.json`. To log in again later: `just reauth`
-   (or delete that file).
-3. **Audio-output credentials** (optional — only needed if hifi itself should
-   play audio): hifi reuses [spotify-player](https://github.com/aome510/spotify-player)'s
-   librespot credential cache. Run `spotify-player` once and log in, which
-   writes `~/.cache/spotify-player/credentials.json`. Without it, hifi still
-   works as a remote for your other Spotify devices.
+```bash
+mkdir -p ~/music && cd ~/music && hifi
+```
+
+hifi walks you through setup the first time; allow ~2 minutes:
+
+1. **Spotify client id**: hifi opens the Spotify dashboard's *Create app*
+   page and tells you exactly what to enter (the one field that must match
+   exactly is the redirect URI, `http://127.0.0.1:8989/login`). Paste the
+   new app's Client ID into the terminal; it's remembered after that.
+   - Spotify allows **one** development-mode app per account. If *Create app*
+     is greyed out, open the app you already have, add the redirect URI to
+     it, and use its Client ID instead.
+   - hifi verifies the id and redirect URI up front and tells you what to
+     fix if they don't match — no cryptic `INVALID_CLIENT` pages.
+   - To skip the prompt, set `HIFI_CLIENT_ID` or put `client_id = "..."` in
+     a `hifi.toml` in the working directory.
+2. **Spotify login**: your browser opens for the Spotify approval
+   (OAuth/PKCE); the token is cached in `hifi-auth.json`. To log in again
+   later: `just reauth` (or delete that file).
+3. **Audio output**: your browser opens a second time so hifi itself can
+   stream audio (librespot needs its own approval). Credentials are cached
+   in `~/.cache/hifi`. If you skip or cancel this, hifi still works as a
+   remote control for your other Spotify devices.

@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use librespot_connect::{ConnectConfig, Spirc};
-use librespot_core::{cache::Cache, config::DeviceType, config::SessionConfig, Session};
+use librespot_core::{
+    authentication::Credentials, cache::Cache, config::DeviceType, config::SessionConfig, Session,
+};
 use librespot_playback::{
     audio_backend,
     config::{AudioFormat, Bitrate, PlayerConfig},
@@ -25,14 +27,64 @@ impl Streaming {
     }
 }
 
+/// The redirect URI librespot's own client id has registered — see
+/// librespot's oauth example. Distinct from hifi's Web-API redirect (8989)
+/// so the two flows can never collide on a port.
+const OAUTH_REDIRECT: &str = "http://127.0.0.1:8898/login";
+
+/// Make sure reusable librespot credentials exist in the cache, minting them
+/// via Spotify's OAuth flow if missing. First run only; afterwards the cached
+/// credentials.json short-circuits. Must run BEFORE the TUI owns the terminal:
+/// it prints instructions to stderr and opens a browser.
+pub async fn ensure_credentials() -> Result<()> {
+    let cache_dir = librespot_cache_dir();
+    let cache = Cache::new(Some(&cache_dir), None, None, None).context("librespot cache")?;
+    if cache.credentials().is_some() {
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!("One-time audio setup: hifi needs a second Spotify approval so it");
+    eprintln!("can play audio itself (the first approval covered search/control).");
+    eprintln!("Opening your browser...");
+
+    let session_config = SessionConfig::default();
+    let oauth = librespot_oauth::OAuthClientBuilder::new(
+        &session_config.client_id,
+        OAUTH_REDIRECT,
+        vec!["streaming"],
+    )
+    .open_in_browser()
+    .build()
+    .context("build librespot oauth client")?;
+    let token = oauth
+        .get_access_token_async()
+        .await
+        .map_err(|e| anyhow!("librespot oauth: {e}"))?;
+
+    // The token is short-lived; one real login with store_credentials=true
+    // converts it into reusable stored credentials (credentials.json in the
+    // cache). The session is dropped right after — the Connect device proper
+    // is brought up later by `start` on the run loop's reconnect path.
+    let session = Session::new(session_config, Some(cache));
+    session
+        .connect(Credentials::with_access_token(token.access_token), true)
+        .await
+        .context("librespot login")?;
+    session.shutdown();
+
+    eprintln!(
+        "Audio output ready — credentials cached in {}.",
+        cache_dir.display()
+    );
+    Ok(())
+}
+
 pub async fn start(device_name: &str) -> Result<Streaming> {
     let cache_dir = librespot_cache_dir();
     let cache = Cache::new(Some(&cache_dir), None, None, None).context("librespot cache")?;
     let creds = cache.credentials().ok_or_else(|| {
-        anyhow!(
-            "no librespot credentials at {}/credentials.json — run spotify-player once first",
-            cache_dir.display()
-        )
+        anyhow!("no audio credentials cached — quit and relaunch hifi to set up audio output")
     })?;
 
     let session = Session::new(SessionConfig::default(), Some(cache));
@@ -86,8 +138,14 @@ fn librespot_cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("HIFI_LIBRESPOT_CACHE") {
         return PathBuf::from(p);
     }
-    if let Some(home) = dirs_next::home_dir() {
-        return home.join(".cache").join("spotify-player");
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let ours = home.join(".cache").join("hifi");
+    // Earlier builds borrowed spotify-player's librespot cache instead of
+    // owning one. Keep honoring it when it's the only place with credentials
+    // so existing setups don't get re-prompted to authorize audio.
+    let legacy = home.join(".cache").join("spotify-player");
+    if !ours.join("credentials.json").exists() && legacy.join("credentials.json").exists() {
+        return legacy;
     }
-    PathBuf::from(".cache/spotify-player")
+    ours
 }

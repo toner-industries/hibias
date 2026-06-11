@@ -81,6 +81,17 @@ async fn hifi_main() -> Result<()> {
         Arc::new(SpotifyClient::new(auth)?)
     };
 
+    // First-run audio setup happens here — after Web-API auth, before the TUI
+    // owns the terminal — because it prints instructions and opens a browser.
+    // Failure is non-fatal: hifi still works as a remote for other devices.
+    if replay_path.is_none() {
+        if let Err(e) = streaming::ensure_credentials().await {
+            log::error("audio setup", &format!("{e:#}"));
+            eprintln!("warning: audio setup failed ({e:#})");
+            eprintln!("continuing without local playback — hifi can still control other devices");
+        }
+    }
+
     eprintln!("Probing terminal for image support...");
     let art_loader = Arc::new(art::ArtLoader::new(reqwest::Client::new()));
     if !art_loader.enabled() {

@@ -38,13 +38,17 @@ the core free of ratatui types — the seam that lets a non-TUI head reuse it).
 Supporting modules: `auth` (OAuth/PKCE), `log` (async SQLite event log),
 `input` (frontend-neutral key type), `keys` (hotkey/footer tables + `ModeMask`),
 `recent` (recent-search persistence), `streaming` (librespot Connect device —
-**reuses spotify-player's cached credentials** at `~/.cache/spotify-player`),
+mints its own credentials via librespot OAuth into `~/.cache/hifi`; falls back
+to spotify-player's legacy cache at `~/.cache/spotify-player` if that's the
+only one with credentials),
 `art` (head-owned art cache/loader), `testmode` (the `HIFI_TEST` switch),
 `test_support` (headless `Harness` + `FakeSpotify`, `cfg(test)` only).
 
 ## Boot sequence (`main.rs`)
 
-auth-vs-replay branch → `spawn_reconnect` (skipped under replay) →
+auth-vs-replay branch → `streaming::ensure_credentials` (first-run librespot
+OAuth, pre-TUI, skipped under replay) → `spawn_reconnect` (skipped under
+replay) →
 `spawn_boot_seed` → `run()` spawns `spawn_playback_poll` + an event-reader task
 → `select!(redraw tick 100ms, event channel)`. Keypresses arrive over an
 `mpsc` channel (cancellation-safe) rather than a raw `EventStream`, so none are
@@ -71,7 +75,7 @@ lost to a redraw tick.
 | `HIFI_AUTH_FILE` | `hifi-auth.json` | stored OAuth token path (`auth.rs`) |
 | `HIFI_RECENT_FILE` | `hifi-recent.json` | recent-search persistence (`recent.rs`) |
 | `HIFI_RATELIMIT_FILE` | `hifi-ratelimit.json` | persisted 429 deadline (`api.rs`) |
-| `HIFI_LIBRESPOT_CACHE` | `~/.cache/spotify-player` | librespot credential cache (`streaming.rs`) |
+| `HIFI_LIBRESPOT_CACHE` | `~/.cache/hifi` (legacy fallback: `~/.cache/spotify-player`) | librespot credential cache (`streaming.rs`) |
 | `HIFI_DUMP_AUTH_PAGES` | off | debug: dump OAuth callback HTML (`auth.rs`) |
 
 ## Record / replay / screenshot workflow

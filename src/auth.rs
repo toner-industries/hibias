@@ -104,7 +104,50 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+/// True when Spotify says the client id doesn't exist. Probed *before*
+/// sending the user's browser to the authorize page: the token endpoint
+/// answers `invalid_client` for an unknown id and `invalid_grant` (bad code)
+/// for a real one, no login session required — unlike the authorize page,
+/// which hides INVALID_CLIENT behind the login wall. Network trouble counts
+/// as "valid": the probe must never block auth when Spotify is reachable
+/// enough for the real flow to work.
+async fn client_id_is_unknown(client_id: &str, http: &reqwest::Client) -> bool {
+    let resp = http
+        .post(TOKEN_URL)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "preflight-probe"),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", client_id),
+            ("code_verifier", "preflight-probe"),
+        ])
+        .send()
+        .await;
+    match resp {
+        Ok(r) => match r.text().await {
+            Ok(body) => body_says_invalid_client(&body),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn body_says_invalid_client(body: &str) -> bool {
+    body.contains("\"invalid_client\"")
+}
+
 async fn run_oauth_flow(client_id: &str, http: &reqwest::Client) -> Result<StoredTokens> {
+    // Catch a typo'd / stale client id before the browser dance — otherwise
+    // it surfaces as a cryptic INVALID_CLIENT page in the browser while the
+    // terminal sits waiting for a callback that will never come.
+    if client_id_is_unknown(client_id, http).await {
+        anyhow::bail!(
+            "Spotify doesn't recognize client id '{client_id}'.\n\
+             Double-check it against your app at https://developer.spotify.com/dashboard\n\
+             (if it's stored in hifi.toml, HIFI_CLIENT_ID, or hifi-auth.json, fix it there)"
+        );
+    }
+
     let listener = TcpListener::bind("127.0.0.1:8989")
         .await
         .context("bind 127.0.0.1:8989 (already in use?)")?;
@@ -125,6 +168,13 @@ async fn run_oauth_flow(client_id: &str, http: &reqwest::Client) -> Result<Store
 
     eprintln!("Opening browser for Spotify authorization...");
     eprintln!("If it doesn't open, visit:\n  {auth_url}");
+    // The redirect URI can't be validated headlessly (the authorize page
+    // hides its errors behind the login wall), so pre-empt the one failure
+    // the user would otherwise have to decode on their own.
+    eprintln!();
+    eprintln!("If the browser shows \"INVALID_CLIENT: Invalid redirect URI\", your app");
+    eprintln!("is missing the exact redirect URI. In the dashboard open the app, Edit,");
+    eprintln!("add   {REDIRECT_URI}   under Redirect URIs, Save, and rerun hifi.");
     let _ = open::that(&auth_url);
 
     let code = wait_for_callback(listener, &state).await?;
@@ -401,6 +451,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preflight_classifies_token_endpoint_bodies() {
+        // Live shapes from accounts.spotify.com/api/token with a fake code
+        // (verified 2026-06-11): unknown ids answer invalid_client, real ids
+        // answer invalid_grant — both HTTP 400, so only the body decides.
+        let unknown = r#"{"error":"invalid_client","error_description":"Failed to get client"}"#;
+        assert!(body_says_invalid_client(unknown));
+
+        let known = r#"{"error":"invalid_grant","error_description":"Invalid authorization code"}"#;
+        assert!(!body_says_invalid_client(known));
+    }
+
+    #[test]
     fn dump_callback_pages_for_visual_review() {
         if std::env::var("HIFI_DUMP_AUTH_PAGES").is_err() {
             return;
@@ -488,17 +550,30 @@ fn resolve_client_id() -> Option<String> {
 fn prompt_for_client_id(auth_path: &Path) -> Result<String> {
     use std::io::{BufRead, Write};
 
+    const CREATE_URL: &str = "https://developer.spotify.com/dashboard/create";
+
     eprintln!();
-    eprintln!("hifi needs a Spotify client id (free, one-time setup):");
-    eprintln!("  1. Open https://developer.spotify.com/dashboard and create an app");
-    eprintln!("  2. Add redirect URI:  {REDIRECT_URI}");
-    eprintln!("  3. Select the \"Web API\" scope and save");
-    eprintln!("  4. Copy the app's Client ID and paste it below");
+    eprintln!("hifi needs its own (free) Spotify app — a one-time, ~2 minute setup.");
+    eprintln!("Opening {CREATE_URL} ...");
+    eprintln!();
+    eprintln!("  1. Log in (requires Spotify Premium) and fill in the form:");
+    eprintln!("       App name / description:  anything, e.g. \"hifi\"");
+    eprintln!("       Redirect URIs:           {REDIRECT_URI}   <- exactly this");
+    eprintln!("       Which API/SDKs:          check \"Web API\"");
+    eprintln!("     Accept the terms, then Save.");
+    eprintln!();
+    eprintln!("     If \"Create app\" is greyed out: Spotify allows only ONE");
+    eprintln!("     development-mode app per account. Open your existing app");
+    eprintln!("     instead, Edit, add the same Redirect URI, Save — and use");
+    eprintln!("     that app's Client ID here.");
+    eprintln!();
+    eprintln!("  2. Copy the Client ID (top of the app's page) and paste it below.");
     eprintln!();
     eprintln!(
         "It will be remembered in {} for future launches.",
         auth_path.display()
     );
+    let _ = open::that(CREATE_URL);
 
     let stdin = std::io::stdin();
     loop {

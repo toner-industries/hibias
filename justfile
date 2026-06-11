@@ -6,7 +6,7 @@ default:
 start:
     @echo "==> Building hifi (release)…"
     cargo build --release
-    @if tmux has-session -t hifi 2>/dev/null; then echo "hifi: already running"; else tmux new-session -d -s hifi 'target/release/hifi' && echo "hifi: started (use 'just attach' to interact)"; fi
+    @if tmux has-session -t hifi 2>/dev/null; then echo "hifi: already running"; else tmux new-session -d -x 96 -y 41 -s hifi 'target/release/hifi' && echo "hifi: started (use 'just attach' to interact)"; fi
 
 # Start (if needed) and attach to the TUI; detach with Ctrl-b d
 run:

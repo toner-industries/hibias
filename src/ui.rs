@@ -23,9 +23,20 @@ pub const FIXED_W: u16 = 96;
 pub const FIXED_H: u16 = 40;
 
 pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
-    // Pin to a fixed-size top-left rect — ratatui silently clips writes
-    // that fall outside the terminal buffer, so a smaller terminal just
-    // crops the canvas instead of rearranging the layout.
+    // Pin to a fixed-size top-left rect. Larger terminals leave the
+    // surrounding cells empty. Smaller ones get a notice instead of the UI:
+    // ratatui does NOT clip out-of-buffer writes — several widgets index the
+    // buffer directly and panic — so rendering the canvas into a too-small
+    // frame would crash (observed: a fresh user in a default 80×24 terminal).
+    let frame = f.area();
+    if frame.width < FIXED_W || frame.height < FIXED_H {
+        let msg = format!(
+            "Terminal too small: {}\u{d7}{} \u{2014} hifi needs at least {FIXED_W}\u{d7}{FIXED_H}.\nEnlarge the window (or zoom out) to continue.",
+            frame.width, frame.height
+        );
+        f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }), frame);
+        return;
+    }
     let area = Rect {
         x: 0,
         y: 0,
@@ -70,6 +81,16 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         Tab::Library => render_library_tab(f, rows[1], &state.library),
     }
     if let Some((text, color)) = status {
+        // The status row is one line; anything longer would be clipped
+        // mid-word at the canvas edge. Truncate with an ellipsis instead so
+        // it's at least visibly cut (the event log carries the full text).
+        let max = rows[2].width as usize;
+        let text = if text.chars().count() > max && max > 1 {
+            let cut: String = text.chars().take(max - 1).collect();
+            format!("{cut}…")
+        } else {
+            text
+        };
         let p = Paragraph::new(text)
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(color));
@@ -1237,6 +1258,24 @@ mod tests {
         assert!(is_browse_forbidden("Insufficient client scope"));
         assert!(!is_browse_forbidden("rate limited; retry after 30s"));
         assert!(!is_browse_forbidden("connection refused"));
+    }
+
+    #[test]
+    fn small_terminal_shows_notice_instead_of_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // A default macOS terminal is 80×24 — smaller than the fixed canvas.
+        // Rendering the canvas there used to panic ("index outside of buffer"):
+        // ratatui widgets index the buffer directly rather than clipping.
+        let mut state = AppState::default();
+        let mut art = ArtCache::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut state, &mut art)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let top: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains("Terminal too small"), "got: {top}");
     }
 
     #[test]

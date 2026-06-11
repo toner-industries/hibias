@@ -185,6 +185,10 @@ impl FakeSpotify {
         self.with(|s| s.play_context_returns.push(r));
     }
 
+    pub fn queue_transfer(&self, r: Result<(), String>) {
+        self.with(|s| s.transfer_returns.push(r));
+    }
+
     // ---- readers -------------------------------------------------------
 
     pub fn calls(&self) -> Vec<Call> {

@@ -69,6 +69,10 @@ pub struct AppState {
     /// the librespot Spirc session has lost its Connect cloud registration
     /// and play/pause will 404 until the user restarts the app.
     pub device_present: Option<bool>,
+    /// The Connect device id our librespot session registered under (same
+    /// value handed to `SpotifyApi::set_device_id`). Kept here so playback
+    /// polls can recognize our own device in `/me/player` responses.
+    pub device_id: Option<String>,
     /// Recently played tracks fetched from /me/player/recently-played.
     /// Shown in the search overlay when the input is empty.
     pub recent_tracks: Vec<Track>,
@@ -119,6 +123,7 @@ impl Default for AppState {
             focus: Focus::default(),
             last_local_action_ms: 0,
             device_present: None,
+            device_id: None,
             recent_tracks: Vec::new(),
             queue: Vec::new(),
             recent_queries: Vec::new(),
@@ -588,6 +593,7 @@ pub async fn reconnect_now(
         // loop, and a manual reconnect is the user's "get me unstuck" lever.
         s.streaming_failed = None;
         s.device_name = None;
+        s.device_id = None;
         s.device_present = None;
         s.rate_limited_until = None;
         s.error = None;
@@ -624,6 +630,7 @@ pub async fn reconnect_now(
             {
                 let mut s = state.lock().await;
                 s.device_name = Some(new.device_name.clone());
+                s.device_id = Some(new.device_id.clone());
                 s.streaming = Some(new);
                 s.reconnecting = false;
             }
@@ -698,8 +705,22 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) -> boo
                             log::note("transfer_playback ok", None);
                             return true;
                         }
+                        Err(e) if e.downcast_ref::<RateLimited>().is_some() => {
+                            log::note("wait_then_transfer: aborted (RateLimited)", None);
+                            return false;
+                        }
                         Err(e) => {
-                            log::error("transfer_playback", &format!("{e:#}"));
+                            let msg = format!("{e:#}");
+                            log::error("transfer_playback", &msg);
+                            // Spotify's Connect endpoints routinely throw
+                            // transient 5xx (and device-not-found races)
+                            // right after registration. Keep probing within
+                            // the loop's 12s budget instead of giving up on
+                            // the first failure — one lost transfer is how a
+                            // restart ends up at "Nothing playing".
+                            if is_transient_server_error(&msg) || is_device_not_found(&msg) {
+                                continue;
+                            }
                             return false;
                         }
                     }
@@ -825,6 +846,15 @@ pub async fn enter_browse(
         // only ever moves forward) so we don't need a second counter.
         let fetch_id = s.search.request_id.wrapping_add(1);
         s.search.request_id = fetch_id;
+        // Keep the search tab's loading math honest: bumping request_id
+        // alone leaves applied_id permanently behind, so is_loading() would
+        // report a phantom "loading…" forever after. A pending debounce is
+        // obsolete for the same reason (its id can no longer apply) — abort
+        // it rather than leaving a finished handle pinning is_loading().
+        s.search.applied_id = fetch_id;
+        if let Some(h) = s.search.debounce.take() {
+            h.abort();
+        }
         s.overlay = Some(Overlay::Browse(BrowseState {
             collection: collection.clone(),
             tracks: Vec::new(),
@@ -967,6 +997,7 @@ pub async fn play_library_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mu
             item: Some(track.clone()),
             context: None,
             timestamp: None,
+            device: None,
         };
         (uri, synth)
     };
@@ -1001,6 +1032,9 @@ pub async fn play_library_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mu
     };
     if let Some(pb) = synth_to_apply {
         apply_playback(state, Some(pb)).await;
+        // Confirm the synth against real state and pull the new Up Next —
+        // same follow-up the search-tab play path gets.
+        spawn_post_play_poll(client.clone(), state.clone());
     }
 }
 
@@ -1238,6 +1272,7 @@ pub async fn play_browse_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mut
                 kind: browse.collection.kind.label().to_string(),
             }),
             timestamp: None,
+            device: None,
         };
         (action, Some(synth))
     };
@@ -1279,6 +1314,9 @@ pub async fn play_browse_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mut
     };
     if let Some(pb) = synth_to_apply {
         apply_playback(state, Some(pb)).await;
+        // Confirm the synth against real state and pull the new Up Next —
+        // same follow-up the search-tab play path gets.
+        spawn_post_play_poll(client.clone(), state.clone());
     }
 }
 
@@ -1304,13 +1342,18 @@ pub async fn play_browse_collection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mu
             // No tracks list to synth from — let the next /me/player poll
             // populate the now-playing display.
             let ts = now_unix_ms();
-            let mut s = state.lock().await;
-            s.error = None;
-            log::mode_change("browse", "now_playing");
-            s.overlay = None;
-            s.tab = Tab::NowPlaying;
-            s.last_local_action_ms = ts;
-            s.boot = false;
+            {
+                let mut s = state.lock().await;
+                s.error = None;
+                log::mode_change("browse", "now_playing");
+                s.overlay = None;
+                s.tab = Tab::NowPlaying;
+                s.last_local_action_ms = ts;
+                s.boot = false;
+            }
+            // There's no synth here, so without this burst the now-playing
+            // display (and Up Next) would wait on the slow periodic poll.
+            spawn_post_play_poll(client.clone(), state.clone());
         }
         Err(e) => {
             let msg = format!("{e:#}");
@@ -1347,7 +1390,10 @@ pub async fn kick_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppStat
         if let Some(h) = search.debounce.take() {
             h.abort();
         }
-        if search.input.is_empty() {
+        // Whitespace-only input is treated like empty: Spotify rejects a
+        // blank q with 400 "No search query", which would surface as an
+        // error banner just for typing a space.
+        if search.input.trim().is_empty() {
             search.results = SearchResults::default();
             search.last_query.clear();
             search.applied_id = search.request_id;
@@ -1525,6 +1571,7 @@ pub fn synth_template_for(action: &PlayAction, search: &SearchState) -> Option<P
         item: Some(item),
         context,
         timestamp: None, // filled in by caller
+        device: None,
     };
     match action {
         PlayAction::Track(uri) => Some(template(find_track_by_uri(search, uri)?, None)),
@@ -1606,6 +1653,31 @@ pub async fn apply_playback_force(state: &Arc<Mutex<AppState>>, pb: Option<Playb
 }
 
 async fn apply_playback_inner(state: &Arc<Mutex<AppState>>, pb: Option<Playback>, force: bool) {
+    // Device-presence recovery, ahead of the freshness gate: even a *stale*
+    // playback snapshot names the currently-active device, so seeing our own
+    // device id there proves the Connect registration is alive. Without this,
+    // one transient 404 on a control endpoint leaves device_present stuck at
+    // false and the next user action tears down a healthy librespot session.
+    {
+        let mut s = state.lock().await;
+        if s.device_present == Some(false) {
+            let ours = match (
+                s.device_id.as_deref(),
+                pb.as_ref().and_then(|p| p.device.as_ref()),
+            ) {
+                (Some(mine), Some(dev)) => dev.id.as_deref() == Some(mine),
+                _ => false,
+            };
+            if ours {
+                log::note("device back online (seen in /me/player)", None);
+                s.device_present = Some(true);
+                if s.error.as_deref() == Some(DEVICE_OFFLINE_MSG) {
+                    s.error = None;
+                }
+            }
+        }
+    }
+
     // A Playback with no `item` carries no useful track info — Spotify
     // returns this between tracks or when nothing is actively serving.
     // Collapse it to `None` so we never end up in the janky hybrid state
@@ -1924,6 +1996,7 @@ pub async fn refresh_queue(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSt
 /// user-initiated play so we pick up Spotify's view quickly.
 pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
+        let mut queue_refreshed = false;
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             // The client's send_logged would short-circuit anyway, but
@@ -1940,6 +2013,14 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
             if let Ok(Some(pb)) = client.get_playback().await {
                 if pb.item.is_some() {
                     apply_playback(&state, Some(pb)).await;
+                    // First real post-play state: the regular poll won't
+                    // refresh Up Next for this play (the track id it compares
+                    // against already updated here), so do it once ourselves —
+                    // but only while the user is actually looking at it.
+                    if !queue_refreshed && now_playing_visible(&*state.lock().await) {
+                        queue_refreshed = true;
+                        refresh_queue(&client, &state).await;
+                    }
                 }
             }
         }

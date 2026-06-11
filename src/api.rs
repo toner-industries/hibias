@@ -74,6 +74,11 @@ pub struct Playback {
     /// returning whichever device reported last, with this timestamp frozen.
     #[serde(default)]
     pub timestamp: Option<u64>,
+    /// The device serving this state, per `/me/player`. Lets a routine poll
+    /// prove our own Connect device is (still) registered, clearing a stale
+    /// "device offline" verdict from a transient 404 on a control endpoint.
+    #[serde(default)]
+    pub device: Option<Device>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

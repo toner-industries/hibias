@@ -39,6 +39,7 @@ fn pb_with_ts(ts: Option<u64>, name: &str) -> Playback {
         item: Some(track("spotify:track:x", name)),
         context: None,
         timestamp: ts,
+        device: None,
     }
 }
 
@@ -398,6 +399,7 @@ fn state_with_playback(progress_ms: u64, is_playing: bool) -> AppState {
             item: Some(track("spotify:track:x", "X")),
             context: None,
             timestamp: None,
+            device: None,
         }),
         last_poll: Some(Instant::now()),
         ..Default::default()
@@ -799,6 +801,7 @@ async fn rate_limited_state_blocks_play_pause() {
         item: Some(track("spotify:track:x", "X")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     {
@@ -834,6 +837,7 @@ async fn like_command_calls_save_track_for_current_track() {
             }),
             context: None,
             timestamp: None,
+            device: None,
         });
     }
 
@@ -888,6 +892,7 @@ async fn like_command_skipped_when_rate_limited() {
             }),
             context: None,
             timestamp: None,
+            device: None,
         });
     }
 
@@ -1416,6 +1421,7 @@ async fn ui_at_96x40_now_playing_with_long_metadata() {
         item: Some(long_track()),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     {
@@ -1437,6 +1443,7 @@ async fn ui_at_96x40_now_playing_with_rate_limit_status() {
         item: Some(long_track()),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     {
@@ -1459,6 +1466,7 @@ async fn refresh_queue_fetches_and_stores_when_playing() {
         item: Some(track("spotify:track:cur", "Current")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     h.fake.set_queue(Ok(vec![
@@ -1496,6 +1504,7 @@ async fn refresh_queue_is_skipped_when_rate_limited() {
         item: Some(track("spotify:track:cur", "Current")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     h.fake
@@ -1517,6 +1526,7 @@ async fn polled_track_change_refreshes_queue_on_now_playing() {
         item: Some(track("spotify:track:cur", "Current")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     h.fake
@@ -1532,6 +1542,7 @@ async fn polled_track_change_refreshes_queue_on_now_playing() {
             item: Some(track("spotify:track:next", "Next")),
             context: None,
             timestamp: Some(now_unix_ms()),
+            device: None,
         }),
     )
     .await;
@@ -1550,6 +1561,7 @@ async fn polled_track_change_does_not_refresh_queue_off_now_playing() {
         item: Some(track("spotify:track:cur", "Current")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     h.fake
@@ -1565,6 +1577,7 @@ async fn polled_track_change_does_not_refresh_queue_off_now_playing() {
             item: Some(track("spotify:track:next", "Next")),
             context: None,
             timestamp: Some(now_unix_ms()),
+            device: None,
         }),
     )
     .await;
@@ -1583,6 +1596,7 @@ async fn polled_same_track_does_not_refresh_queue() {
         item: Some(track("spotify:track:cur", "Current")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     h.fake
@@ -1598,6 +1612,7 @@ async fn polled_same_track_does_not_refresh_queue() {
             item: Some(track("spotify:track:cur", "Current")),
             context: None,
             timestamp: Some(now_unix_ms()),
+            device: None,
         }),
     )
     .await;
@@ -1647,6 +1662,7 @@ async fn ui_at_96x40_now_playing_with_up_next() {
         item: Some(track("spotify:track:cur", "Current Song")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     {
@@ -1822,6 +1838,7 @@ async fn item_none_poll_does_not_create_track_info_unavailable_hybrid() {
         item: Some(track("spotify:track:seed", "Seeded Track")),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     };
     h.seed_playback(seed).await;
     {
@@ -1840,6 +1857,7 @@ async fn item_none_poll_does_not_create_track_info_unavailable_hybrid() {
             item: None,
             context: None,
             timestamp: Some(now_unix_ms() + 1000),
+            device: None,
         }),
     )
     .await;
@@ -1931,6 +1949,7 @@ async fn ui_at_96x40_devices_overlay() {
         item: Some(long_track()),
         context: None,
         timestamp: Some(now_unix_ms()),
+        device: None,
     })
     .await;
     {
@@ -1964,4 +1983,151 @@ async fn ui_at_96x40_devices_overlay() {
         screen.contains("hifi (cabin)") && screen.contains("Kitchen Speaker"),
         "device rows"
     );
+}
+
+#[tokio::test]
+async fn whitespace_only_search_never_hits_the_api() {
+    let h = Harness::new();
+    h.press_and_run(Key::Char('/')).await;
+    h.type_str("   ").await;
+    h.settle().await;
+
+    let calls = h.fake.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Search(_))),
+        "whitespace-only input must not reach /v1/search (400s): {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_poll_naming_our_device_clears_offline_verdict() {
+    use crate::api::Device;
+    let state = Arc::new(Mutex::new(AppState::default()));
+    {
+        let mut s = state.lock().await;
+        s.boot = false;
+        s.device_id = Some("dev-ours".into());
+        s.device_present = Some(false);
+        s.error = Some(DEVICE_OFFLINE_MSG.to_string());
+        // A recent local action, so the poll below is rejected as stale...
+        s.last_local_action_ms = now_unix_ms();
+    }
+    let mut pb = pb_with_ts(Some(0), "Old Track");
+    pb.device = Some(Device {
+        id: Some("dev-ours".into()),
+        name: "hifi".into(),
+        is_active: true,
+    });
+    apply_playback(&state, Some(pb)).await;
+
+    let s = state.lock().await;
+    // ...but the device sighting must still count as proof of life.
+    assert_eq!(s.device_present, Some(true), "device must be back online");
+    assert_eq!(s.error, None, "offline error banner must clear");
+    assert!(s.playback.is_none(), "stale playback itself stays rejected");
+}
+
+#[tokio::test]
+async fn stale_poll_naming_another_device_keeps_offline_verdict() {
+    use crate::api::Device;
+    let state = Arc::new(Mutex::new(AppState::default()));
+    {
+        let mut s = state.lock().await;
+        s.boot = false;
+        s.device_id = Some("dev-ours".into());
+        s.device_present = Some(false);
+        s.last_local_action_ms = now_unix_ms();
+    }
+    let mut pb = pb_with_ts(Some(0), "Old Track");
+    pb.device = Some(Device {
+        id: Some("dev-theirs".into()),
+        name: "Kitchen Speaker".into(),
+        is_active: true,
+    });
+    apply_playback(&state, Some(pb)).await;
+
+    let s = state.lock().await;
+    assert_eq!(s.device_present, Some(false), "someone else's device proves nothing");
+}
+
+#[tokio::test]
+async fn search_is_not_loading_after_browse_opens_and_closes() {
+    let h = Harness::new();
+    h.fake.set_search(
+        "test",
+        Ok(SearchResults {
+            albums: vec![dummy_album("spotify:album:al9", "Album", "Artist")],
+            ..Default::default()
+        }),
+    );
+    h.fake.set_album_tracks("al9", Ok(vec![track("spotify:track:t1", "T1")]));
+
+    h.press_and_run(Key::Char('/')).await;
+    h.type_str("test").await;
+    h.settle().await;
+    h.press_and_run(Key::Down).await;
+    h.press_and_run(Key::Enter).await; // opens browse
+    h.settle().await;
+    h.press_and_run(Key::Esc).await; // back to search
+
+    let s = h.state.lock().await;
+    assert!(
+        !s.search.is_loading(),
+        "search must not report loading after browse: request_id={} applied_id={} debounce={}",
+        s.search.request_id,
+        s.search.applied_id,
+        s.search.debounce.is_some()
+    );
+}
+
+#[tokio::test]
+async fn wait_then_transfer_retries_transient_500() {
+    use crate::api::Device;
+    let h = Harness::new();
+    h.fake.set_devices(Ok(vec![Device {
+        id: Some("dev-1".into()),
+        name: "hifi".into(),
+        is_active: false,
+    }]));
+    h.fake.queue_transfer(Err(
+        "PUT https://api.spotify.com/v1/me/player: 500 Internal Server Error: {\"error\":{}}"
+            .into(),
+    ));
+    // Second attempt (default Ok) should succeed.
+
+    let ok = wait_then_transfer(h.client.as_ref(), "dev-1").await;
+    assert!(ok, "transfer must survive one transient 500");
+
+    let transfers = h
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, Call::TransferPlayback { .. }))
+        .count();
+    assert_eq!(transfers, 2, "expected a retry after the 500");
+}
+
+#[tokio::test]
+async fn wait_then_transfer_gives_up_on_permanent_error() {
+    use crate::api::Device;
+    let h = Harness::new();
+    h.fake.set_devices(Ok(vec![Device {
+        id: Some("dev-1".into()),
+        name: "hifi".into(),
+        is_active: false,
+    }]));
+    h.fake.queue_transfer(Err(
+        "PUT https://api.spotify.com/v1/me/player: 403 Forbidden: {\"error\":{}}".into(),
+    ));
+
+    let ok = wait_then_transfer(h.client.as_ref(), "dev-1").await;
+    assert!(!ok, "a non-transient error must not be retried");
+
+    let transfers = h
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, Call::TransferPlayback { .. }))
+        .count();
+    assert_eq!(transfers, 1);
 }

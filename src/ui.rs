@@ -32,7 +32,11 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         width: FIXED_W,
         height: FIXED_H,
     };
-    let title = match (state.reconnecting, &state.device_name, &state.streaming_failed) {
+    let title = match (
+        state.reconnecting,
+        &state.device_name,
+        &state.streaming_failed,
+    ) {
         (true, _, _) => " hifi · reconnecting... ".to_string(),
         (false, Some(name), _) => format!(" hifi · device: {name} "),
         (false, None, None) => " hifi · starting device... ".to_string(),
@@ -105,7 +109,9 @@ fn render_tab_strip(f: &mut Frame, area: Rect, active: Tab, focused: bool) {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             }
         } else {
             Style::default().fg(Color::DarkGray)
@@ -245,7 +251,7 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
     // Spotify Connect — without it the user just sees mysterious 404s.
     if state.device_present == Some(false) {
         return Some((
-            "⚠ Connect device 'hifi' is offline — restart hifi to reconnect".to_string(),
+            "⚠ Connect device 'hifi' is offline — auto-reconnects on your next action".to_string(),
             Color::Yellow,
         ));
     }
@@ -552,7 +558,11 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                     format!(
                         "  {} — {}",
                         t.name,
-                        t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                        t.artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 }),
                 &mut row,
@@ -574,7 +584,11 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                 let label = format!(
                     "  {} — {}",
                     t.name,
-                    t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                    t.artists
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 if row == s.selected {
                     selected_line = Some(lines.len());
@@ -588,22 +602,45 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         }
     }
 
-    push_section(&mut lines, "Tracks", s.results.tracks.iter().map(|t| {
+    push_section(
+        &mut lines,
+        "Tracks",
+        s.results.tracks.iter().map(|t| {
         format!(
             "  {} — {}",
             t.name,
-            t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                t.artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
         )
-    }), &mut row, s.selected, &mut selected_line);
+        }),
+        &mut row,
+        s.selected,
+        &mut selected_line,
+    );
 
-    push_section(&mut lines, "Albums", s.results.albums.iter().map(|a| {
-        let artists = a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ");
+    push_section(
+        &mut lines,
+        "Albums",
+        s.results.albums.iter().map(|a| {
+            let artists = a
+                .artists
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
         if artists.is_empty() {
             format!("  {}", a.name)
         } else {
             format!("  {} — {}", a.name, artists)
         }
-    }), &mut row, s.selected, &mut selected_line);
+        }),
+        &mut row,
+        s.selected,
+        &mut selected_line,
+    );
 
     push_section(
         &mut lines,
@@ -618,7 +655,11 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         &mut lines,
         "Playlists",
         s.results.playlists.iter().map(|p| {
-            let owner = p.owner.as_ref().and_then(|o| o.display_name.as_deref()).unwrap_or("");
+            let owner = p
+                .owner
+                .as_ref()
+                .and_then(|o| o.display_name.as_deref())
+                .unwrap_or("");
             if owner.is_empty() {
                 format!("  {}", p.name)
             } else {
@@ -654,7 +695,9 @@ fn push_header(lines: &mut Vec<Line>, text: &str) {
     }
     lines.push(Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
     )));
 }
 
@@ -807,7 +850,10 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
         // to repeat them in the hint and crowd out the actual message.
         if is_browse_forbidden(e) {
             (
-                format!("⚠ Spotify locked this {} (API) — [p] plays anyway", browse.collection.kind.label()),
+                format!(
+                    "⚠ Spotify locked this {} (API) — [p] plays anyway",
+                    browse.collection.kind.label()
+                ),
                 Color::Yellow,
             )
         } else {
@@ -815,10 +861,7 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
             (format!("error: {short}"), Color::Red)
         }
     } else {
-        (
-            format!("{} tracks", browse.tracks.len()),
-            Color::DarkGray,
-        )
+        (format!("{} tracks", browse.tracks.len()), Color::DarkGray)
     };
     f.render_widget(
         Paragraph::new(hint)
@@ -901,7 +944,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(block, rect);
 
     let mut lines = vec![
-        Line::from(Span::styled("Hotkeys", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "Hotkeys",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(""),
     ];
     for (key, action) in rows {
@@ -939,7 +985,9 @@ fn render_library_tab(f: &mut Frame, area: Rect, lib: &LibraryState) {
             spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         }
         let style = if *t == lib.tab {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -985,8 +1033,12 @@ fn library_section_view(lib: &LibraryState) -> (String, Vec<String>, bool, Optio
                 .items
                 .iter()
                 .map(|t| {
-                    let artists =
-                        t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+                    let artists = t
+                        .artists
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     if artists.is_empty() {
                         t.name.clone()
                     } else {
@@ -1007,7 +1059,11 @@ fn library_section_view(lib: &LibraryState) -> (String, Vec<String>, bool, Optio
                 .items
                 .iter()
                 .map(|p| {
-                    let owner = p.owner.as_ref().and_then(|o| o.display_name.as_deref()).unwrap_or("");
+                    let owner = p
+                        .owner
+                        .as_ref()
+                        .and_then(|o| o.display_name.as_deref())
+                        .unwrap_or("");
                     if owner.is_empty() {
                         p.name.clone()
                     } else {
@@ -1028,8 +1084,12 @@ fn library_section_view(lib: &LibraryState) -> (String, Vec<String>, bool, Optio
                 .items
                 .iter()
                 .map(|a| {
-                    let artists =
-                        a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ");
+                    let artists = a
+                        .artists
+                        .iter()
+                        .map(|x| x.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     if artists.is_empty() {
                         a.name.clone()
                     } else {
@@ -1045,7 +1105,12 @@ fn library_section_view(lib: &LibraryState) -> (String, Vec<String>, bool, Optio
             )
         }
         LibraryTab::Artists => {
-            let labels = lib.artists.items.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+            let labels = lib
+                .artists
+                .items
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>();
             (
                 format!("Following · {}", lib.artists.items.len()),
                 labels,
@@ -1114,7 +1179,12 @@ fn centered_exact(area: Rect, w: u16, h: u16) -> Rect {
     let h = h.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// Cap a user-provided string to N chars, with an ellipsis. Used in hints
@@ -1195,6 +1265,7 @@ mod tests {
                 item: Some(track),
                 context: None,
                 timestamp: None,
+                device: None,
             }),
             last_poll: None,
             ..Default::default()
@@ -1253,6 +1324,7 @@ mod tests {
                 item: Some(track),
                 context: None,
                 timestamp: None,
+                device: None,
             }),
             last_poll: None,
             ..Default::default()
@@ -1262,7 +1334,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
         terminal
             .draw(|f| {
-                render_progress(f, Rect::new(0, 0, width, 1), Rect::new(0, 1, width, 1), &state);
+                render_progress(
+                    f,
+                    Rect::new(0, 0, width, 1),
+                    Rect::new(0, 1, width, 1),
+                    &state,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -1336,7 +1413,10 @@ mod tests {
             .join("\n");
 
         // The selected last row scrolled into view; the first scrolled off.
-        assert!(text.contains("Track 11"), "last row should be visible:\n{text}");
+        assert!(
+            text.contains("Track 11"),
+            "last row should be visible:\n{text}"
+        );
         assert!(
             !text.contains("Track 00"),
             "first row should have scrolled off:\n{text}"

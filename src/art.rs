@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
 
 pub struct ArtLoader {
     picker: Option<Picker>,
@@ -14,6 +17,19 @@ impl ArtLoader {
         // way to turn art off, so a real run always probes for it.
         let picker = if crate::testmode::under_test() {
             None
+        } else if std::env::var_os("TMUX").is_some() {
+            // Never run the stdio capability probe under tmux. The probe's
+            // reader thread blocks on stdin until the terminal answers its
+            // DSR query, but a tmux pane (observed detached; justfile runs
+            // start detached) never answers — ratatui-image then leaks that
+            // thread, which keeps reading stdin forever and races crossterm
+            // for every keypress, silently eating roughly half of all input.
+            // Inside tmux the probe's outcome is the halfblocks fallback
+            // anyway, so jump straight to it. Font size is irrelevant for
+            // halfblocks (no pixels are rendered).
+            let mut p = Picker::from_fontsize((10, 20));
+            p.set_protocol_type(ProtocolType::Halfblocks);
+            Some(p)
         } else {
             Picker::from_query_stdio().ok()
         };

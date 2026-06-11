@@ -66,3 +66,12 @@ pub const DEVICE_OFFLINE_MSG: &str =
 pub fn is_device_not_found(msg: &str) -> bool {
     msg.contains("Device not found") || msg.contains("\"status\" : 404")
 }
+
+/// Matches the `"<METHOD> <url>: <status> <reason>"` shape `send_logged`
+/// errors carry for the transient 5xx family Spotify's Connect endpoints
+/// are known to throw under no particular provocation.
+pub fn is_transient_server_error(msg: &str) -> bool {
+    [500, 502, 503, 504]
+        .iter()
+        .any(|c| msg.contains(&format!(": {c} ")))
+}

@@ -163,6 +163,7 @@ fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
                             item: Some(t),
                             context: None,
                             timestamp: None,
+                            device: None,
                         };
                         apply_playback_force(&state, Some(synth)).await;
                     }
@@ -256,9 +257,13 @@ async fn run(
     // is cancelled. `mpsc::Receiver::recv()` is cancellation-safe and buffers,
     // so no keypress is ever lost to the redraw tick.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let debug_events = std::env::var("HIFI_DEBUG_EVENTS").is_ok();
     let event_reader = tokio::spawn(async move {
         let mut events = EventStream::new();
         while let Some(ev) = events.next().await {
+            if debug_events {
+                log::note("raw event", Some(&format!("{ev:?}")));
+            }
             if event_tx.send(ev).is_err() {
                 break; // render loop has exited
             }

@@ -61,6 +61,20 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
    the 96-col canvas) and unactionable. Messages shortened at the source;
    the status row now ellipsizes anything that still overflows.
 
+## Addendum (2026-06-11, second from-scratch run)
+
+- **App creation is rate-limited**: after two create/delete cycles in one
+  day, the dashboard refused with "You have created too many apps recently.
+  Please try again in 24 hours." Combined with deletion being irreversible
+  and the one-app cap, the practical guidance is: **never delete a working
+  dev app** — fix it in place (Edit) instead. A genuine first-time user
+  creating their single app won't hit this, but anyone who fat-fingers a
+  delete-and-retry can lock themselves out of the Web API for a day.
+- v0.1.2's installed-from-the-one-liner first run was verified up to the
+  client-id prompt (install → launch → wizard text → dashboard); the
+  remainder of the run was blocked by the cooldown above and resumes once
+  it lifts.
+
 ## Dashboard form notes (for prompt-text fidelity)
 
 - The create form's real labels: "App name", "App description" (required),

@@ -276,8 +276,14 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
         }
     }
 
+    // Judge the state BEFORE rendering: a tampered/replayed callback used to
+    // get the green "logged in" page while the terminal (correctly) rejected
+    // it — the page must agree with the verdict.
+    let state_ok = got_state.as_deref() == Some(expected_state);
     let body = if let Some(e) = &error {
         render_callback_page(CallbackOutcome::Error(e))
+    } else if code.is_some() && !state_ok {
+        render_callback_page(CallbackOutcome::Error("state mismatch (CSRF guard)"))
     } else if code.is_some() {
         render_callback_page(CallbackOutcome::Success)
     } else {

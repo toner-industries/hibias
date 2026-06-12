@@ -72,8 +72,28 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
   delete-and-retry can lock themselves out of the Web API for a day.
 - v0.1.2's installed-from-the-one-liner first run was verified up to the
   client-id prompt (install → launch → wizard text → dashboard); the
-  remainder of the run was blocked by the cooldown above and resumes once
-  it lifts.
+  remainder of the run was blocked by the cooldown above and resumed the
+  next morning.
+
+## Resumption (2026-06-12): full pass, green
+
+The cooldown lifted ~24h after the first creation. Completed end-to-end on
+the released v0.1.2 binary installed by the one-liner: app creation (the
+wizard's instructions match the form 1:1) → client-id paste (pre-flight
+passed) → web OAuth → TUI up with `device: hifi` → space plays, time
+advances, space pauses. The audio step was satisfied by the **legacy
+spotify-player cache fallback** (by design — no re-prompt for existing
+setups); the fresh-mint OAuth path was verified the day before. The 80×24
+small-terminal notice renders instead of the old panic.
+
+Two notes from the run:
+- hifi's CSRF guard caught a genuinely corrupted authorize URL (state
+  truncated by tmux line-wrapping during the test) — but the browser-side
+  callback page still showed the green "logged in" while the terminal
+  rejected the exchange. Fixed: the page now renders the error when the
+  state doesn't match.
+- Repeat reminder that the dashboard cooldown is real: the same account
+  could create an app again the next day without trouble.
 
 ## Dashboard form notes (for prompt-text fidelity)
 

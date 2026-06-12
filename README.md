@@ -68,7 +68,9 @@ hifi walks you through setup the first time; allow ~2 minutes:
    new app's Client ID into the terminal; it's remembered after that.
    - Spotify allows **one** development-mode app per account. If *Create app*
      is greyed out, open the app you already have, add the redirect URI to
-     it, and use its Client ID instead.
+     it, and use its Client ID instead. Don't delete it to start over —
+     deletion is permanent and app creation is rate-limited (you can be
+     locked out for 24 hours).
    - hifi verifies the id and redirect URI up front and tells you what to
      fix if they don't match — no cryptic `INVALID_CLIENT` pages.
    - To skip the prompt, set `HIFI_CLIENT_ID` or put `client_id = "..."` in

@@ -571,7 +571,9 @@ fn prompt_for_client_id(auth_path: &Path) -> Result<String> {
     eprintln!("     If \"Create app\" is greyed out: Spotify allows only ONE");
     eprintln!("     development-mode app per account. Open your existing app");
     eprintln!("     instead, Edit, add the same Redirect URI, Save — and use");
-    eprintln!("     that app's Client ID here.");
+    eprintln!("     that app's Client ID here. (Don't delete it to start over:");
+    eprintln!("     deletion is permanent, and Spotify rate-limits app creation");
+    eprintln!("     — you could be locked out for 24 hours.)");
     eprintln!();
     eprintln!("  2. Copy the Client ID (top of the app's page) and paste it below.");
     eprintln!();

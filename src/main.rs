@@ -37,7 +37,7 @@ use input::{Input, Key, Mods};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let result = hifi_main().await;
+    let result = hibias_main().await;
     // The log writer is a detached thread draining a channel; returning from
     // main kills it mid-queue, silently dropping the newest events (the quit
     // keypress, a fatal auth error). Drain it before the process exits.
@@ -45,10 +45,10 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn hifi_main() -> Result<()> {
+async fn hibias_main() -> Result<()> {
     let log_path = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("hifi.log.sqlite");
+        .join("hibias.log.sqlite");
     if let Err(e) = log::init(&log_path) {
         eprintln!("warning: log init failed: {e:#}");
     } else {
@@ -56,10 +56,10 @@ async fn hifi_main() -> Result<()> {
     }
     log::note("app start", None);
 
-    // Offline replay: when HIFI_REPLAY points at a cassette, serve recorded
+    // Offline replay: when HIBIAS_REPLAY points at a cassette, serve recorded
     // responses instead of hitting Spotify — no auth, no librespot, no rate
-    // limits. Build a cassette with `cargo run --bin hifi-cassette`.
-    let replay_path = std::env::var("HIFI_REPLAY").ok().filter(|s| !s.is_empty());
+    // limits. Build a cassette with `cargo run --bin hibias-cassette`.
+    let replay_path = std::env::var("HIBIAS_REPLAY").ok().filter(|s| !s.is_empty());
     let client: Arc<dyn SpotifyApi> = if let Some(path) = replay_path.as_deref() {
         let cassette =
             api::Cassette::load(path).with_context(|| format!("load replay cassette {path}"))?;
@@ -83,12 +83,12 @@ async fn hifi_main() -> Result<()> {
 
     // First-run audio setup happens here — after Web-API auth, before the TUI
     // owns the terminal — because it prints instructions and opens a browser.
-    // Failure is non-fatal: hifi still works as a remote for other devices.
+    // Failure is non-fatal: hibias still works as a remote for other devices.
     if replay_path.is_none() {
         if let Err(e) = streaming::ensure_credentials().await {
             log::error("audio setup", &format!("{e:#}"));
             eprintln!("warning: audio setup failed ({e:#})");
-            eprintln!("continuing without local playback — hifi can still control other devices");
+            eprintln!("continuing without local playback — hibias can still control other devices");
         }
     }
 
@@ -268,7 +268,7 @@ async fn run(
     // is cancelled. `mpsc::Receiver::recv()` is cancellation-safe and buffers,
     // so no keypress is ever lost to the redraw tick.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let debug_events = std::env::var("HIFI_DEBUG_EVENTS").is_ok();
+    let debug_events = std::env::var("HIBIAS_DEBUG_EVENTS").is_ok();
     let event_reader = tokio::spawn(async move {
         let mut events = EventStream::new();
         while let Some(ev) = events.next().await {

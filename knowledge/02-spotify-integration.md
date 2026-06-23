@@ -1,6 +1,6 @@
 # Spotify Integration in `spotify-player`
 
-A reference for the `hifi` design. Covers auth, the API client, librespot streaming, and OS media controls. All file paths are relative to `spotify-player/` (the repo we're mirroring).
+A reference for the `hibias` design. Covers auth, the API client, librespot streaming, and OS media controls. All file paths are relative to `spotify-player/` (the repo we're mirroring).
 
 ---
 
@@ -19,7 +19,7 @@ Feature flags worth noting (`Cargo.toml:84-102`):
 - `media-control` pulls in `souvlaki` + `winit` + `windows` (default on).
 - `daemon` requires `streaming` (no UI mode).
 
-> **hifi implication:** keep the same coarse split — a always-compiled API/auth layer, a feature-gated streaming layer, and a feature-gated media-control layer. Match the audio-backend matrix if you want feature parity; otherwise pick one (e.g. just `rodio`) for v1 simplicity.
+> **hibias implication:** keep the same coarse split — a always-compiled API/auth layer, a feature-gated streaming layer, and a feature-gated media-control layer. Match the audio-backend matrix if you want feature parity; otherwise pick one (e.g. just `rodio`) for v1 simplicity.
 
 ---
 
@@ -92,7 +92,7 @@ The `Spotify` struct enables `Config { token_refreshing: true, .. }` (`client/sp
 
 `AppClient::token()` (`client/mod.rs:114-125`) is the main accessor — it calls `self.auto_reauth()` (provided by rspotify's `BaseClient` trait) which transparently triggers `refetch_token` when needed, then pulls the access string out from the cached `Token`.
 
-> **hifi implication:** the cleanest port is to copy this sandwich: librespot OAuth for first login + persistent credentials, librespot session + login5 for ongoing token refresh, and a thin Web-API client that you give a `&str` token to. Don't try to do "real" Web API OAuth refresh — Spotify rate-limits PKCE refresh harshly and librespot's tokens are easier and longer-lived.
+> **hibias implication:** the cleanest port is to copy this sandwich: librespot OAuth for first login + persistent credentials, librespot session + login5 for ongoing token refresh, and a thin Web-API client that you give a `&str` token to. Don't try to do "real" Web API OAuth refresh — Spotify rate-limits PKCE refresh harshly and librespot's tokens are easier and longer-lived.
 
 ---
 
@@ -113,7 +113,7 @@ pub struct AppClient {
 }
 ```
 
-`AppClient` `Deref`s to `&rspotify::AuthCodePkceSpotify` (`mod.rs:57-64`) — when the user provides a client ID, all "standard" rspotify methods route through the user client; otherwise the `expect` panics. *Note*: this means **`user_client` is effectively assumed to be `Some`** for many calls; the bare default-client-id path may panic on those methods. (Possibly a latent bug — keep in mind for hifi.)
+`AppClient` `Deref`s to `&rspotify::AuthCodePkceSpotify` (`mod.rs:57-64`) — when the user provides a client ID, all "standard" rspotify methods route through the user client; otherwise the `expect` panics. *Note*: this means **`user_client` is effectively assumed to be `Some`** for many calls; the bare default-client-id path may panic on those methods. (Possibly a latent bug — keep in mind for hibias.)
 
 The `spotify` field is the **internal** client used in three places:
 
@@ -204,7 +204,7 @@ Three distinct caches:
 4. **Optional disk audio cache** (librespot, when `device.audio_cache = true`).
 5. **Optional disk image cache** at `<cache_folder>/image/` (`mod.rs:1741-1745`).
 
-> **hifi implication:** the three-tier model (TTL memcache for read-only API responses, per-user-data lists with manual mutation, file cache for fast startup) is solid — replicate it, but consider a unified abstraction (`Cache<Key, Val>` with TTL + persistence) instead of the ad-hoc HashMap-plus-`store_data_into_file_cache` mix.
+> **hibias implication:** the three-tier model (TTL memcache for read-only API responses, per-user-data lists with manual mutation, file cache for fast startup) is solid — replicate it, but consider a unified abstraction (`Cache<Key, Val>` with TTL + persistence) instead of the ad-hoc HashMap-plus-`store_data_into_file_cache` mix.
 
 ### Error propagation
 
@@ -230,7 +230,7 @@ Three distinct caches:
   - Detects track-end (progress >= duration) and fires `GetCurrentPlayback`.
   - Detects queue drift and fires `GetCurrentUserQueue`.
 
-> **hifi implication:** the polling-based playback watcher is a workaround for Spotify's lack of push events for non-Connect playback. If hifi only ever drives its own integrated player, you can rely on `librespot::PlayerEvent` and skip the polling — see Streaming section below.
+> **hibias implication:** the polling-based playback watcher is a workaround for Spotify's lack of push events for non-Connect playback. If hibias only ever drives its own integrated player, you can rely on `librespot::PlayerEvent` and skip the polling — see Streaming section below.
 
 ---
 
@@ -292,7 +292,7 @@ When streaming is on, `AppClient` augments device-related operations:
 
 The whole abstraction is `librespot_playback::audio_backend::Sink` and the `audio_backend::find(name) -> impl Fn(Option<String>, AudioFormat) -> Box<dyn Sink>` factory. The `streaming` feature requires exactly one of the eight backend features to be enabled (compile_error at `streaming.rs:19-39`).
 
-> **hifi implication:** copy librespot's Sink-factory pattern verbatim — it's how `VisualizationSink` slots in cleanly. If hifi wants visualization or audio FX, intercepting at the Sink level is the right seam. Default to `rodio-backend` for cross-platform simplicity.
+> **hibias implication:** copy librespot's Sink-factory pattern verbatim — it's how `VisualizationSink` slots in cleanly. If hibias wants visualization or audio FX, intercepting at the Sink level is the right seam. Default to `rodio-backend` for cross-platform simplicity.
 
 ---
 
@@ -329,13 +329,13 @@ Gated behind `media-control` feature (`Cargo.toml:94`).
 
 Because both platforms require their event loops on the main thread, after spawning the media-control thread `main.rs:217-227` runs a `winit::event_loop::EventLoop` on the main thread (no-op handler). This is what keeps macOS/Windows responsive to media keys. Linux doesn't need this.
 
-> **hifi implication:** the souvlaki + winit dance is the standard recipe — copy it. Note especially the macOS startup hack (set `Playing` once for metadata to appear), the Linux 1s rate limit, and the Windows DummyWindow + pump. If hifi targets only Linux, the code becomes much simpler (drop winit, drop Windows module).
+> **hibias implication:** the souvlaki + winit dance is the standard recipe — copy it. Note especially the macOS startup hack (set `Playing` once for metadata to appear), the Linux 1s rate limit, and the Windows DummyWindow + pump. If hibias targets only Linux, the code becomes much simpler (drop winit, drop Windows module).
 
 ---
 
 ## Key Types & Traits Surface
 
-For a `hifi`-side designer choosing what to mimic:
+For a `hibias`-side designer choosing what to mimic:
 
 ### From `auth.rs` / `token.rs`
 
@@ -367,7 +367,7 @@ For a `hifi`-side designer choosing what to mimic:
 - `flume::Sender<ClientRequest>` / `Receiver<ClientRequest>` — unbounded, cloneable, lock-free.
 - `SharedState` (in `state/`, not covered here) holds `player` (`RwLock<PlayerState>`), `data` (`RwLock<DataState>`), and `ui` (`Mutex<UiState>`). The client mutates `player.playback`, `player.buffered_playback`, `data.user_data.*`, `data.caches.*`.
 
-> **hifi implication:** the request-channel pattern is the most reusable bit. UI thread → enum request → flume → tokio handler → mutate `RwLock`-guarded state → UI thread re-reads on next frame. It scales well and avoids any tokio-in-the-UI complexity. Keep it.
+> **hibias implication:** the request-channel pattern is the most reusable bit. UI thread → enum request → flume → tokio handler → mutate `RwLock`-guarded state → UI thread re-reads on next frame. It scales well and avoids any tokio-in-the-UI complexity. Keep it.
 
 ---
 

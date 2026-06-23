@@ -81,7 +81,7 @@ impl Auth {
         let refreshed = refresh(&self.client_id, &state.refresh_token, &self.http)
             .await
             .context(
-                "token refresh failed; if you revoked access, delete hifi-auth.json and rerun",
+                "token refresh failed; if you revoked access, delete hibias-auth.json and rerun",
             )?;
         *state = refreshed;
         save_tokens(&auth_state_path(), &state)?;
@@ -144,7 +144,7 @@ async fn run_oauth_flow(client_id: &str, http: &reqwest::Client) -> Result<Store
         anyhow::bail!(
             "Spotify doesn't recognize client id '{client_id}'.\n\
              Double-check it against your app at https://developer.spotify.com/dashboard\n\
-             (if it's stored in hifi.toml, HIFI_CLIENT_ID, or hifi-auth.json, fix it there)"
+             (if it's stored in hibias.toml, HIBIAS_CLIENT_ID, or hibias-auth.json, fix it there)"
         );
     }
 
@@ -174,7 +174,7 @@ async fn run_oauth_flow(client_id: &str, http: &reqwest::Client) -> Result<Store
     eprintln!();
     eprintln!("If the browser shows \"INVALID_CLIENT: Invalid redirect URI\", your app");
     eprintln!("is missing the exact redirect URI. In the dashboard open the app, Edit,");
-    eprintln!("add   {REDIRECT_URI}   under Redirect URIs, Save, and rerun hifi.");
+    eprintln!("add   {REDIRECT_URI}   under Redirect URIs, Save, and rerun hibias.");
     let _ = open::that(&auth_url);
 
     let code = wait_for_callback(listener, &state).await?;
@@ -326,7 +326,7 @@ fn render_callback_page(outcome: CallbackOutcome<'_>) -> String {
     // for warnings, red for errors. Background mimics a dark terminal.
     let (title, accent, badge, lines): (&str, &str, &str, Vec<String>) = match outcome {
         CallbackOutcome::Success => (
-            "hifi · logged in",
+            "hibias · logged in",
             "#39d353",
             "[ok]",
             vec![
@@ -336,7 +336,7 @@ fn render_callback_page(outcome: CallbackOutcome<'_>) -> String {
             ],
         ),
         CallbackOutcome::Error(e) => (
-            "hifi · auth failed",
+            "hibias · auth failed",
             "#f85149",
             "[err]",
             vec![
@@ -348,7 +348,7 @@ fn render_callback_page(outcome: CallbackOutcome<'_>) -> String {
             ],
         ),
         CallbackOutcome::BadRequest => (
-            "hifi · bad request",
+            "hibias · bad request",
             "#e3b341",
             "[warn]",
             vec![
@@ -470,21 +470,21 @@ mod tests {
 
     #[test]
     fn dump_callback_pages_for_visual_review() {
-        if std::env::var("HIFI_DUMP_AUTH_PAGES").is_err() {
+        if std::env::var("HIBIAS_DUMP_AUTH_PAGES").is_err() {
             return;
         }
         std::fs::write(
-            "/tmp/hifi_auth_success.html",
+            "/tmp/hibias_auth_success.html",
             render_callback_page(CallbackOutcome::Success),
         )
         .unwrap();
         std::fs::write(
-            "/tmp/hifi_auth_error.html",
+            "/tmp/hibias_auth_error.html",
             render_callback_page(CallbackOutcome::Error("access_denied")),
         )
         .unwrap();
         std::fs::write(
-            "/tmp/hifi_auth_bad.html",
+            "/tmp/hibias_auth_bad.html",
             render_callback_page(CallbackOutcome::BadRequest),
         )
         .unwrap();
@@ -515,10 +515,10 @@ mod pkce {
 }
 
 fn auth_state_path() -> PathBuf {
-    if let Ok(p) = std::env::var("HIFI_AUTH_FILE") {
+    if let Ok(p) = std::env::var("HIBIAS_AUTH_FILE") {
         return PathBuf::from(p);
     }
-    PathBuf::from("hifi-auth.json")
+    PathBuf::from("hibias-auth.json")
 }
 
 fn load_tokens(path: &Path) -> Option<StoredTokens> {
@@ -538,10 +538,10 @@ struct ConfigFile {
 }
 
 fn resolve_client_id() -> Option<String> {
-    if let Ok(id) = std::env::var("HIFI_CLIENT_ID") {
+    if let Ok(id) = std::env::var("HIBIAS_CLIENT_ID") {
         return Some(id);
     }
-    let path = Path::new("hifi.toml");
+    let path = Path::new("hibias.toml");
     if !path.exists() {
         return None;
     }
@@ -559,11 +559,11 @@ fn prompt_for_client_id(auth_path: &Path) -> Result<String> {
     const CREATE_URL: &str = "https://developer.spotify.com/dashboard/create";
 
     eprintln!();
-    eprintln!("hifi needs its own (free) Spotify app — a one-time, ~2 minute setup.");
+    eprintln!("hibias needs its own (free) Spotify app — a one-time, ~2 minute setup.");
     eprintln!("Opening {CREATE_URL} ...");
     eprintln!();
     eprintln!("  1. Log in (requires Spotify Premium) and fill in the form:");
-    eprintln!("       App name / description:  anything, e.g. \"hifi\"");
+    eprintln!("       App name / description:  anything, e.g. \"hibias\"");
     eprintln!("       Redirect URIs:           {REDIRECT_URI}   <- exactly this");
     eprintln!("       Which API/SDKs:          check \"Web API\"");
     eprintln!("     Accept the terms, then Save.");

@@ -3,7 +3,7 @@
 This document describes how `spotify-player` is structured: workspace layout, module
 boundaries inside the binary crate, the runtime model, the threads/tasks spawned at
 startup, the channels that connect them, and the shutdown flow. It is the
-reference for designing the analogous bones of `hifi`.
+reference for designing the analogous bones of `hibias`.
 
 ## Workspace crates
 
@@ -22,7 +22,7 @@ Workspace-wide lints in `spotify-player/Cargo.toml:8-24` enforce
 relaxations (`module_name_repetitions`, several `cast_*`, `similar_names`,
 `too_many_lines`, `missing_errors_doc`).
 
-Takeaway for `hifi`: a workspace is worth doing only when you have a genuinely
+Takeaway for `hibias`: a workspace is worth doing only when you have a genuinely
 reusable, decoupled library. Otherwise a single crate is simpler. `lyric_finder`
 is a good template for splitting out a network-bound, framework-free helper.
 
@@ -383,7 +383,7 @@ This is simple but has consequences:
 - Logs are flushed because `tracing-subscriber`'s file writer is
   synchronous; the in-memory `BufferLayer` is dropped with the process.
 
-For `hifi`, this is a design choice you can keep or improve. A more
+For `hibias`, this is a design choice you can keep or improve. A more
 graceful version would: signal each thread/task via a watch channel, await
 the librespot Spirc shutdown future, drain any pending writes, then
 cooperatively exit. The cost is more wiring and an explicit `Shutdown`
@@ -405,7 +405,7 @@ into a sibling `.backtrace` file, so crashes leave a forensic trail.
 `RUST_LOG` defaults to `spotify_player=info,librespot=info` if unset
 (`main.rs:62-65`); setting it to `off` skips file/buffer setup entirely.
 
-## Design notes worth lifting into `hifi`
+## Design notes worth lifting into `hibias`
 
 1. **Single shared `State` Arc, three locked sub-structs.** Avoids one
    giant mutex while keeping ownership trivial. `parking_lot` over
@@ -420,7 +420,7 @@ into a sibling `.backtrace` file, so crashes leave a forensic trail.
    Spotify Web API is eventually consistent and there is no streaming
    playback push, a 100ms watcher fires periodic
    `GetCurrentPlayback` and reacts to UI page changes by enqueuing the
-   right fetch. `hifi` will need an analogous watcher unless its backend
+   right fetch. `hibias` will need an analogous watcher unless its backend
    pushes updates.
 5. **CLI uses UDP localhost loopback rather than a Unix socket.** Cheap,
    cross-platform (Windows-friendly), and avoids filesystem cleanup. The

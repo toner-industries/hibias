@@ -2,9 +2,9 @@
 //! `SpotifyClient`, the offline `ReplaySpotify`/`Cassette` record-replay system,
 //! and the rate-limit circuit breaker.
 //!
-//! COMPILED THREE TIMES. As `crate::api` for the `hifi` binary (which only
+//! COMPILED THREE TIMES. As `crate::api` for the `hibias` binary (which only
 //! *replays* — it never builds a cassette), and `#[path]`-included by
-//! `bin/diag.rs` and `bin/cassette.rs` (hifi is a binary-only crate, no
+//! `bin/diag.rs` and `bin/cassette.rs` (hibias is a binary-only crate, no
 //! lib.rs). Items marked `#[allow(dead_code)]` (e.g. `Cassette::from_log`,
 //! `cassette_key`) are live in one binary and unused in another — do NOT delete
 //! them as "dead" or strip the allow without checking all three build targets.
@@ -56,7 +56,7 @@ pub struct SpotifyClient {
     /// trigger a 429. Pruned on every read/write so it stays bounded by
     /// `THROTTLE_WINDOW`.
     recent_requests: Mutex<VecDeque<Instant>>,
-    /// When `HIFI_RECORD` is set, every successful read response is teed
+    /// When `HIBIAS_RECORD` is set, every successful read response is teed
     /// (untruncated) into a replay cassette — see [`CassetteRecorder`]. `None`
     /// in normal operation.
     recorder: Option<CassetteRecorder>,
@@ -409,7 +409,7 @@ impl SpotifyClient {
                 Some(&format!("retry in {secs}s")),
             );
         }
-        let recorder = std::env::var("HIFI_RECORD")
+        let recorder = std::env::var("HIBIAS_RECORD")
             .ok()
             .filter(|s| !s.is_empty())
             .map(CassetteRecorder::new);
@@ -624,7 +624,7 @@ impl SpotifyClient {
 
     /// Add a single track to the user's Liked Songs. Requires the
     /// `user-library-modify` scope — a stored token without that scope
-    /// will 403; the user must delete `hifi-auth.json` and re-auth.
+    /// will 403; the user must delete `hibias-auth.json` and re-auth.
     pub async fn save_track(&self, track_id: &str) -> Result<()> {
         let url = format!("{BASE}/me/tracks?ids={}", urlencoding::encode(track_id));
         let req = self
@@ -883,14 +883,14 @@ fn prune_window(q: &mut VecDeque<Instant>, now: Instant) {
     }
 }
 
-/// Path for the persisted rate-limit deadline. Honors `HIFI_RATELIMIT_FILE`
+/// Path for the persisted rate-limit deadline. Honors `HIBIAS_RATELIMIT_FILE`
 /// for tests / non-default deployments; otherwise sits alongside
-/// `hifi-auth.json` in the working directory.
+/// `hibias-auth.json` in the working directory.
 fn rate_limit_state_path() -> PathBuf {
-    if let Ok(p) = std::env::var("HIFI_RATELIMIT_FILE") {
+    if let Ok(p) = std::env::var("HIBIAS_RATELIMIT_FILE") {
         return PathBuf::from(p);
     }
-    PathBuf::from("hifi-ratelimit.json")
+    PathBuf::from("hibias-ratelimit.json")
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -949,7 +949,7 @@ fn load_rate_limit_until() -> Option<Instant> {
 // ---------------------------------------------------------------------------
 // Record / replay: an offline `SpotifyApi` backed by captured responses.
 //
-// The app already logs every request/response to `hifi.log.sqlite`. A cassette
+// The app already logs every request/response to `hibias.log.sqlite`. A cassette
 // is just that data distilled into a `{logical-key -> response body}` map that
 // `ReplaySpotify` serves without touching the network — so the UI can be
 // exercised infinitely with zero rate-limit risk. See `Cassette::from_log`.
@@ -965,7 +965,7 @@ fn load_rate_limit_until() -> Option<Instant> {
 /// two different places; if they drift, replay silently returns empty (a miss
 /// is swallowed in `ReplaySpotify::parsed`), so the offline app just shows a
 /// blank screen with no error. Change one side, change the other.
-// Used by the `hifi-cassette` bin and tests; the `hifi` bin only replays.
+// Used by the `hibias-cassette` bin and tests; the `hibias` bin only replays.
 #[allow(dead_code)]
 fn cassette_key(method: &str, url: &str) -> Option<String> {
     let path = url.strip_prefix(BASE)?;
@@ -1022,7 +1022,7 @@ pub struct Cassette {
 }
 
 // Several methods (new/insert/keys/save/from_log) are used only by the
-// `hifi-cassette` bin and tests; the `hifi` bin uses just load/get/len.
+// `hibias-cassette` bin and tests; the `hibias` bin uses just load/get/len.
 #[allow(dead_code)]
 impl Cassette {
     pub fn new() -> Self {
@@ -1132,7 +1132,7 @@ impl Cassette {
 }
 
 /// Tees successful read responses into a [`Cassette`] on disk as the real
-/// client runs. Enabled by `HIFI_RECORD=<path>`. Unlike mining the SQLite log,
+/// client runs. Enabled by `HIBIAS_RECORD=<path>`. Unlike mining the SQLite log,
 /// this captures full untruncated bodies, so even the large library pages make
 /// it into the cassette. Seeds from any existing file at `path`, so repeated
 /// record sessions accumulate coverage rather than overwrite it.
@@ -1566,19 +1566,19 @@ mod tests {
     }
 
     /// Single combined test for save / load / expired-purge / delete. Kept
-    /// as one `#[test]` because `HIFI_RATELIMIT_FILE` is process-global and
+    /// as one `#[test]` because `HIBIAS_RATELIMIT_FILE` is process-global and
     /// splitting into multiple tests would race under cargo's parallel
     /// runner.
     #[test]
     fn rate_limit_persistence_round_trip() {
         let path = std::env::temp_dir().join(format!(
-            "hifi-ratelimit-test-{}.json",
+            "hibias-ratelimit-test-{}.json",
             std::process::id()
         ));
         // SAFETY: env writes are unsafe in 2024 edition. Only this test
-        // touches HIFI_RATELIMIT_FILE, so the access is effectively serial.
+        // touches HIBIAS_RATELIMIT_FILE, so the access is effectively serial.
         unsafe {
-            std::env::set_var("HIFI_RATELIMIT_FILE", &path);
+            std::env::set_var("HIBIAS_RATELIMIT_FILE", &path);
         }
         let _ = std::fs::remove_file(&path);
 
@@ -1609,7 +1609,7 @@ mod tests {
         assert!(!path.exists(), "expired file should be deleted");
 
         unsafe {
-            std::env::remove_var("HIFI_RATELIMIT_FILE");
+            std::env::remove_var("HIBIAS_RATELIMIT_FILE");
         }
     }
 
@@ -1626,7 +1626,7 @@ mod tests {
              "artists":[{"name":"A"}],"album":{"name":"Alb","images":[]}}
         ]}
     }"#;
-    const DEVICES_JSON: &str = r#"{"devices":[{"id":"d1","name":"hifi","is_active":true}]}"#;
+    const DEVICES_JSON: &str = r#"{"devices":[{"id":"d1","name":"hibias","is_active":true}]}"#;
 
     #[test]
     fn cassette_key_maps_read_endpoints() {
@@ -1666,7 +1666,7 @@ mod tests {
         let mut c = Cassette::new();
         c.insert("playback", PLAYBACK_JSON);
         c.insert("search:beatles", SEARCH_JSON);
-        let path = std::env::temp_dir().join("hifi_cassette_roundtrip.json");
+        let path = std::env::temp_dir().join("hibias_cassette_roundtrip.json");
         c.save(&path).expect("save");
         let loaded = Cassette::load(&path).expect("load");
         assert_eq!(loaded.len(), 2);
@@ -1726,7 +1726,7 @@ mod tests {
         // that both reuse request_id 1 (the counter resets per process), a
         // skipped mutation, a truncated body, and a 500 — then assert
         // extraction pairs correctly within each run and keeps the latest.
-        let path = std::env::temp_dir().join("hifi_from_log_test.sqlite");
+        let path = std::env::temp_dir().join("hibias_from_log_test.sqlite");
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -1783,7 +1783,7 @@ mod tests {
 
     #[test]
     fn recorder_captures_reads_skips_the_rest_and_persists() {
-        let path = std::env::temp_dir().join("hifi_recorder_test.json");
+        let path = std::env::temp_dir().join("hibias_recorder_test.json");
         let _ = std::fs::remove_file(&path);
         let b = "https://api.spotify.com/v1";
         {

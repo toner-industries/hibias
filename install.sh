@@ -1,21 +1,21 @@
 #!/bin/sh
-# hifi installer: downloads the latest release binary and installs it on PATH.
+# hibias installer: downloads the latest release binary and installs it on PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/toner-industries/hifi/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/toner-industries/hibias/main/install.sh | sh
 #
 # Files fetched with curl never get macOS's quarantine attribute, so this
 # path never triggers the Gatekeeper "Apple could not verify…" dialog that
 # a browser-downloaded binary does.
 set -eu
 
-REPO="toner-industries/hifi"
-BIN_DIR="${HIFI_BIN_DIR:-$HOME/.local/bin}"
+REPO="toner-industries/hibias"
+BIN_DIR="${HIBIAS_BIN_DIR:-$HOME/.local/bin}"
 
 case "$(uname -sm)" in
 "Darwin arm64") TARGET="aarch64-apple-darwin" ;;
 *)
     echo "error: no prebuilt binary for '$(uname -sm)' yet — build from source instead:" >&2
-    echo "  git clone https://github.com/$REPO.git && cd hifi && cargo run --release" >&2
+    echo "  git clone https://github.com/$REPO.git && cd hibias && cargo run --release" >&2
     exit 1
     ;;
 esac
@@ -28,17 +28,17 @@ if [ -z "$TAG" ]; then
     exit 1
 fi
 
-URL="https://github.com/$REPO/releases/download/$TAG/hifi-$TAG-$TARGET.tar.gz"
+URL="https://github.com/$REPO/releases/download/$TAG/hibias-$TAG-$TARGET.tar.gz"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Downloading hifi $TAG ($TARGET)..."
-curl -fsSL "$URL" -o "$TMP/hifi.tar.gz"
-tar -xzf "$TMP/hifi.tar.gz" -C "$TMP"
+echo "Downloading hibias $TAG ($TARGET)..."
+curl -fsSL "$URL" -o "$TMP/hibias.tar.gz"
+tar -xzf "$TMP/hibias.tar.gz" -C "$TMP"
 
 mkdir -p "$BIN_DIR"
-install -m 755 "$TMP/hifi" "$BIN_DIR/hifi"
-echo "Installed $BIN_DIR/hifi"
+install -m 755 "$TMP/hibias" "$BIN_DIR/hibias"
+echo "Installed $BIN_DIR/hibias"
 
 case ":$PATH:" in
 *":$BIN_DIR:"*) ;;
@@ -50,6 +50,6 @@ case ":$PATH:" in
 esac
 
 echo
-echo "hifi stores its login and state in the directory you run it from."
+echo "hibias stores its login and state in the directory you run it from."
 echo "Start it from one you'll keep using:"
-echo "  mkdir -p ~/music && cd ~/music && hifi"
+echo "  mkdir -p ~/music && cd ~/music && hibias"

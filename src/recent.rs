@@ -10,10 +10,10 @@ struct Stored {
 }
 
 fn path() -> PathBuf {
-    if let Ok(p) = std::env::var("HIFI_RECENT_FILE") {
+    if let Ok(p) = std::env::var("HIBIAS_RECENT_FILE") {
         return PathBuf::from(p);
     }
-    PathBuf::from("hifi-recent.json")
+    PathBuf::from("hibias-recent.json")
 }
 
 pub fn load_queries() -> Vec<String> {

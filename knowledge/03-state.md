@@ -1,6 +1,6 @@
 # State Management in `spotify-player`
 
-This doc traces how application state is shaped, shared, mutated, and read across `spotify-player` so that `hifi` can make informed choices. All references are relative to the cloned reference repo at `/Users/chris/repos/hifi/spotify-player/`.
+This doc traces how application state is shaped, shared, mutated, and read across `spotify-player` so that `hibias` can make informed choices. All references are relative to the cloned reference repo at `/Users/chris/repos/hibias/spotify-player/`.
 
 ## TL;DR
 
@@ -106,7 +106,7 @@ UIState {
 
 ### `CustomQueue` (`state/queue.rs:55-85`)
 
-A self-contained app-managed queue used when the integrated librespot player is active. It owns the full track list, sends *batches* of URIs to Spotify, and acts at batch boundaries. Worth reading top-to-bottom if `hifi` plans on similar queue control — the file has unit tests (`state/queue.rs:400-660`) covering shuffle, repeat, batch transitions.
+A self-contained app-managed queue used when the integrated librespot player is active. It owns the full track list, sends *batches* of URIs to Spotify, and acts at batch boundaries. Worth reading top-to-bottom if `hibias` plans on similar queue control — the file has unit tests (`state/queue.rs:400-660`) covering shuffle, repeat, batch transitions.
 
 ## How state is mutated
 
@@ -178,14 +178,14 @@ Three patterns of note:
 
 `parking_lot::RwLock` is *not* writer-preferring by default, but writes here are short and rare enough that starvation hasn't bitten the project. With many readers (multiple page sections all `.read()`ing `data` per frame) and short writers, this works.
 
-### Implication for `hifi`
+### Implication for `hibias`
 
-If `hifi` wants reactive updates instead of a polling redraw, it needs something the reference doesn't have:
+If `hibias` wants reactive updates instead of a polling redraw, it needs something the reference doesn't have:
 
 - A `Notify` / broadcast channel (e.g. `tokio::sync::Notify` or `tokio::sync::watch`) signalled on every state mutation, with the UI awaiting the notify before it redraws.
 - Or a true actor: one task owns mutable state, others send messages and receive snapshots (e.g. via `tokio::sync::watch::Sender<StateSnapshot>` per sub-domain).
 
-Either approach also lets `hifi` ditch the 32ms polling redraw, which currently spins regardless of whether anything changed.
+Either approach also lets `hibias` ditch the 32ms polling redraw, which currently spins regardless of whether anything changed.
 
 ## Caching layer
 
@@ -214,23 +214,23 @@ There is no SQLite, sled, redb, etc. Everything is JSON files plus in-memory `Ha
 ## Pain points and non-obvious patterns
 
 1. **Locks-everywhere is the architecture.** Every task and thread holds an `Arc<State>` and grabs locks on demand. There is no single source of mutation truth and no replay mechanism. Bugs from forgotten/stale fields (the `buffered_playback` story) are common — note the explicit "Related issue: #109" comment at `state/player.rs:14`.
-2. **`UIState` uses `Mutex`, not `RwLock`.** The justification (implicit) is that the renderer mutates UI state every frame for things like `last_cover_image_render_info` and `playback_progress_bar_rect`. If `hifi` wants concurrent UI readers (e.g. for testing/snapshotting), it would need to refactor.
+2. **`UIState` uses `Mutex`, not `RwLock`.** The justification (implicit) is that the renderer mutates UI state every frame for things like `last_cover_image_render_info` and `playback_progress_bar_rect`. If `hibias` wants concurrent UI readers (e.g. for testing/snapshotting), it would need to refactor.
 3. **Cross-cell consistency is not guaranteed.** Code that reads both `data` and `player` (e.g. `client/handlers.rs:96-145` page-change handler) takes them as separate guards and can observe a torn view if a writer slips in between. In practice the writes are compatible enough that nobody notices.
-4. **Drop ordering matters.** The codebase carefully scopes guards via `let player = state.player.read();` followed by `let curr_item = ...; drop(player);` (see `client/mod.rs:1603-1652`). A `hifi` clippy lint or convention to keep `RwLock`/`Mutex` guard scopes minimal would prevent deadlocks.
+4. **Drop ordering matters.** The codebase carefully scopes guards via `let player = state.player.read();` followed by `let curr_item = ...; drop(player);` (see `client/mod.rs:1603-1652`). A `hibias` clippy lint or convention to keep `RwLock`/`Mutex` guard scopes minimal would prevent deadlocks.
 5. **No deadlock-by-construction.** Because the same task can take, say, `state.ui.lock()` and `state.data.read()` in different orders across handlers, a deadlock is technically possible. The reference avoids it by convention (UI guard first, then data, then player) but it isn't enforced.
-6. **The custom queue lives inside `PlayerState`** despite being app-managed. Mutating shuffle/repeat means reaching into `state.player.write().custom_queue.as_mut()` — verbose and easy to miss. `hifi` could promote this to its own `RwLock` cell.
-7. **TTL of 1h on the memory cache is aggressive for a long-running daemon.** If `hifi` targets longer sessions (or always-on use), consider event-driven invalidation (e.g. on a "playlist updated" webhook) rather than time-based expiry.
-8. **File cache writes happen on the client task with no debouncing.** Every successful library refresh writes the entire JSON. For very large libraries this is meaningful blocking I/O on the tokio task — `hifi` should either offload this to `tokio::task::spawn_blocking` or batch.
-9. **The `vis_bands` Mutex is in the audio hot path.** It's locked from both the audio sink (high-rate writes) and the UI thread (per-frame reads). The reference uses `parking_lot::Mutex` precisely for its low overhead. If `hifi` wants visualisation, this contention pattern is a known design point.
-10. **No undo / no event log.** Because mutations are direct lock-and-write, there's nothing to replay. If `hifi` wants Spotify-style "Recently played" or "back to last view" beyond the page stack, it has to build that itself.
+6. **The custom queue lives inside `PlayerState`** despite being app-managed. Mutating shuffle/repeat means reaching into `state.player.write().custom_queue.as_mut()` — verbose and easy to miss. `hibias` could promote this to its own `RwLock` cell.
+7. **TTL of 1h on the memory cache is aggressive for a long-running daemon.** If `hibias` targets longer sessions (or always-on use), consider event-driven invalidation (e.g. on a "playlist updated" webhook) rather than time-based expiry.
+8. **File cache writes happen on the client task with no debouncing.** Every successful library refresh writes the entire JSON. For very large libraries this is meaningful blocking I/O on the tokio task — `hibias` should either offload this to `tokio::task::spawn_blocking` or batch.
+9. **The `vis_bands` Mutex is in the audio hot path.** It's locked from both the audio sink (high-rate writes) and the UI thread (per-frame reads). The reference uses `parking_lot::Mutex` precisely for its low overhead. If `hibias` wants visualisation, this contention pattern is a known design point.
+10. **No undo / no event log.** Because mutations are direct lock-and-write, there's nothing to replay. If `hibias` wants Spotify-style "Recently played" or "back to last view" beyond the page stack, it has to build that itself.
 
-## Design implications for `hifi`
+## Design implications for `hibias`
 
 - If reactive UI updates and a clearer mutation model are priorities, consider a single-writer pattern: an `actor` task owns `State`, exposes `tokio::sync::watch::Receiver`s for each sub-domain, and accepts mutations via an `mpsc` channel of typed commands. This eliminates the lock soup and makes time-travel/debug snapshots trivial.
 - If staying with the locks-everywhere model, at least:
   - Use `parking_lot::RwLock` everywhere (skip `Mutex` for `UIState` if the renderer can be made non-mutating).
   - Add a thin `state::write_*` / `state::read_*` API surface so you can later add change-notification, metrics, and tracing in one place.
   - Consider `arc_swap::ArcSwap<Snapshot>` for read-mostly cells where you're OK cloning whole sub-state into the consumer.
-- For caching, pick one tier strategy up front. The reference's mix of `TtlCache + JSON files` works but is ad hoc. `hifi` could use `redb` / `sled` / SQLite for both tiers and get atomic transactions, evictions, and querying for free.
+- For caching, pick one tier strategy up front. The reference's mix of `TtlCache + JSON files` works but is ad hoc. `hibias` could use `redb` / `sled` / SQLite for both tiers and get atomic transactions, evictions, and querying for free.
 - Keep the page-stack model from `UIState` (`state/ui/mod.rs:33`) — it's clean and lets you implement "back" trivially. But pull selection state out of `PageState` into a per-page-id keyed map if you want cursors to survive re-navigation.
 - Treat `buffered_playback` as a lesson: any client-side optimistic state needs to be explicit and named, not papered over with retries. Consider an `OptimisticPlayback` wrapper with a TTL of its own.

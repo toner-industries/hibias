@@ -3,18 +3,18 @@
 // Builds a replay cassette from the SQLite event log the app already writes.
 // No network, no auth, no Spotify calls — it just distills past recordings.
 //
-//   cargo run --bin hifi-cassette                       # hifi.log.sqlite -> cassette.json
-//   cargo run --bin hifi-cassette -- <log.sqlite> <out.json>
+//   cargo run --bin hibias-cassette                       # hibias.log.sqlite -> cassette.json
+//   cargo run --bin hibias-cassette -- <log.sqlite> <out.json>
 //
 // This is the zero-cost path, but the log caps bodies at 32 KB, so large
 // library pages get truncated and dropped. For full coverage, record a live
 // session instead (captures untruncated bodies as you browse):
 //
-//   HIFI_RECORD=cassette.json cargo run --bin hifi      # then visit every screen
+//   HIBIAS_RECORD=cassette.json cargo run --bin hibias      # then visit every screen
 //
 // Either way, drive the UI offline against the result:
 //
-//   HIFI_REPLAY=cassette.json cargo run --bin hifi
+//   HIBIAS_REPLAY=cassette.json cargo run --bin hibias
 
 use anyhow::Result;
 use std::env;
@@ -28,7 +28,7 @@ mod api;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let db = args.get(1).map(String::as_str).unwrap_or("hifi.log.sqlite");
+    let db = args.get(1).map(String::as_str).unwrap_or("hibias.log.sqlite");
     let out = args.get(2).map(String::as_str).unwrap_or("cassette.json");
 
     let cassette = api::Cassette::from_log(db)?;

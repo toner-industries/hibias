@@ -1,13 +1,13 @@
 #![allow(dead_code, unused_imports)] // diag uses a subset of the shared modules
 
 // Diagnostic CLI that uses the same auth/api code as the main app but skips
-// the TUI and librespot. Run it in a second terminal while `hifi` is running.
+// the TUI and librespot. Run it in a second terminal while `hibias` is running.
 //
-//   cargo run --bin hifi-diag                  -> show /me/player + devices
-//   cargo run --bin hifi-diag play <track_uri> -> play on the "hifi" device,
+//   cargo run --bin hibias-diag                  -> show /me/player + devices
+//   cargo run --bin hibias-diag play <track_uri> -> play on the "hibias" device,
 //                                                 then poll /me/player for 10s
 //
-// Logging goes to hifi.log.sqlite (same DB the main app uses).
+// Logging goes to hibias.log.sqlite (same DB the main app uses).
 
 use anyhow::{Context, Result};
 use std::env;
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 }
 
 async fn diag_main() -> Result<()> {
-    let _ = log::init(&std::path::PathBuf::from("hifi.log.sqlite"));
+    let _ = log::init(&std::path::PathBuf::from("hibias.log.sqlite"));
     log::note("diag start", None);
 
     let mode = parse_args(env::args().collect::<Vec<_>>());
@@ -58,7 +58,7 @@ fn parse_args(args: Vec<String>) -> DiagMode {
     match it.next().as_deref() {
         Some("play") => {
             let uri = it.next().unwrap_or_else(|| {
-                eprintln!("usage: hifi-diag play <spotify:track:...>");
+                eprintln!("usage: hibias-diag play <spotify:track:...>");
                 std::process::exit(2);
             });
             DiagMode::Play(uri)
@@ -110,18 +110,18 @@ async fn print_state(client: &SpotifyClient) -> Result<()> {
 }
 
 async fn play_and_poll(client: &SpotifyClient, track_uri: &str) -> Result<()> {
-    // Look up the "hifi" device's id.
+    // Look up the "hibias" device's id.
     let devs = client.get_devices().await.context("get_devices")?;
-    let hifi = devs.iter().find(|d| d.name == "hifi");
-    let Some(d) = hifi else {
-        eprintln!("\nno 'hifi' device visible. Start the TUI first (`just run`).");
+    let hibias = devs.iter().find(|d| d.name == "hibias");
+    let Some(d) = hibias else {
+        eprintln!("\nno 'hibias' device visible. Start the TUI first (`just run`).");
         std::process::exit(1);
     };
     let Some(device_id) = d.id.clone() else {
-        eprintln!("\nhifi device has no id (?)");
+        eprintln!("\nhibias device has no id (?)");
         std::process::exit(1);
     };
-    println!("\nfound hifi device: id={device_id} active={}", d.is_active);
+    println!("\nfound hibias device: id={device_id} active={}", d.is_active);
 
     // Set the client's target device so play_uris appends ?device_id=.
     client.set_device_id(device_id.clone());

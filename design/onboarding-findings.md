@@ -1,6 +1,6 @@
 # Onboarding findings — from-scratch dry run, 2026-06-11
 
-Method: wiped ALL local state (auth, hifi.toml, recents, event log, librespot
+Method: wiped ALL local state (auth, hibias.toml, recents, event log, librespot
 credentials — backed up to `scratch/onboarding-backup-2026-06-11/`), deleted
 the Spotify dev app from the dashboard, then re-onboarded exactly as a new
 user would: downloaded the v0.1.1 release, ran it quarantined, created the
@@ -12,14 +12,14 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
 1. ☐ **The repo is private.** Every README link 404s for anyone who isn't a
    collaborator; `curl` of a release asset returns a 9-byte "Not Found".
    The entire distribution story currently works for an audience of one.
-   Decision needed: make `toner-industries/hifi` public (or mirror releases
+   Decision needed: make `toner-industries/hibias` public (or mirror releases
    somewhere public).
-2. ✅ **README pointed at the wrong repo** (`github.com/chrisbolin/hifi` —
-   the actual remote is `toner-industries/hifi`).
+2. ✅ **README pointed at the wrong repo** (`github.com/chrisbolin/hibias` —
+   the actual remote is `toner-industries/hibias`).
 3. ✅ **Gatekeeper, macOS Sequoia edition.** A browser-downloaded binary is
    quarantined; running it freezes the terminal for ~30s (blocked in
    `_dyld_start` while syspolicyd assesses), then a dialog appears whose
-   **primary button is "Move to Trash"** ("Apple could not verify hifi is
+   **primary button is "Move to Trash"** ("Apple could not verify hibias is
    free of malware"), then `zsh: killed`. There is no "Open Anyway" in the
    dialog (Sequoia removed the right-click→Open path; the escape hatch is
    System Settings → Privacy & Security, or `xattr -d`).
@@ -29,14 +29,14 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
    carries the execute bit).
 4. **Spotify's Feb 2026 developer-policy changes** (announced
    developer.spotify.com/blog/2026-02-06…, effective for new apps Feb 11):
-   - Development mode requires **Premium** (hifi already requires it ✓)
+   - Development mode requires **Premium** (hibias already requires it ✓)
    - **One development-mode app per account** — "Create app" is greyed out
      with a tooltip if you already have one. ✅ The first-run prompt now
      explains the reuse-your-existing-app path (add the redirect URI to it).
    - **Max 5 authorized users** per client id (fine for personal use)
    - ☐ New client ids get "a smaller set of supported endpoints" — endpoint
      enforcement was postponed for pre-existing apps but applies to apps
-     created now. Everything hifi calls worked on an app created 2026-06-11,
+     created now. Everything hibias calls worked on an app created 2026-06-11,
      but this is worth re-checking whenever something 403s.
 5. ✅ **Client-id mistakes surfaced as cryptic failures.** A typo'd id used
    to open a browser to an INVALID_CLIENT page while the terminal waited
@@ -48,14 +48,14 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
    pre-emptive hint printed at browser-open time.
 6. ✅ **The audio-credentials wall was the worst step**: the README told
    users to install a *different* Spotify client (spotify-player), log in
-   there, and let hifi steal its librespot cache. Replaced with native
+   there, and let hibias steal its librespot cache. Replaced with native
    librespot OAuth (`streaming::ensure_credentials`, librespot-oauth 0.8):
    on first run the browser opens a second time ("Spotify for Desktop" →
    single "Continue to the app" button) and reusable credentials are minted
-   into `~/.cache/hifi/credentials.json` via one `Session::connect(creds,
+   into `~/.cache/hibias/credentials.json` via one `Session::connect(creds,
    store_credentials=true)`. Legacy spotify-player cache still honored as a
    fallback so existing setups aren't re-prompted. Declining is non-fatal —
-   hifi stays a remote-only controller.
+   hibias stays a remote-only controller.
 7. ✅ **The streaming-failure status line was truncated mid-sentence**
    ("⚠ streaming disabled: no librespot credentials at" — path clipped by
    the 96-col canvas) and unactionable. Messages shortened at the source;
@@ -80,14 +80,14 @@ step. Fixes shipped the same day are marked ✅; open items are marked ☐.
 The cooldown lifted ~24h after the first creation. Completed end-to-end on
 the released v0.1.2 binary installed by the one-liner: app creation (the
 wizard's instructions match the form 1:1) → client-id paste (pre-flight
-passed) → web OAuth → TUI up with `device: hifi` → space plays, time
+passed) → web OAuth → TUI up with `device: hibias` → space plays, time
 advances, space pauses. The audio step was satisfied by the **legacy
 spotify-player cache fallback** (by design — no re-prompt for existing
 setups); the fresh-mint OAuth path was verified the day before. The 80×24
 small-terminal notice renders instead of the old panic.
 
 Two notes from the run:
-- hifi's CSRF guard caught a genuinely corrupted authorize URL (state
+- hibias's CSRF guard caught a genuinely corrupted authorize URL (state
   truncated by tmux line-wrapping during the test) — but the browser-side
   callback page still showed the green "logged in" while the terminal
   rejected the exchange. Fixed: the page now renders the error when the
@@ -126,7 +126,7 @@ self-update story later.)
 - ☐ Real fix for Gatekeeper on manual downloads: Apple Developer ID signing
   + notarization ($99/yr) or a Homebrew tap
 - ☐ State-in-CWD is still a trap ("run it from the same directory every
-  time"); consider `~/.config/hifi`/`~/.local/share/hifi` defaults with
+  time"); consider `~/.config/hibias`/`~/.local/share/hibias` defaults with
   CWD-files-win back-compat
 - ☐ Cut a release containing this work (v0.1.1 still ships the tmux
   key-eating bug fixed on 2026-06-10 and the old onboarding)

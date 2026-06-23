@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>hifi · screen mockups</title>
+<title>hibias · screen mockups</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -186,7 +186,7 @@
 <body>
 
 <aside class="thumbs">
-  <h1>hifi · screen mockups</h1>
+  <h1>hibias · screen mockups</h1>
   <div id="thumbList"></div>
 </aside>
 
@@ -503,7 +503,7 @@ function spliceVisible(haystack, start, len, replacement) {
 // ============================================================================
 function screen_now_playing() {
   const inner = nowPlayingInner({withFooter: true, footerKeys: 'now'});
-  return shell('hifi · device: hifi (cabin)', inner);
+  return shell('hibias · device: hibias (cabin)', inner);
 }
 
 // ============================================================================
@@ -561,7 +561,7 @@ function screen_search() {
   inner.push('       ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' play / open   ' + cy('[tab]') + ' switch tab   ' + cy('[?]') + ' help');
   inner.push('');
   while (inner.length < 38) inner.push('');
-  return shell('hifi · device: hifi (cabin)', inner.slice(0, 38));
+  return shell('hibias · device: hibias (cabin)', inner.slice(0, 38));
 }
 
 // ============================================================================
@@ -611,7 +611,7 @@ function screen_browse() {
   inner.push('   ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' play   ' + cy('[p]') + ' play all   ' + cy('[/]') + ' search   ' + cy('[esc]') + ' back');
   inner.push('');
   while (inner.length < 38) inner.push('');
-  return shell('hifi · device: hifi (cabin)', inner.slice(0, 38));
+  return shell('hibias · device: hibias (cabin)', inner.slice(0, 38));
 }
 
 // ============================================================================
@@ -657,7 +657,7 @@ function screen_library() {
   inner.push('   ' + cy('[↑/↓]') + ' move   ' + cy('[enter]') + ' open   ' + cy('[tab]') + ' switch tab   ' + cy('[/]') + ' search   ' + cy('[esc]') + ' back');
   inner.push('');
   while (inner.length < 38) inner.push('');
-  return shell('hifi · device: hifi (cabin) · library', inner.slice(0, 38));
+  return shell('hibias · device: hibias (cabin) · library', inner.slice(0, 38));
 }
 
 // ============================================================================
@@ -676,7 +676,7 @@ function screen_devices() {
     contentRows: [
       di('Select device for playback'),
       '',
-      sel(`  ${ok('*')} ${bo('hifi (cabin)')}${di('  · this app  ')}        `),
+      sel(`  ${ok('*')} ${bo('hibias (cabin)')}${di('  · this app  ')}        `),
       `    ${di(' ')} ${bo('Chris\'s MacBook Pro')}${di('  · spotify')}    `,
       `    ${di(' ')} ${bo('iPhone (Chris)')}${di('  · mobile')}           `,
       `    ${di(' ')} ${bo('Kitchen Speaker')}${di('  · cast')}            `,
@@ -687,7 +687,7 @@ function screen_devices() {
   };
   while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
   const composed = compositeWithOverlay(bg, overlay);
-  return shell('hifi · device: hifi (cabin)', composed);
+  return shell('hibias · device: hibias (cabin)', composed);
 }
 
 // ============================================================================
@@ -719,12 +719,12 @@ function screen_help() {
       `  ${cy('esc')}       back`,
       `  ${cy('ctrl-c')}    quit`,
       '',
-      di('hifi · v0.1'),
+      di('hibias · v0.1'),
     ],
   };
   while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
   const composed = compositeWithOverlay(bg, overlay);
-  return shell('hifi · device: hifi (cabin)', composed);
+  return shell('hibias · device: hibias (cabin)', composed);
 }
 
 // ============================================================================
@@ -751,18 +751,18 @@ function screen_command() {
       '',
       `  ${bo('next')}              skip to the next track`,
       `  ${bo('previous')}          skip back (or restart current track)`,
-      `  ${bo('reconnect')}         restart the 'hifi' Connect device`,
+      `  ${bo('reconnect')}         restart the 'hibias' Connect device`,
       `  ${bo('queue')}             open the queue view`,
       `  ${bo('library')}           open library`,
       `  ${bo('devices')}           pick playback device`,
       `  ${bo('search')}            open the search overlay`,
       `  ${bo('help')}              show the hotkey help overlay`,
-      `  ${bo('quit')}              exit hifi`,
+      `  ${bo('quit')}              exit hibias`,
     ],
   };
   while (overlay.contentRows.length < overlay.h - 2) overlay.contentRows.push('');
   const composed = compositeWithOverlay(bg, overlay);
-  return shell('hifi · device: hifi (cabin)', composed);
+  return shell('hibias · device: hibias (cabin)', composed);
 }
 
 // ---- registry --------------------------------------------------------------

@@ -238,14 +238,14 @@ The `UIState` (`state/ui/mod.rs:26-45`) holds:
 7. Independently, `start_player_event_watcher` notices the playback change on its next 100 ms tick and queues `GetCurrentPlayback` and possibly `GetCurrentUserQueue` (`client/handlers.rs:48-89`). Those tasks update `state.player` / `state.data`.
 8. Within ~32 ms `ui::run` redraws using the new `SharedState`.
 
-## Notes for `hifi`'s Design
+## Notes for `hibias`'s Design
 
 - The two-channel model (UI -> client `flume::unbounded`, no reverse channel; render-on-poll instead) is simple and avoids future-correlation, at the cost of any explicit "request finished / failed" notifications. Errors only land in `tracing::error!` logs.
 - Keymap lookup is O(N) over a `Vec` per keypress; fine at default size (~80 entries) but a `HashMap<KeySequence, Command>` would be trivial to swap in.
-- The chord buffer has no timeout — chords are aborted only by a non-prefix continuation or by a successful match. For `hifi`, consider adding a configurable `chord_timeout_ms`.
+- The chord buffer has no timeout — chords are aborted only by a non-prefix continuation or by a successful match. For `hibias`, consider adding a configurable `chord_timeout_ms`.
 - The popup-vs-page-vs-global dispatch ladder is implemented as plain function calls; there's no Trait-object `EventHandler` interface. Each `PageType` and each `PopupState` has its own bespoke handler function. Adding a new page = adding another arm in `handle_key_sequence_for_page`.
 - `Action` vs `Command` is a useful split — verbs that need an object (a track) vs verbs that don't (next track, quit). Worth preserving.
-- Mouse support is minimal; not a bad starting target for `hifi`.
+- Mouse support is minimal; not a bad starting target for `hibias`.
 
 ## File Index (cited)
 

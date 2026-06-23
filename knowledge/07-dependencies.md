@@ -170,9 +170,9 @@ Standalone library published separately (`lyric_finder/Cargo.toml:1-9`) that scr
 - `serde` (derive), `anyhow`, `log` for plumbing.
 - Dev-only: `tokio` and `env_logger` for the example binary at `lyric_finder/examples/lyric-finder.rs`.
 
-It is consumed by `spotify_player` only when the user enables lyrics in config; nothing in the main `Cargo.toml` lists it as a dep, suggesting it is vendored via path/local link or copied in-tree (worth confirming when wiring lyrics into hifi).
+It is consumed by `spotify_player` only when the user enables lyrics in config; nothing in the main `Cargo.toml` lists it as a dep, suggesting it is vendored via path/local link or copied in-tree (worth confirming when wiring lyrics into hibias).
 
-## Implications for `hifi`
+## Implications for `hibias`
 
 ### Effectively mandatory for any spotify-player-shaped app
 
@@ -183,7 +183,7 @@ It is consumed by `spotify_player` only when the user enables lyrics in config; 
 - `serde` + `toml` + `dirs-next` — config baseline.
 - `clap` (+`clap_complete`) — CLI parser; a music app benefits from RPC subcommands.
 - `tracing` + `tracing-subscriber` — diagnostic logging.
-- `anyhow` — the chosen error style; trivially swappable for `thiserror` if hifi prefers typed errors.
+- `anyhow` — the chosen error style; trivially swappable for `thiserror` if hibias prefers typed errors.
 - `parking_lot` — small win, big convenience for sync `SharedState`.
 - `reqwest` — pulled in transitively anyway.
 
@@ -191,16 +191,16 @@ It is consumed by `spotify_player` only when the user enables lyrics in config; 
 
 - **Audio backend choice**: `librespot-playback` is the only path to streaming. Backend feature can be left to the user, but picking a sensible default (rodio is the most portable) matters. `gstreamer-backend` is overkill unless you need its codecs.
 - **Media controls**: `souvlaki` is the only credible cross-platform option. Skipping it removes a large surface (winit on macOS, windows-rs on Windows, dbus on Linux).
-- **Image rendering**: `viuer` + `image` adds binary size and the sixel headache. A v1 hifi can defer this entirely.
+- **Image rendering**: `viuer` + `image` adds binary size and the sixel headache. A v1 hibias can defer this entirely.
 - **Notifications**: `notify-rust` with the `d` feature is cheap; worth including.
 - **Daemon mode**: `daemonize` is tiny but couples with the socket/RPC design; fine to defer.
 - **Fuzzy search**: `fuzzy-matcher` is trivial to add later; consider `nucleo` (newer, used by Helix) as an alternative.
-- **TLS**: spotify-player straddles rustls (explicit) and native-tls (via librespot). hifi could try to force rustls everywhere by patching librespot features, eliminating the OpenSSL system dep.
-- **`config_parser2`**: a project-local crate; hifi can use plain `serde` + `figment` or `config` instead.
-- **`flume` vs `tokio::sync`**: hifi could standardize on tokio channels if it doesn't need sync-side recv.
+- **TLS**: spotify-player straddles rustls (explicit) and native-tls (via librespot). hibias could try to force rustls everywhere by patching librespot features, eliminating the OpenSSL system dep.
+- **`config_parser2`**: a project-local crate; hibias can use plain `serde` + `figment` or `config` instead.
+- **`flume` vs `tokio::sync`**: hibias could standardize on tokio channels if it doesn't need sync-side recv.
 - **Lyrics**: `lyric_finder` is a small, self-contained crate; either depend on the published version or skip lyrics in v1.
 
-### Things hifi can reasonably do differently
+### Things hibias can reasonably do differently
 
 - Use `thiserror` for typed errors at API boundaries while keeping `anyhow` for app-level glue.
 - Replace `config_parser2` with a more standard layered-config approach.

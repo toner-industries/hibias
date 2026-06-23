@@ -450,7 +450,7 @@ The TUI and the headless daemon share `start_app` end-to-end; the only branch
 is whether to spin up a UI thread. The CLI is a thin marshalling layer that
 hits the same UDP endpoint regardless of who's serving.
 
-## Notes for `hifi`'s design
+## Notes for `hibias`'s design
 
 - A single `OnceLock` config initialized from disk + CLI overrides is enough.
   No reload machinery; document that restart is required.

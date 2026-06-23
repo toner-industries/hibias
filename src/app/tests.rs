@@ -1427,7 +1427,7 @@ async fn ui_at_96x40_now_playing_with_long_metadata() {
     {
         let mut s = h.state.lock().await;
         s.boot = false;
-        s.device_name = Some("hifi (cabin)".into());
+        s.device_name = Some("hibias (cabin)".into());
     }
     let screen = h.snapshot_sized(96, 40).await;
     print_snapshot("now_playing long metadata", &screen);
@@ -1449,7 +1449,7 @@ async fn ui_at_96x40_now_playing_with_rate_limit_status() {
     {
         let mut s = h.state.lock().await;
         s.boot = false;
-        s.device_name = Some("hifi".into());
+        s.device_name = Some("hibias".into());
         s.rate_limited_until = Some(Instant::now() + Duration::from_secs(45));
     }
     let screen = h.snapshot_sized(96, 40).await;
@@ -1668,7 +1668,7 @@ async fn ui_at_96x40_now_playing_with_up_next() {
     {
         let mut s = h.state.lock().await;
         s.boot = false;
-        s.device_name = Some("hifi".into());
+        s.device_name = Some("hibias".into());
         // The leading entry duplicates the now-playing track (a stale
         // queue) and should be filtered out of "Up Next".
         s.queue = vec![
@@ -1959,7 +1959,7 @@ async fn ui_at_96x40_devices_overlay() {
     h.fake.set_devices(Ok(vec![
         Device {
             id: Some("a".into()),
-            name: "hifi (cabin)".into(),
+            name: "hibias (cabin)".into(),
             is_active: true,
         },
         Device {
@@ -1980,7 +1980,7 @@ async fn ui_at_96x40_devices_overlay() {
     assert_border_closes("devices overlay", &screen);
     assert!(screen.contains("devices"), "overlay title present");
     assert!(
-        screen.contains("hifi (cabin)") && screen.contains("Kitchen Speaker"),
+        screen.contains("hibias (cabin)") && screen.contains("Kitchen Speaker"),
         "device rows"
     );
 }
@@ -2015,7 +2015,7 @@ async fn stale_poll_naming_our_device_clears_offline_verdict() {
     let mut pb = pb_with_ts(Some(0), "Old Track");
     pb.device = Some(Device {
         id: Some("dev-ours".into()),
-        name: "hifi".into(),
+        name: "hibias".into(),
         is_active: true,
     });
     apply_playback(&state, Some(pb)).await;
@@ -2086,7 +2086,7 @@ async fn wait_then_transfer_retries_transient_500() {
     let h = Harness::new();
     h.fake.set_devices(Ok(vec![Device {
         id: Some("dev-1".into()),
-        name: "hifi".into(),
+        name: "hibias".into(),
         is_active: false,
     }]));
     h.fake.queue_transfer(Err(
@@ -2113,7 +2113,7 @@ async fn wait_then_transfer_gives_up_on_permanent_error() {
     let h = Harness::new();
     h.fake.set_devices(Ok(vec![Device {
         id: Some("dev-1".into()),
-        name: "hifi".into(),
+        name: "hibias".into(),
         is_active: false,
     }]));
     h.fake.queue_transfer(Err(

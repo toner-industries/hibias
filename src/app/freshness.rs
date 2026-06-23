@@ -61,7 +61,7 @@ pub fn displayed_progress_for_toggle(s: &AppState) -> u64 {
 }
 
 pub const DEVICE_OFFLINE_MSG: &str =
-    "Connect device 'hifi' is offline — auto-reconnecting (or press ':' → reconnect)";
+    "Connect device 'hibias' is offline — auto-reconnecting (or press ':' → reconnect)";
 
 pub fn is_device_not_found(msg: &str) -> bool {
     msg.contains("Device not found") || msg.contains("\"status\" : 404")

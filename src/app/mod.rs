@@ -82,7 +82,7 @@ pub struct AppState {
     /// re-entered. Empty when nothing is queued or nothing is playing.
     pub queue: Vec<Track>,
     /// Queries the user has searched for previously, most-recent-first.
-    /// Persisted to `hifi-recent.json` so it survives restarts.
+    /// Persisted to `hibias-recent.json` so it survives restarts.
     pub recent_queries: Vec<String>,
     /// True until the user takes a local action OR we observe an
     /// actively-playing track. While true, paused/empty polled playback is
@@ -450,10 +450,10 @@ impl Cmd {
             Cmd::Next => "skip to the next track",
             Cmd::Previous => "skip back (or restart current track)",
             Cmd::Like => "save the current track to Liked Songs",
-            Cmd::Reconnect => "restart the 'hifi' Connect device",
+            Cmd::Reconnect => "restart the 'hibias' Connect device",
             Cmd::Search => "open the Spotify search overlay",
             Cmd::Help => "show the hotkey help overlay",
-            Cmd::Quit => "exit hifi",
+            Cmd::Quit => "exit hibias",
         }
     }
 }
@@ -619,7 +619,7 @@ pub async fn reconnect_now(
     }
     client.clear_device_id();
 
-    match streaming::start("hifi").await {
+    match streaming::start("hibias").await {
         Ok(new) => {
             log::note(
                 "reconnect: new spirc up",
@@ -1090,7 +1090,7 @@ fn apply_library_result(
     // hint the like flow uses, scoped to just this section.
     let friendly = |msg: String| -> String {
         if msg.contains("403") {
-            "locked: missing scope — delete hifi-auth.json and re-auth".into()
+            "locked: missing scope — delete hibias-auth.json and re-auth".into()
         } else {
             msg
         }
@@ -1782,7 +1782,7 @@ pub async fn like_current_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<
             log::error("like", &msg);
             let mut s = state.lock().await;
             s.error = Some(if msg.contains("403") {
-                "like failed: missing scope — delete hifi-auth.json and re-auth".into()
+                "like failed: missing scope — delete hibias-auth.json and re-auth".into()
             } else {
                 msg
             });

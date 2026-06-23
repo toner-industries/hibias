@@ -31,7 +31,7 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
     let frame = f.area();
     if frame.width < FIXED_W || frame.height < FIXED_H {
         let msg = format!(
-            "Terminal too small: {}\u{d7}{} \u{2014} hifi needs at least {FIXED_W}\u{d7}{FIXED_H}.\nEnlarge the window (or zoom out) to continue.",
+            "Terminal too small: {}\u{d7}{} \u{2014} hibias needs at least {FIXED_W}\u{d7}{FIXED_H}.\nEnlarge the window (or zoom out) to continue.",
             frame.width, frame.height
         );
         f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }), frame);
@@ -48,10 +48,10 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         &state.device_name,
         &state.streaming_failed,
     ) {
-        (true, _, _) => " hifi · reconnecting... ".to_string(),
-        (false, Some(name), _) => format!(" hifi · device: {name} "),
-        (false, None, None) => " hifi · starting device... ".to_string(),
-        (false, None, Some(_)) => " hifi · streaming unavailable ".to_string(),
+        (true, _, _) => " hibias · reconnecting... ".to_string(),
+        (false, Some(name), _) => format!(" hibias · device: {name} "),
+        (false, None, None) => " hibias · starting device... ".to_string(),
+        (false, None, Some(_)) => " hibias · streaming unavailable ".to_string(),
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -272,7 +272,7 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
     // Spotify Connect — without it the user just sees mysterious 404s.
     if state.device_present == Some(false) {
         return Some((
-            "⚠ Connect device 'hifi' is offline — auto-reconnects on your next action".to_string(),
+            "⚠ Connect device 'hibias' is offline — auto-reconnects on your next action".to_string(),
             Color::Yellow,
         ));
     }
@@ -323,7 +323,7 @@ fn render_info(f: &mut Frame, area: Rect, state: &AppState) {
     let track = state.playback.as_ref().and_then(|p| p.item.as_ref());
     let Some(track) = track else {
         let msg = if state.device_name.is_none() && state.streaming_failed.is_none() {
-            "Connecting to Spotify...\n\nStarting the 'hifi' Connect device — this usually takes a couple of seconds."
+            "Connecting to Spotify...\n\nStarting the 'hibias' Connect device — this usually takes a couple of seconds."
         } else {
             "Nothing playing.\n\nStart a track on any Spotify device,\nor pick this one in the Connect picker."
         };

@@ -28,7 +28,7 @@ impl Streaming {
 }
 
 /// The redirect URI librespot's own client id has registered — see
-/// librespot's oauth example. Distinct from hifi's Web-API redirect (8989)
+/// librespot's oauth example. Distinct from hibias's Web-API redirect (8989)
 /// so the two flows can never collide on a port.
 const OAUTH_REDIRECT: &str = "http://127.0.0.1:8898/login";
 
@@ -44,7 +44,7 @@ pub async fn ensure_credentials() -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("One-time audio setup: hifi needs a second Spotify approval so it");
+    eprintln!("One-time audio setup: hibias needs a second Spotify approval so it");
     eprintln!("can play audio itself (the first approval covered search/control).");
     eprintln!("Opening your browser...");
 
@@ -84,7 +84,7 @@ pub async fn start(device_name: &str) -> Result<Streaming> {
     let cache_dir = librespot_cache_dir();
     let cache = Cache::new(Some(&cache_dir), None, None, None).context("librespot cache")?;
     let creds = cache.credentials().ok_or_else(|| {
-        anyhow!("no audio credentials cached — quit and relaunch hifi to set up audio output")
+        anyhow!("no audio credentials cached — quit and relaunch hibias to set up audio output")
     })?;
 
     let session = Session::new(SessionConfig::default(), Some(cache));
@@ -135,11 +135,11 @@ pub async fn start(device_name: &str) -> Result<Streaming> {
 }
 
 fn librespot_cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("HIFI_LIBRESPOT_CACHE") {
+    if let Ok(p) = std::env::var("HIBIAS_LIBRESPOT_CACHE") {
         return PathBuf::from(p);
     }
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let ours = home.join(".cache").join("hifi");
+    let ours = home.join(".cache").join("hibias");
     // Earlier builds borrowed spotify-player's librespot cache instead of
     // owning one. Keep honoring it when it's the only place with credentials
     // so existing setups don't get re-prompted to authorize audio.

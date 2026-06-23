@@ -1,12 +1,12 @@
-# hifi UI screens — driven offline against a replay cassette.
+# hibias UI screens — driven offline against a replay cassette.
 #
 # Regenerate (from repo root, after `cargo build`):
-#   cargo run --bin hifi-cassette          # refresh cassette.json if needed
+#   cargo run --bin hibias-cassette          # refresh cassette.json if needed
 #   vhs vhs/screens.tape                    # writes PNGs to scratch/vhs/
 #
 # No Spotify, no auth, no rate limits — every screen is served from the cassette.
 #
-# Navigation notes (learned the hard way, verified against hifi.log.sqlite):
+# Navigation notes (learned the hard way, verified against hibias.log.sqlite):
 #   - Esc on Now Playing QUITS — only Esc to close a known-open overlay.
 #   - Tab is global: switches top tab and closes any open overlay.
 #   - `/` `d` `?` are global only when NOT typing in the search box.
@@ -22,11 +22,11 @@ Set Width 820
 Set Height 700
 
 # --- Launch offline against the cassette --------------------------------
-# HIFI_TEST=1 marks this as a harness run, which disables album art (VHS's
+# HIBIAS_TEST=1 marks this as a harness run, which disables album art (VHS's
 # xterm.js mis-renders the image widget as duplicated text; real terminals are
-# fine). HIFI_REPLAY serves recorded data offline. Two orthogonal switches:
+# fine). HIBIAS_REPLAY serves recorded data offline. Two orthogonal switches:
 # "under test" vs. "where data comes from".
-Type "HIFI_TEST=1 HIFI_REPLAY=cassette.json target/debug/hifi"
+Type "HIBIAS_TEST=1 HIBIAS_REPLAY=cassette.json target/debug/hibias"
 Enter
 Sleep 3s
 Screenshot scratch/vhs/01-now-playing.png

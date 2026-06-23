@@ -33,8 +33,8 @@ listed at the bottom for the record; everything else here is open.
   transfer lands paused (`play:false` by design, so the app never blasts
   audio unannounced). A `--resume` flag or a "press space to resume" hint on
   the seeded screen would smooth the restart story.
-- **Replay-mode title.** Under `HIFI_REPLAY` the frame title stays
-  "hifi · starting device..." forever; could say "hifi · replay" instead.
+- **Replay-mode title.** Under `HIBIAS_REPLAY` the frame title stays
+  "hibias · starting device..." forever; could say "hibias · replay" instead.
 
 ## Known inconsistencies (by design or upstream, worth knowing)
 
@@ -72,7 +72,7 @@ listed at the bottom for the record; everything else here is open.
   the Connect device is offline: routine `/me/player` polls now carry the
   reporting device and flip `device_present` back when our device shows up.
   The status-line copy also matched reality ("auto-reconnects on your next
-  action" instead of "restart hifi").
+  action" instead of "restart hibias").
 - The boot/reconnect `transfer_playback` retries transient 5xx / device-
   not-found races within its 12s probe budget instead of giving up on the
   first error (a single Spotify 500 used to strand a restart at "Nothing

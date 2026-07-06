@@ -81,6 +81,10 @@ pub struct AppState {
     /// never on a timer — so it can be slightly stale until the tab is
     /// re-entered. Empty when nothing is queued or nothing is playing.
     pub queue: Vec<Track>,
+    /// Selected row within the "Up Next" list on Now Playing (up/down walk it).
+    /// Reset to 0 whenever the queue is refreshed. Clamped by the renderer and
+    /// the down-arrow handler against [`up_next_tracks`].
+    pub up_next_selected: usize,
     /// Queries the user has searched for previously, most-recent-first.
     /// Persisted to `hibias-recent.json` so it survives restarts.
     pub recent_queries: Vec<String>,
@@ -104,6 +108,10 @@ pub struct AppState {
     /// whose effect is invisible from the now-playing view (e.g. `:like`).
     /// Status line renders it green; expiry is checked lazily on read.
     pub notice: Option<(String, Instant)>,
+    /// The current user's Spotify id, fetched once at boot. Used to tell an
+    /// owned playlist from a followed/editorial one when the tracks endpoint
+    /// 403s, so we only show the "locked" warning for ones we can't fix.
+    pub me_id: Option<String>,
 }
 
 impl Default for AppState {
@@ -126,12 +134,14 @@ impl Default for AppState {
             device_id: None,
             recent_tracks: Vec::new(),
             queue: Vec::new(),
+            up_next_selected: 0,
             recent_queries: Vec::new(),
             boot: true,
             streaming_failed: None,
             streaming: None,
             reconnecting: false,
             notice: None,
+            me_id: None,
         }
     }
 }
@@ -152,12 +162,11 @@ pub struct ArtRequest {
 pub enum Tab {
     #[default]
     NowPlaying,
-    Search,
     Library,
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[Tab::NowPlaying, Tab::Search, Tab::Library];
+    pub const ALL: &'static [Tab] = &[Tab::NowPlaying, Tab::Library];
 
     pub fn next(self) -> Tab {
         let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
@@ -172,7 +181,6 @@ impl Tab {
     pub fn name(self) -> &'static str {
         match self {
             Tab::NowPlaying => "now_playing",
-            Tab::Search => "search",
             Tab::Library => "library",
         }
     }
@@ -180,7 +188,6 @@ impl Tab {
     pub fn label(self) -> &'static str {
         match self {
             Tab::NowPlaying => "Now Playing",
-            Tab::Search => "Search",
             Tab::Library => "Library",
         }
     }
@@ -188,7 +195,6 @@ impl Tab {
     pub fn mask(self) -> ModeMask {
         match self {
             Tab::NowPlaying => ModeMask::NOW_PLAYING,
-            Tab::Search => ModeMask::SEARCH,
             Tab::Library => ModeMask::LIBRARY,
         }
     }
@@ -209,7 +215,11 @@ pub enum Focus {
 /// A transient surface drawn over the active tab. Help/Command/Devices render
 /// as centered boxes; Browse fills the body. Each carries its own state inline.
 pub enum Overlay {
-    Help,
+    /// The search surface. Summoned by typing (or `/`) from any tab, dismissed
+    /// with Esc back to the tab underneath. Its data lives in the persistent
+    /// `AppState::search` field (so an in-progress query survives a dismiss);
+    /// this variant is just the "search is showing" marker.
+    Search,
     Command(CommandState),
     Devices(DevicesState),
     Browse(BrowseState),
@@ -218,7 +228,7 @@ pub enum Overlay {
 impl Overlay {
     pub fn name(&self) -> &'static str {
         match self {
-            Overlay::Help => "help",
+            Overlay::Search => "search",
             Overlay::Command(_) => "command",
             Overlay::Devices(_) => "devices",
             Overlay::Browse(_) => "browse",
@@ -227,7 +237,7 @@ impl Overlay {
 
     pub fn mask(&self) -> ModeMask {
         match self {
-            Overlay::Help => ModeMask::HELP,
+            Overlay::Search => ModeMask::SEARCH,
             Overlay::Command(_) => ModeMask::COMMAND,
             Overlay::Devices(_) => ModeMask::DEVICES,
             Overlay::Browse(_) => ModeMask::BROWSE,
@@ -241,6 +251,27 @@ pub fn mode_name(s: &AppState) -> &'static str {
     match &s.overlay {
         Some(ov) => ov.name(),
         None => s.tab.name(),
+    }
+}
+
+/// The upcoming tracks shown in "Up Next": the fetched queue with any entry
+/// matching the currently-playing track filtered out (the queue can lag a
+/// track behind after a skip). Single source of truth for the renderer and the
+/// Now Playing down-arrow clamp — they MUST agree on the count, or the
+/// selection can point at a row the renderer never draws.
+pub fn up_next_tracks(s: &AppState) -> Vec<&Track> {
+    let current_id = s
+        .playback
+        .as_ref()
+        .and_then(|p| p.item.as_ref())
+        .and_then(|t| t.id.as_deref());
+    match current_id {
+        None => Vec::new(),
+        Some(cur) => s
+            .queue
+            .iter()
+            .filter(|t| t.id.as_deref() != Some(cur))
+            .collect(),
     }
 }
 
@@ -264,10 +295,11 @@ pub fn active_mask(s: &AppState) -> ModeMask {
 }
 
 /// True when the focused surface is capturing typed characters, so the global
-/// launcher keys (`/ : ? d l tab`) must NOT steal them: the Search tab (no
-/// overlay) and the Command palette. Everywhere else those keys are live.
+/// launcher keys (`/ :`) must NOT steal them: the Search overlay and the
+/// Command palette. Everywhere else those keys are live and a bare letter
+/// opens search.
 pub fn is_capturing_text(s: &AppState) -> bool {
-    matches!(s.overlay, Some(Overlay::Command(_))) || (s.tab == Tab::Search && s.overlay.is_none())
+    matches!(s.overlay, Some(Overlay::Command(_)) | Some(Overlay::Search))
 }
 
 /// Album or playlist metadata, captured at the moment the user hit Enter
@@ -278,6 +310,10 @@ pub struct Collection {
     pub uri: String,
     pub name: String,
     pub subtitle: String,
+    /// Spotify user id of the playlist owner, when known (None for albums).
+    /// Compared to `AppState::me_id` to decide whether a tracks-endpoint 403
+    /// is on something the user owns.
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +340,14 @@ pub struct BrowseState {
     /// Monotonic id so a slow fetch that resolves after the user has
     /// already navigated away can be dropped instead of clobbering state.
     pub fetch_id: u64,
+    /// True when this collection is a playlist the current user owns
+    /// (`collection.owner_id == me_id`). Drives gentler 403 messaging — an
+    /// owned playlist that won't list is a known API quirk, not "locked."
+    pub owned: bool,
+    /// True when Browse was opened from the Search overlay (vs. a Library
+    /// row). On Esc we then reopen Search instead of dropping to the bare tab,
+    /// so the user lands back on their results.
+    pub from_search: bool,
 }
 
 /// One lazily-loaded list in the Library tab. `loaded` distinguishes "never
@@ -409,50 +453,71 @@ pub struct DevicesState {
 /// A discrete action runnable from the command menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
-    PlayPause,
+    Library,
+    Devices,
+    Like,
     Next,
     Previous,
-    Like,
-    Reconnect,
+    PlayPause,
     Search,
-    Help,
+    Reconnect,
     Quit,
 }
 
 impl Cmd {
     pub const ALL: &'static [Cmd] = &[
-        Cmd::PlayPause,
+        Cmd::Library,
+        Cmd::Devices,
+        Cmd::Like,
         Cmd::Next,
         Cmd::Previous,
-        Cmd::Like,
-        Cmd::Reconnect,
+        Cmd::PlayPause,
         Cmd::Search,
-        Cmd::Help,
+        Cmd::Reconnect,
         Cmd::Quit,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
-            Cmd::PlayPause => "play / pause",
+            Cmd::Library => "library",
+            Cmd::Devices => "devices",
+            Cmd::Like => "like",
             Cmd::Next => "next",
             Cmd::Previous => "previous",
-            Cmd::Like => "like",
-            Cmd::Reconnect => "reconnect",
+            Cmd::PlayPause => "play / pause",
             Cmd::Search => "search",
-            Cmd::Help => "help",
+            Cmd::Reconnect => "reconnect",
             Cmd::Quit => "quit",
+        }
+    }
+
+    /// The `:` accelerator — the short key sequence shown in the palette and
+    /// matched first when filtering, so `:l` reliably picks `library` even
+    /// though the letter 'l' appears in several command names.
+    pub fn accel(self) -> &'static str {
+        match self {
+            Cmd::Library => "l",
+            Cmd::Devices => "d",
+            Cmd::Like => "k",
+            Cmd::Next => "n",
+            Cmd::Previous => "p",
+            Cmd::PlayPause => "pp",
+            Cmd::Search => "s",
+            Cmd::Reconnect => "r",
+            Cmd::Quit => "q",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Cmd::PlayPause => "toggle playback on the current device",
+            Cmd::Library => "liked songs, playlists, albums",
+            Cmd::Devices => "pick the Connect device to play on",
+            Cmd::Like => "save the current track to Liked Songs",
             Cmd::Next => "skip to the next track",
             Cmd::Previous => "skip back (or restart current track)",
-            Cmd::Like => "save the current track to Liked Songs",
-            Cmd::Reconnect => "restart the 'hibias' Connect device",
+            Cmd::PlayPause => "toggle playback on the current device",
             Cmd::Search => "open the Spotify search overlay",
-            Cmd::Help => "show the hotkey help overlay",
+            Cmd::Reconnect => "restart the 'hibias' Connect device",
             Cmd::Quit => "exit hibias",
         }
     }
@@ -475,18 +540,36 @@ impl Default for CommandState {
 }
 
 impl CommandState {
-    /// Commands matching the current input (case-insensitive substring on
-    /// the name). With empty input, all commands are returned.
+    /// Commands matching the current input. With empty input, all commands
+    /// are returned in their canonical order. Otherwise we rank: an exact
+    /// accelerator match first (`l` → library), then an accelerator prefix,
+    /// then a name substring — so the obvious `:`-letter always lands on top.
     pub fn filtered(&self) -> Vec<Cmd> {
         if self.input.is_empty() {
             return Cmd::ALL.to_vec();
         }
         let q = self.input.to_lowercase();
-        Cmd::ALL
+        let mut ranked: Vec<(u8, usize, Cmd)> = Cmd::ALL
             .iter()
             .copied()
-            .filter(|c| c.name().to_lowercase().contains(&q))
-            .collect()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let accel = c.accel();
+                let rank = if accel == q {
+                    0
+                } else if accel.starts_with(&q) {
+                    1
+                } else if c.name().to_lowercase().contains(&q) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, i, c))
+            })
+            .collect();
+        // Stable within a rank by original order (the `i` tiebreak).
+        ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
+        ranked.into_iter().map(|(_, _, c)| c).collect()
     }
 
     pub fn selected_cmd(&self) -> Option<Cmd> {
@@ -746,9 +829,9 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) -> boo
 // Action handlers
 // ---------------------------------------------------------------------------
 
-/// Focus the Search tab. Search state is persistent, so we only reset and
-/// re-seed recents when the box is empty — tabbing away and back mid-query
-/// keeps the user's in-progress search intact.
+/// Open the Search overlay over the current tab. Search state is persistent,
+/// so we only reset and re-seed recents when the box is empty — dismissing and
+/// reopening mid-query keeps the user's in-progress search intact.
 pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
     let context_uri = {
         let s = state.lock().await;
@@ -762,8 +845,7 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
 
     let reseeded = {
         let mut s = state.lock().await;
-        s.tab = Tab::Search;
-        s.overlay = None;
+        s.overlay = Some(Overlay::Search);
         if s.search.input.is_empty() {
             let in_context = context_uri.as_ref().map(|uri| InContext {
                 playlist_uri: uri.clone(),
@@ -820,6 +902,36 @@ pub async fn enter_search(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSta
     }
 }
 
+/// Insert a typed character into the (already-open) search box and refilter
+/// the in-context tracks.
+pub async fn type_into_search(state: &Arc<Mutex<AppState>>, c: char) {
+    let mut s = state.lock().await;
+    let search = &mut s.search;
+    let byte = char_idx_to_byte(&search.input, search.cursor);
+    search.input.insert(byte, c);
+    search.cursor += 1;
+    refilter_in_context(search);
+}
+
+/// The "just start typing to search" entry point: a bare keystroke from a tab
+/// opens a FRESH search seeded with that char. (Unlike `/` / [`enter_search`],
+/// which reopens the persistent query where you left off — here a new letter
+/// means a new search, so we clear any stale query first.)
+pub async fn open_search_typing(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    c: char,
+) {
+    {
+        let mut s = state.lock().await;
+        s.search.input.clear();
+        s.search.cursor = 0;
+    }
+    enter_search(client, state).await;
+    type_into_search(state, c).await;
+    kick_search(client, state).await;
+}
+
 /// Open the Browse overlay for the given collection. Browse stacks on top of
 /// whatever tab the user was on (Search or Library); Esc just closes it,
 /// revealing that tab unchanged — no need to stash/restore search state, since
@@ -855,6 +967,11 @@ pub async fn enter_browse(
         if let Some(h) = s.search.debounce.take() {
             h.abort();
         }
+        let owned = match (&collection.owner_id, &s.me_id) {
+            (Some(owner), Some(me)) => owner == me,
+            _ => false,
+        };
+        let from_search = matches!(s.overlay, Some(Overlay::Search));
         s.overlay = Some(Overlay::Browse(BrowseState {
             collection: collection.clone(),
             tracks: Vec::new(),
@@ -862,6 +979,8 @@ pub async fn enter_browse(
             error: None,
             selected: 0,
             fetch_id,
+            owned,
+            from_search,
         }));
         fetch_id
     };
@@ -1984,7 +2103,11 @@ pub async fn refresh_queue(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSt
         match client.get_queue().await {
             Ok(queue) => {
                 log::note("refresh_queue", Some(&format!("len={}", queue.len())));
-                state.lock().await.queue = queue;
+                let mut s = state.lock().await;
+                s.queue = queue;
+                // The list just changed under the user — reset the cursor to
+                // the top so it never dangles past the new end.
+                s.up_next_selected = 0;
             }
             Err(e) => log::note("refresh_queue failed", Some(&format!("{e:#}"))),
         }

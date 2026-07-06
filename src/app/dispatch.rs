@@ -11,6 +11,10 @@ pub enum KeyAction {
     Quit,
     TogglePlayback,
     EnterSearch,
+    /// Open the Search overlay (if not already) and feed it this typed
+    /// character — the "just start typing to search" entry point. The run
+    /// loop seeds context, inserts the char, then kicks the search.
+    OpenSearchTyping(char),
     SearchInputChanged,
     PlaySelection,
     /// Open the Browse mode loaded with the given album or playlist.
@@ -69,38 +73,38 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
         return tab_entry_action(s.tab);
     }
 
-    // 1. Global launcher keys. These fire regardless of which tab/overlay is
-    //    active, EXCEPT when a text field is capturing characters (Search tab,
-    //    Command palette) — there, the printable `/ : ? d l` are literal input.
+    // 1. Reserved launcher symbols. They fire regardless of tab/overlay,
+    //    EXCEPT when a text field is capturing characters (Search overlay,
+    //    Command palette) — there `/` and `:` are literal input. `?` opens the
+    //    same `:` palette (it doubles as the help/cheat-sheet).
     if !is_capturing_text(&s) {
         match input.key {
             Key::Char('/') => {
-                s.overlay = None;
                 s.focus = Focus::Content;
                 return KeyAction::EnterSearch;
             }
-            Key::Char(':') => {
+            Key::Char(':') | Key::Char('?') => {
                 s.overlay = Some(Overlay::Command(CommandState::default()));
                 return KeyAction::Stay;
-            }
-            Key::Char('?') => {
-                s.overlay = Some(Overlay::Help);
-                return KeyAction::Stay;
-            }
-            Key::Char('d') => {
-                return KeyAction::OpenDevices;
-            }
-            Key::Char('l') => {
-                s.tab = Tab::Library;
-                s.overlay = None;
-                s.focus = Focus::Content;
-                return KeyAction::OpenLibrary;
             }
             _ => {}
         }
     }
 
-    // 2. An open overlay consumes everything else.
+    // 2. Type-to-search: with no overlay open, any printable character that
+    //    isn't a reserved launcher (handled above) or a player control opens
+    //    the Search overlay seeded with that char. Space is excluded so it
+    //    stays a play/pause control on Now Playing; you never start a query
+    //    with a leading space anyway.
+    if s.overlay.is_none() {
+        if let Key::Char(c) = input.key {
+            if c != ' ' {
+                return KeyAction::OpenSearchTyping(c);
+            }
+        }
+    }
+
+    // 3. An open overlay consumes everything else.
     if s.overlay.is_some() {
         return dispatch_overlay(&mut s, input);
     }
@@ -111,10 +115,9 @@ pub async fn dispatch_input(input: Input, state: &Mutex<AppState>) -> KeyAction 
         return dispatch_tabs_focus(&mut s, input);
     }
 
-    // 3. The active tab handles the rest.
+    // 4. The active tab handles the rest.
     match s.tab {
         Tab::NowPlaying => dispatch_now_playing(&mut s, input, shift),
-        Tab::Search => dispatch_search(&mut s, input),
         Tab::Library => dispatch_library(&mut s, input),
     }
 }
@@ -144,29 +147,44 @@ fn dispatch_tabs_focus(s: &mut AppState, input: Input) -> KeyAction {
     }
 }
 
-/// What to do right after landing on a tab via `tab`/`shift+tab`: Search
-/// re-seeds recents, Library lazy-loads its sub-tab, Now Playing is inert.
+/// What to do right after landing on a tab via `tab`/`shift+tab`: Library
+/// lazy-loads its sub-tab, Now Playing is inert.
 fn tab_entry_action(tab: Tab) -> KeyAction {
     match tab {
         // Now Playing's queue refresh is driven by the run loop's
         // visibility transition (see `now_playing_visible`), not an action.
         Tab::NowPlaying => KeyAction::Stay,
-        Tab::Search => KeyAction::EnterSearch,
         Tab::Library => KeyAction::OpenLibrary,
     }
 }
 
 fn dispatch_now_playing(s: &mut AppState, input: Input, shift: bool) -> KeyAction {
     match input.key {
-        Key::Char('q') | Key::Esc => KeyAction::Quit,
         Key::Char(' ') => KeyAction::TogglePlayback,
+        // Shift+arrows seek within the track; bare arrows skip tracks.
         Key::Left if shift => KeyAction::Seek(-SEEK_STEP_MS),
         Key::Right if shift => KeyAction::Seek(SEEK_STEP_MS),
-        // Now Playing has no list, so Up always rises to the tab strip.
+        Key::Left => KeyAction::PrevTrack,
+        Key::Right => KeyAction::NextTrack,
+        // Up/Down walk the "Up Next" queue; Up past the first row rises to the
+        // tab strip (as on the other list surfaces).
         Key::Up => {
-            s.focus = Focus::Tabs;
+            if s.up_next_selected > 0 {
+                s.up_next_selected -= 1;
+            } else {
+                s.focus = Focus::Tabs;
+            }
             KeyAction::Stay
         }
+        Key::Down => {
+            let max = up_next_tracks(s).len().saturating_sub(1);
+            if s.up_next_selected < max {
+                s.up_next_selected += 1;
+            }
+            KeyAction::Stay
+        }
+        // Esc on the bare Now Playing screen is a no-op now — quitting is
+        // `:q` or ctrl-c, so a stray Esc can't drop you out of the app.
         _ => KeyAction::Stay,
     }
 }
@@ -178,16 +196,14 @@ fn dispatch_search(s: &mut AppState, input: Input) -> KeyAction {
             if let Some(h) = search.debounce.take() {
                 h.abort();
             }
-            s.tab = Tab::NowPlaying;
+            // Dismiss the overlay, revealing the tab underneath unchanged.
+            s.overlay = None;
             KeyAction::Stay
         }
         Key::Up => {
-            if search.selected > 0 {
-                search.selected -= 1;
-            } else {
-                // Above the first result — rise to the tab strip.
-                s.focus = Focus::Tabs;
-            }
+            // The Search overlay floats over the tab strip, so there's nothing
+            // above the first row to rise to — just clamp at the top.
+            search.selected = search.selected.saturating_sub(1);
             KeyAction::Stay
         }
         Key::Down => {
@@ -216,6 +232,12 @@ fn dispatch_search(s: &mut AppState, input: Input) -> KeyAction {
                 refilter_in_context(search);
                 KeyAction::SearchInputChanged
             } else {
+                // Backspacing past an empty query dismisses the overlay — the
+                // mirror of typing a char to open it.
+                if let Some(h) = search.debounce.take() {
+                    h.abort();
+                }
+                s.overlay = None;
                 KeyAction::Stay
             }
         }
@@ -304,6 +326,7 @@ fn library_enter_action(lib: &LibraryState) -> KeyAction {
                     .as_ref()
                     .and_then(|o| o.display_name.clone())
                     .unwrap_or_default(),
+                owner_id: p.owner.as_ref().and_then(|o| o.id.clone()),
             }),
             None => KeyAction::Stay,
         },
@@ -319,6 +342,7 @@ fn library_enter_action(lib: &LibraryState) -> KeyAction {
                         .map(|x| x.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
+                    owner_id: None,
                 }),
                 None => KeyAction::Stay,
             },
@@ -331,13 +355,12 @@ fn library_enter_action(lib: &LibraryState) -> KeyAction {
 }
 
 fn dispatch_overlay(s: &mut AppState, input: Input) -> KeyAction {
+    // The Search overlay is a text field — route it to the search dispatcher,
+    // which already owns the input/selection/dismiss logic.
+    if matches!(s.overlay, Some(Overlay::Search)) {
+        return dispatch_search(s, input);
+    }
     match s.overlay.as_mut() {
-        Some(Overlay::Help) => {
-            if matches!(input.key, Key::Esc | Key::Char('?') | Key::Char('q')) {
-                s.overlay = None;
-            }
-            KeyAction::Stay
-        }
         Some(Overlay::Command(_)) => dispatch_command(s, input),
         Some(Overlay::Devices(dev)) => match input.key {
             Key::Esc => {
@@ -365,7 +388,14 @@ fn dispatch_overlay(s: &mut AppState, input: Input) -> KeyAction {
         },
         Some(Overlay::Browse(browse)) => match input.key {
             Key::Esc => {
-                s.overlay = None;
+                // Reopened from Search → land back on the results; from a
+                // Library row → drop to the bare tab.
+                let back = if browse.from_search {
+                    Some(Overlay::Search)
+                } else {
+                    None
+                };
+                s.overlay = back;
                 KeyAction::Stay
             }
             Key::Up => {
@@ -393,7 +423,9 @@ fn dispatch_overlay(s: &mut AppState, input: Input) -> KeyAction {
             Key::Char('p') => KeyAction::PlayBrowseCollection,
             _ => KeyAction::Stay,
         },
-        None => KeyAction::Stay,
+        // Search is handled by the early return above; None is the no-overlay
+        // case. Both fall through to a no-op.
+        Some(Overlay::Search) | None => KeyAction::Stay,
     }
 }
 
@@ -452,20 +484,17 @@ fn dispatch_command(s: &mut AppState, input: Input) -> KeyAction {
             let Some(chosen) = cmd.selected_cmd() else {
                 return KeyAction::Stay;
             };
-            // Most commands close the palette first, then the run loop runs
-            // the action. Help re-opens as an overlay instead.
+            // Close the palette first, then the run loop runs the action.
             s.overlay = None;
             match chosen {
-                Cmd::PlayPause => KeyAction::TogglePlayback,
+                Cmd::Library => KeyAction::OpenLibrary,
+                Cmd::Devices => KeyAction::OpenDevices,
+                Cmd::Like => KeyAction::LikeCurrent,
                 Cmd::Next => KeyAction::NextTrack,
                 Cmd::Previous => KeyAction::PrevTrack,
-                Cmd::Like => KeyAction::LikeCurrent,
-                Cmd::Reconnect => KeyAction::Reconnect,
+                Cmd::PlayPause => KeyAction::TogglePlayback,
                 Cmd::Search => KeyAction::EnterSearch,
-                Cmd::Help => {
-                    s.overlay = Some(Overlay::Help);
-                    KeyAction::Stay
-                }
+                Cmd::Reconnect => KeyAction::Reconnect,
                 Cmd::Quit => KeyAction::Quit,
             }
         }
@@ -572,6 +601,7 @@ pub fn resolve_collection_to_browse(s: &SearchState) -> Option<Collection> {
             } else {
                 format!("album · {subtitle}")
             },
+            owner_id: None,
         });
     }
     idx -= s.results.albums.len();
@@ -598,6 +628,7 @@ pub fn resolve_collection_to_browse(s: &SearchState) -> Option<Collection> {
             } else {
                 format!("playlist · {owner}")
             },
+            owner_id: p.owner.as_ref().and_then(|o| o.id.clone()),
         });
     }
     None

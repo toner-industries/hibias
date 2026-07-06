@@ -77,6 +77,7 @@ struct FakeState {
     saved_playlists: Option<Result<Vec<Playlist>, String>>,
     saved_albums: Option<Result<Vec<Album>, String>>,
     followed_artists: Option<Result<Vec<Artist>, String>>,
+    current_user: Option<Result<String, String>>,
     /// Each `play()` pops the front; if empty, defaults to Ok(()).
     play_returns: Vec<Result<(), String>>,
     pause_returns: Vec<Result<(), String>>,
@@ -175,6 +176,10 @@ impl FakeSpotify {
 
     pub fn set_followed_artists(&self, r: Result<Vec<Artist>, String>) {
         self.with(|s| s.followed_artists = Some(r));
+    }
+
+    pub fn set_current_user(&self, r: Result<String, String>) {
+        self.with(|s| s.current_user = Some(r));
     }
 
     pub fn queue_play(&self, r: Result<(), String>) {
@@ -387,6 +392,14 @@ impl SpotifyApi for FakeSpotify {
             None => Ok(Vec::new()),
         }
     }
+
+    async fn get_current_user(&self) -> Result<String> {
+        match self.with(|s| s.current_user.clone()) {
+            Some(Ok(id)) => Ok(id),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(String::new()),
+        }
+    }
 }
 
 /// Headless test harness — owns an AppState and a programmable FakeSpotify,
@@ -457,6 +470,9 @@ impl Harness {
                 // on the higher-level state machine instead.
             }
             KeyAction::EnterSearch => enter_search(&self.client, &self.state).await,
+            KeyAction::OpenSearchTyping(c) => {
+                crate::app::open_search_typing(&self.client, &self.state, c).await;
+            }
             KeyAction::SearchInputChanged => kick_search(&self.client, &self.state).await,
             KeyAction::PlaySelection => play_selection(&self.client, &self.state).await,
             KeyAction::OpenBrowse(c) => enter_browse(&self.client, &self.state, c).await,
@@ -483,6 +499,17 @@ impl Harness {
     pub async fn press_and_run(&self, key: Key) {
         let action = self.press(key).await;
         self.run(action).await;
+    }
+
+    /// Enter the Library tab the way the `:l` palette command does (bare `l`
+    /// now types into search, so tests can't use it as a launcher).
+    pub async fn open_library(&self) {
+        self.run(KeyAction::OpenLibrary).await;
+    }
+
+    /// Open the device picker the way the `:d` palette command does.
+    pub async fn open_devices(&self) {
+        self.run(KeyAction::OpenDevices).await;
     }
 
     /// Force-apply a `Playback` to the state, bypassing `should_accept`. Used

@@ -77,7 +77,6 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
     render_tab_strip(f, rows[0], state.tab, tabs_focused);
     match state.tab {
         Tab::NowPlaying => render_now_playing_body(f, rows[1], state, art),
-        Tab::Search => render_search_tab(f, rows[1], &state.search),
         Tab::Library => render_library_tab(f, rows[1], &state.library),
     }
     if let Some((text, color)) = status {
@@ -106,11 +105,25 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
     // Transient overlays draw on top of the whole canvas.
     match &state.overlay {
         None => {}
-        Some(Overlay::Help) => render_help_overlay(f, area),
+        Some(Overlay::Search) => render_search_overlay(f, area, &state.search),
         Some(Overlay::Command(cmd)) => render_command_overlay(f, area, cmd),
         Some(Overlay::Devices(dev)) => render_devices_overlay(f, area, dev),
         Some(Overlay::Browse(browse)) => render_browse_overlay(f, area, browse),
     }
+}
+
+/// The Search overlay: the existing search body (input + results/recents)
+/// inside a bordered box floating over whatever tab is underneath. Summoned by
+/// typing or `/`, dismissed with Esc.
+fn render_search_overlay(f: &mut Frame, area: Rect, search: &SearchState) {
+    let rect = centered(area, 84, 92);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" search (`/`) ")
+        .borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    render_search_tab(f, inner, search);
 }
 
 /// The top "Now Playing | Search | Library" strip. The active tab is cyan and
@@ -178,32 +191,27 @@ fn render_now_playing_body(f: &mut Frame, area: Rect, state: &mut AppState, art:
     render_progress(f, rows[2], rows[3], state);
 }
 
-/// "Up Next": a compact peek at the upcoming queue, shown in the gap between
-/// the now-playing header and the progress bar. The data is fetched on demand
-/// (see [`crate::app::refresh_queue`]) so it can be briefly stale; empty when
-/// nothing is queued or nothing is playing.
+/// "Up Next": the upcoming queue shown between the now-playing header and the
+/// progress bar. Fills the available height (scrolling when there are more
+/// tracks than fit) and highlights the row the user has arrowed to. The data
+/// is fetched on demand (see [`crate::app::refresh_queue`]) so it can be
+/// briefly stale; empty when nothing is queued or nothing is playing.
 fn render_up_next(f: &mut Frame, area: Rect, state: &AppState) {
-    // Only meaningful alongside a current track. Without one the queue is
-    // empty and Now Playing shows its placeholder instead.
-    let current_id = state
-        .playback
-        .as_ref()
-        .and_then(|p| p.item.as_ref())
-        .and_then(|t| t.id.as_deref());
-    if current_id.is_none() || area.height < 2 {
+    // Header is a blank line + the "Up Next" label; the rest scrolls.
+    if area.height < 3 {
         return;
     }
-    // Skip a stale leading entry that's actually the track now playing — the
-    // fetched queue can lag a track behind until it's re-fetched.
-    let upcoming: Vec<_> = state
-        .queue
-        .iter()
-        .filter(|t| t.id.as_deref() != current_id)
-        .take(5)
-        .collect();
+    let upcoming = crate::app::up_next_tracks(state);
     if upcoming.is_empty() {
         return;
     }
+    let capacity = area.height.saturating_sub(2) as usize;
+    let selected = state.up_next_selected.min(upcoming.len().saturating_sub(1));
+    let scroll = compute_scroll(selected, upcoming.len(), capacity);
+    let end = (scroll + capacity).min(upcoming.len());
+    // Only draw the selection while the content is focused — when the user has
+    // arrowed up onto the tab strip, that pill is the highlighted thing.
+    let show_selection = state.focus == Focus::Content;
 
     let mut lines = vec![
         Line::from(""),
@@ -214,22 +222,36 @@ fn render_up_next(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-    for (i, t) in upcoming.iter().enumerate() {
+    for idx in scroll..end {
+        let t = upcoming[idx];
         let artists = t
             .artists
             .iter()
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let label = if artists.is_empty() {
+        let desc = if artists.is_empty() {
             t.name.clone()
         } else {
             format!("{} — {artists}", t.name)
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{}. ", i + 1), Style::default().fg(Color::DarkGray)),
-            Span::raw(label),
-        ]));
+        // Absolute position so the numbering stays stable as the list scrolls.
+        if show_selection && idx == selected {
+            lines.push(Line::from(Span::styled(
+                format!("{}. {desc}", idx + 1),
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}. ", idx + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(desc),
+            ]));
+        }
     }
     // No wrap: long rows truncate at the canvas width rather than reflowing,
     // and any lines past the available height clip cleanly.
@@ -757,16 +779,33 @@ fn styled_row(label: String, selected: bool) -> Line<'static> {
     }
 }
 
+/// The major bare keys, shown as a static cheat-sheet at the foot of the
+/// command palette — this is how the old help overlay's reference folds into
+/// the single `:` surface.
+const KEY_CHEATSHEET: &[(&str, &str)] = &[
+    ("space", "play / pause"),
+    ("←/→", "prev / next track"),
+    ("shift ←/→", "seek ±10s"),
+    ("↑/↓", "move"),
+    ("enter", "play / open"),
+    ("tab", "switch tab"),
+    ("type", "search"),
+    ("esc", "back"),
+    ("ctrl-c", "quit"),
+];
+
 fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
     let filtered = cmd.filtered();
-    // Height: title + input + hint + a row per command, capped by viewport.
-    let desired = 4 + filtered.len() as u16;
+    let cheat_h = KEY_CHEATSHEET.len() as u16 + 1; // blank separator + rows
+    // Height: title + input + hint + a row per command + the key cheat-sheet,
+    // capped by viewport.
+    let desired = 4 + filtered.len() as u16 + cheat_h;
     let height = desired.min(area.height.saturating_sub(2));
     let width = 64u16.min(area.width.saturating_sub(2));
     let rect = centered_exact(area, width, height);
     f.render_widget(Clear, rect);
     let block = Block::default()
-        .title(" command (`:`) ")
+        .title(" menu (`:`) — type to filter · enter to run ")
         .borders(Borders::ALL);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -774,9 +813,10 @@ fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // input
-            Constraint::Length(1), // hint
-            Constraint::Min(0),    // list
+            Constraint::Length(1),       // input
+            Constraint::Length(1),       // hint
+            Constraint::Min(0),          // command list
+            Constraint::Length(cheat_h), // key cheat-sheet
         ])
         .split(inner);
 
@@ -819,7 +859,8 @@ fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let label = format!("  {:<12}  {}", c.name(), c.description());
+            let accel = format!(":{}", c.accel());
+            let label = format!("  {accel:<6}{:<12}  {}", c.name(), c.description());
             if i == cmd.selected {
                 Line::from(Span::styled(
                     label,
@@ -833,6 +874,20 @@ fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), layout[2]);
+
+    // Static key cheat-sheet — the old help overlay, folded in.
+    let mut cheat = vec![Line::from(Span::styled(
+        "  keys",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (key, action) in KEY_CHEATSHEET {
+        cheat.push(Line::from(vec![
+            Span::styled(format!("  {key:<10}"), Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(*action, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(cheat), layout[3]);
 }
 
 fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
@@ -870,13 +925,23 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
         // [p] play / [esc] back are already in the mode's footer, no need
         // to repeat them in the hint and crowd out the actual message.
         if is_browse_forbidden(e) {
-            (
-                format!(
-                    "⚠ Spotify locked this {} (API) — [p] plays anyway",
-                    browse.collection.kind.label()
-                ),
-                Color::Yellow,
-            )
+            // An owned playlist that won't list is a known Spotify API quirk,
+            // not "locked" — so we don't cry wolf on the user's own playlists.
+            // A followed/editorial one genuinely is gated to the app.
+            if browse.owned {
+                (
+                    "Spotify's API won't list these tracks — [p] plays anyway".to_string(),
+                    Color::DarkGray,
+                )
+            } else {
+                (
+                    format!(
+                        "⚠ Spotify locked this {} (API) — [p] plays anyway",
+                        browse.collection.kind.label()
+                    ),
+                    Color::Yellow,
+                )
+            }
         } else {
             let short = truncate_for_hint(e, 50);
             (format!("error: {short}"), Color::Red)
@@ -932,9 +997,10 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
 }
 
 /// Heuristic: was this Browse fetch error a Spotify access restriction?
-/// In late 2024 Spotify locked down /playlists/{id}/tracks (and several
-/// other browse endpoints) to apps created before the change; everyone
-/// else gets a 403. We surface this with a different, less alarming hint.
+/// In late 2024 Spotify hard-403'd /playlists/{id}/tracks (and several other
+/// browse endpoints) for apps without extended quota — verified live that it
+/// fails even for the user's own playlists. We surface this with a hint that's
+/// gentle for owned playlists and a sharper warning otherwise.
 fn is_browse_forbidden(e: &str) -> bool {
     e.contains("403 Forbidden")
         || e.contains("\"status\": 403")
@@ -952,39 +1018,6 @@ fn compute_scroll(selected: usize, total: usize, list_h: usize) -> usize {
     let half = list_h / 2;
     let max_scroll = total - list_h;
     selected.saturating_sub(half).min(max_scroll)
-}
-
-fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let rows = keys::HELP_ROWS;
-    let height = (rows.len() as u16 + 4).min(area.height);
-    let width = 44u16.min(area.width.saturating_sub(2));
-    let rect = centered_exact(area, width, height);
-    f.render_widget(Clear, rect);
-    let block = Block::default().title(" help ").borders(Borders::ALL);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Hotkeys",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-    ];
-    for (key, action) in rows {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {key:<10}"), Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::raw(*action),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  esc or ? to close",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The Library tab: a sub-tab strip (Liked / Playlists / Albums / Artists)

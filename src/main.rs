@@ -127,6 +127,18 @@ async fn hibias_main() -> Result<()> {
 
 fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
+        // Identify the current user once, so Browse can tell an owned playlist
+        // from a followed/editorial one when the tracks endpoint 403s. Best
+        // effort — a failure just means we fall back to the generic warning.
+        match client.get_current_user().await {
+            Ok(id) if !id.is_empty() => {
+                log::note("current user loaded", Some(&id));
+                state.lock().await.me_id = Some(id);
+            }
+            Ok(_) => {}
+            Err(e) => log::note("current user unavailable", Some(&format!("{e:#}"))),
+        }
+
         // The authoritative current player state comes first. If a track is
         // already playing (or paused) on the account, seed from it so its real
         // position shows on the very first paint. Otherwise we'd display the
@@ -373,6 +385,9 @@ async fn run(
                             app::transfer_to_device(&client, &state, id).await
                         }
                         KeyAction::EnterSearch => app::enter_search(&client, &state).await,
+                        KeyAction::OpenSearchTyping(c) => {
+                            app::open_search_typing(&client, &state, c).await;
+                        }
                         KeyAction::OpenBrowse(coll) => app::enter_browse(&client, &state, coll).await,
                         KeyAction::PlayBrowseSelection => {
                             play_browse_selection(&client, &state).await;

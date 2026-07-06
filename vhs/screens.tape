@@ -7,9 +7,14 @@
 # No Spotify, no auth, no rate limits — every screen is served from the cassette.
 #
 # Navigation notes (learned the hard way, verified against hibias.log.sqlite):
-#   - Esc on Now Playing QUITS — only Esc to close a known-open overlay.
-#   - Tab is global: switches top tab and closes any open overlay.
-#   - `/` `d` `?` are global only when NOT typing in the search box.
+#   - Esc on Now Playing is a NO-OP now; quit is `:q` or Ctrl+C. Esc only
+#     closes a known-open overlay.
+#   - Just start typing to search — a bare letter opens the Search overlay.
+#     So `l`/`d`/`q` are NOT shortcuts anymore; commands live behind `:`
+#     (`:l` library, `:d` devices, `:q` quit). `?` is an alias for `:`.
+#   - Tab is global: cycles the two top tabs (Now Playing / Library) and
+#     closes any open overlay.
+#   - `/` `:` `?` are global only when NOT typing in the search box.
 #   - Always `Sleep` AFTER a `Screenshot`: VHS captures the frame lazily, so a
 #     keypress immediately after a screenshot races it and you capture stale.
 
@@ -46,18 +51,22 @@ Sleep 1s
 Screenshot scratch/vhs/04-library.png
 Sleep 1s
 
-# --- Devices overlay (cassette has a recorded device list) --------------
+# --- Devices overlay (via the `:` menu: `:d` then Enter) ----------------
+Type ":"
+Sleep 500ms
 Type "d"
+Sleep 500ms
+Enter
 Sleep 1s
 Screenshot scratch/vhs/05-devices.png
 Sleep 1s
 Escape
 Sleep 1s
 
-# --- Help overlay -------------------------------------------------------
+# --- Menu / help palette (`?` is an alias for `:`) ----------------------
 Type "?"
 Sleep 1s
-Screenshot scratch/vhs/06-help.png
+Screenshot scratch/vhs/06-menu.png
 Sleep 1s
 Escape
 Sleep 1s

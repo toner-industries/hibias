@@ -456,6 +456,7 @@ fn resolve_playlist_row_returns_browse_action() {
             name: "Mix".into(),
             owner: Some(crate::api::PlaylistOwner {
                 display_name: Some("alice".into()),
+                id: None,
             }),
         }],
         ..Default::default()
@@ -585,6 +586,9 @@ fn dummy_playlist(uri: &str, name: &str, owner: &str) -> Playlist {
         name: name.into(),
         owner: Some(crate::api::PlaylistOwner {
             display_name: Some(owner.into()),
+            // The owner string doubles as the owner id so tests can exercise
+            // ownership by setting `me_id` to the same value.
+            id: Some(owner.into()),
         }),
     }
 }
@@ -1054,9 +1058,8 @@ async fn search_with_zero_matches_says_no_results() {
 #[tokio::test]
 async fn tab_key_cycles_top_tabs() {
     let h = Harness::new();
+    // Two tabs now — Search left the strip and became a typed overlay.
     assert_eq!(h.mode_name().await, "now_playing");
-    h.press_and_run(Key::Tab).await;
-    assert_eq!(h.mode_name().await, "search");
     h.press_and_run(Key::Tab).await;
     assert_eq!(h.mode_name().await, "library");
     h.press_and_run(Key::Tab).await;
@@ -1075,31 +1078,31 @@ async fn tab_key_cycles_top_tabs() {
 }
 
 #[tokio::test]
-async fn d_opens_devices_on_now_playing_but_types_into_search() {
+async fn typing_opens_search_and_devices_live_in_the_palette() {
     let h = Harness::new();
-    // On Now Playing, 'd' is the global device-picker launcher.
-    let action = h.press(Key::Char('d')).await;
-    assert!(matches!(action, KeyAction::OpenDevices), "got {action:?}");
-
-    // In the Search tab, 'd' is literal text — never opens devices.
-    h.press_and_run(Key::Char('/')).await;
-    assert_eq!(h.mode_name().await, "search");
+    // On Now Playing, a bare letter opens the Search overlay seeded with it.
     let action = h.press(Key::Char('d')).await;
     assert!(
-        matches!(action, KeyAction::SearchInputChanged),
+        matches!(action, KeyAction::OpenSearchTyping('d')),
         "got {action:?}"
     );
-    let s = h.state.lock().await;
-    assert_eq!(s.search.input, "d");
+    h.run(action).await;
+    assert_eq!(h.mode_name().await, "search");
+    assert_eq!(h.state.lock().await.search.input, "d");
+
+    // Devices now live behind the `:` palette. Close search, open the menu,
+    // type the accelerator 'd', and Enter runs OpenDevices.
+    h.press_and_run(Key::Esc).await;
+    h.press_and_run(Key::Char(':')).await;
+    assert_eq!(h.mode_name().await, "command");
+    h.press_and_run(Key::Char('d')).await; // filter -> devices on top
+    let action = h.press(Key::Enter).await;
+    assert!(matches!(action, KeyAction::OpenDevices), "got {action:?}");
 }
 
 #[tokio::test]
 async fn esc_closes_overlay_without_changing_tab() {
     let h = Harness::new();
-    h.press_and_run(Key::Tab).await; // -> Search tab
-    assert_eq!(h.mode_name().await, "search");
-    // Open the command palette (overlay) from the search tab... but search
-    // captures ':' as text, so switch to Library where ':' is global.
     h.press_and_run(Key::Tab).await; // -> Library
     assert_eq!(h.mode_name().await, "library");
     h.press_and_run(Key::Char(':')).await; // command overlay
@@ -1109,6 +1112,197 @@ async fn esc_closes_overlay_without_changing_tab() {
         h.mode_name().await,
         "library",
         "esc should reveal the tab, not jump home"
+    );
+}
+
+// --- Type-to-search / colon keymap ---------------------------------
+
+#[tokio::test]
+async fn typing_a_letter_opens_the_search_overlay() {
+    let h = Harness::new();
+    let action = h.press(Key::Char('r')).await;
+    assert!(
+        matches!(action, KeyAction::OpenSearchTyping('r')),
+        "a bare letter should open search, got {action:?}"
+    );
+    h.run(action).await;
+    assert_eq!(h.mode_name().await, "search");
+    assert_eq!(h.state.lock().await.search.input, "r");
+}
+
+#[tokio::test]
+async fn typing_starts_a_fresh_query_but_slash_reopens_the_old_one() {
+    let h = Harness::new();
+    // Search for something, then dismiss — the query persists in state.
+    h.press_and_run(Key::Char('/')).await;
+    h.type_str("beatles").await;
+    h.settle().await;
+    h.press_and_run(Key::Esc).await;
+    assert_eq!(h.mode_name().await, "now_playing");
+
+    // `/` reopens the persistent query exactly where you left off.
+    h.press_and_run(Key::Char('/')).await;
+    assert_eq!(h.state.lock().await.search.input, "beatles");
+    h.press_and_run(Key::Esc).await;
+
+    // But just *typing* starts a brand-new search — not "beatlesr".
+    h.press_and_run(Key::Char('r')).await;
+    assert_eq!(h.state.lock().await.search.input, "r");
+}
+
+#[tokio::test]
+async fn space_toggles_playback_and_never_opens_search() {
+    let h = Harness::new();
+    let action = h.press(Key::Char(' ')).await;
+    assert!(
+        matches!(action, KeyAction::TogglePlayback),
+        "space stays a player control, got {action:?}"
+    );
+    assert_eq!(h.mode_name().await, "now_playing");
+}
+
+#[tokio::test]
+async fn bare_arrows_skip_tracks_on_now_playing() {
+    let h = Harness::new();
+    assert!(matches!(h.press(Key::Left).await, KeyAction::PrevTrack));
+    assert!(matches!(h.press(Key::Right).await, KeyAction::NextTrack));
+    // Shift still seeks rather than skipping.
+    let shift = crate::input::Mods {
+        shift: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        h.press_with_mods(Key::Right, shift).await,
+        KeyAction::Seek(_)
+    ));
+}
+
+#[tokio::test]
+async fn up_next_arrows_navigate_the_queue_then_rise_to_tabs() {
+    let h = Harness::new();
+    h.seed_playback(Playback {
+        is_playing: true,
+        progress_ms: Some(0),
+        item: Some(track("spotify:track:cur", "Current")),
+        context: None,
+        timestamp: Some(now_unix_ms()),
+        device: None,
+    })
+    .await;
+    {
+        let mut s = h.state.lock().await;
+        s.boot = false;
+        s.queue = (0..6)
+            .map(|i| track(&format!("spotify:track:n{i}"), &format!("Next {i}")))
+            .collect();
+    }
+    // Down walks down the Up Next list.
+    h.press_and_run(Key::Down).await;
+    h.press_and_run(Key::Down).await;
+    assert_eq!(h.state.lock().await.up_next_selected, 2);
+    // Down stops at the last row (6 upcoming tracks -> max index 5).
+    for _ in 0..10 {
+        h.press_and_run(Key::Down).await;
+    }
+    assert_eq!(h.state.lock().await.up_next_selected, 5);
+    // Up walks back; Up at the top rises to the tab strip.
+    h.press_and_run(Key::Up).await;
+    assert_eq!(h.state.lock().await.up_next_selected, 4);
+    for _ in 0..4 {
+        h.press_and_run(Key::Up).await;
+    }
+    {
+        let s = h.state.lock().await;
+        assert_eq!(s.up_next_selected, 0);
+        assert_eq!(s.focus, Focus::Content, "still in content at the top row");
+    }
+    h.press_and_run(Key::Up).await;
+    assert_eq!(h.state.lock().await.focus, Focus::Tabs, "Up past row 0 -> strip");
+}
+
+#[tokio::test]
+async fn up_next_shows_more_than_the_old_five_cap() {
+    let h = Harness::new();
+    h.seed_playback(Playback {
+        is_playing: true,
+        progress_ms: Some(0),
+        item: Some(track("spotify:track:cur", "Current")),
+        context: None,
+        timestamp: Some(now_unix_ms()),
+        device: None,
+    })
+    .await;
+    {
+        let mut s = h.state.lock().await;
+        s.boot = false;
+        s.device_name = Some("hibias".into());
+        s.queue = (0..15)
+            .map(|i| track(&format!("spotify:track:n{i}"), &format!("Next {i}")))
+            .collect();
+    }
+    let screen = h.snapshot_sized(96, 40).await;
+    // The body's Up Next region fits well over five rows on the fixed canvas.
+    assert!(screen.contains("Next 0") && screen.contains("Next 9"), "fills the height, got:\n{screen}");
+}
+
+#[tokio::test]
+async fn esc_on_now_playing_is_a_no_op_not_quit() {
+    let h = Harness::new();
+    let action = h.press(Key::Esc).await;
+    assert!(
+        matches!(action, KeyAction::Stay),
+        "esc must not quit Now Playing, got {action:?}"
+    );
+    assert_eq!(h.mode_name().await, "now_playing");
+}
+
+#[tokio::test]
+async fn colon_l_runs_library_from_the_palette() {
+    let h = Harness::new();
+    h.fake.set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
+    h.press_and_run(Key::Char(':')).await;
+    h.press_and_run(Key::Char('l')).await; // accelerator 'l' -> library on top
+    let action = h.press(Key::Enter).await;
+    assert!(matches!(action, KeyAction::OpenLibrary), "got {action:?}");
+    h.run(action).await;
+    h.settle().await;
+    assert_eq!(h.mode_name().await, "library");
+}
+
+#[tokio::test]
+async fn owned_playlist_403_gets_a_gentle_message() {
+    let h = Harness::new();
+    h.state.lock().await.me_id = Some("me".into());
+    h.fake.set_saved_playlists(Ok(vec![dummy_playlist(
+        "spotify:playlist:mine",
+        "My Mix",
+        "me",
+    )]));
+    h.fake.set_playlist_tracks(
+        "mine",
+        Err("GET /v1/playlists/mine/tracks: 403 Forbidden".into()),
+    );
+    h.open_library().await;
+    h.press_and_run(Key::Right).await; // -> Playlists
+    h.settle().await;
+    h.press_and_run(Key::Enter).await; // open Browse
+    h.settle().await;
+    {
+        let s = h.state.lock().await;
+        let Some(Overlay::Browse(b)) = &s.overlay else {
+            panic!("expected browse overlay")
+        };
+        assert!(b.owned, "playlist owned by me_id should be marked owned");
+        assert!(b.error.is_some(), "the 403 should be recorded");
+    }
+    let screen = h.snapshot_sized(96, 40).await;
+    assert!(
+        screen.contains("won't list"),
+        "owned playlist gets the gentle message, got:\n{screen}"
+    );
+    assert!(
+        !screen.contains("locked"),
+        "owned playlist must not show the 'locked' warning"
     );
 }
 
@@ -1125,14 +1319,13 @@ async fn up_from_now_playing_rises_to_tab_strip_then_arrows_switch_tabs() {
         assert_eq!(s.tab, Tab::NowPlaying);
     }
     // On the strip, Right/Left switch the top tab without leaving the strip.
+    // Two tabs now (Now Playing / Library), so one Right lands on Library.
     h.press_and_run(Key::Right).await;
     {
         let s = h.state.lock().await;
         assert_eq!(s.focus, Focus::Tabs, "still on the tab strip");
-        assert_eq!(s.tab, Tab::Search);
+        assert_eq!(s.tab, Tab::Library);
     }
-    h.press_and_run(Key::Right).await;
-    assert_eq!(h.state.lock().await.tab, Tab::Library);
     // Down drops into the content of the selected tab.
     h.press_and_run(Key::Down).await;
     let s = h.state.lock().await;
@@ -1141,7 +1334,7 @@ async fn up_from_now_playing_rises_to_tab_strip_then_arrows_switch_tabs() {
 }
 
 #[tokio::test]
-async fn up_at_top_of_search_results_rises_to_tabs() {
+async fn up_at_top_of_search_overlay_clamps() {
     let h = Harness::new();
     h.fake.set_search(
         "q",
@@ -1156,19 +1349,21 @@ async fn up_at_top_of_search_results_rises_to_tabs() {
     h.press_and_run(Key::Char('/')).await;
     h.type_str("q").await;
     h.settle().await;
-    // Move down one, then up twice: first Up returns to row 0, second Up
-    // (at the top) rises to the tab strip.
+    // Search is an overlay floating over the tab strip — Up at the top has
+    // nowhere higher to go, so it just clamps the selection at row 0.
     h.press_and_run(Key::Down).await;
+    assert_eq!(h.state.lock().await.search.selected, 1);
     h.press_and_run(Key::Up).await;
-    assert_eq!(h.state.lock().await.focus, Focus::Content);
+    assert_eq!(h.state.lock().await.search.selected, 0);
     h.press_and_run(Key::Up).await;
-    assert_eq!(h.state.lock().await.focus, Focus::Tabs);
+    assert_eq!(h.state.lock().await.search.selected, 0);
+    assert_eq!(h.mode_name().await, "search", "still in the search overlay");
 }
 
 #[tokio::test]
 async fn esc_on_tab_strip_returns_to_content() {
     let h = Harness::new();
-    h.press_and_run(Key::Char('l')).await; // Library, focus = Content
+    h.open_library().await; // Library, focus = Content
     h.settle().await;
     h.press_and_run(Key::Up).await; // selected is 0 -> rise to tabs
     assert_eq!(h.state.lock().await.focus, Focus::Tabs);
@@ -1191,7 +1386,7 @@ async fn library_loads_active_subtab_once() {
         .set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
 
     // Enter Library — Liked is the default sub-tab and should fetch once.
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.settle().await;
     assert_eq!(h.mode_name().await, "library");
     {
@@ -1200,7 +1395,7 @@ async fn library_loads_active_subtab_once() {
         assert_eq!(s.library.liked.items.len(), 1);
     }
     // Re-entering Library must NOT refetch a loaded section.
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.settle().await;
     let n = h
         .fake
@@ -1218,7 +1413,7 @@ async fn library_subtab_switch_loads_lazily() {
     h.fake
         .set_saved_playlists(Ok(vec![dummy_playlist("spotify:playlist:p", "P", "me")]));
 
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.settle().await;
     // Right -> Playlists sub-tab, which now lazily loads.
     h.press_and_run(Key::Right).await;
@@ -1234,7 +1429,7 @@ async fn library_403_surfaces_per_section_hint() {
     let h = Harness::new();
     h.fake
         .set_saved_tracks(Err("GET /me/tracks: 403 Forbidden".into()));
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.settle().await;
     let s = h.state.lock().await;
     let e = s
@@ -1261,7 +1456,7 @@ async fn library_playlist_enter_opens_browse() {
     h.fake
         .set_playlist_tracks("pl", Ok(vec![track("spotify:track:t", "T")]));
 
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.press_and_run(Key::Right).await; // -> Playlists
     h.settle().await;
     h.press_and_run(Key::Enter).await; // open the selected playlist
@@ -1293,7 +1488,7 @@ async fn devices_opens_fetches_once_and_transfers() {
         },
     ]));
 
-    h.press_and_run(Key::Char('d')).await;
+    h.open_devices().await;
     h.settle().await;
     assert_eq!(h.mode_name().await, "devices");
     {
@@ -1637,9 +1832,9 @@ async fn tab_nav_back_to_now_playing_makes_it_visible_again() {
 #[tokio::test]
 async fn esc_from_search_makes_now_playing_visible() {
     let h = Harness::new();
-    h.state.lock().await.tab = Tab::Search;
+    h.press_and_run(Key::Char('/')).await; // open the Search overlay
     assert!(!now_playing_visible(&*h.state.lock().await));
-    h.press(Key::Esc).await;
+    h.press(Key::Esc).await; // dismiss it
     assert!(now_playing_visible(&*h.state.lock().await));
 }
 
@@ -1647,7 +1842,7 @@ async fn esc_from_search_makes_now_playing_visible() {
 async fn closing_an_overlay_makes_now_playing_visible() {
     let h = Harness::new();
     // Open the device picker over Now Playing, then Esc to close it.
-    h.press_and_run(Key::Char('d')).await;
+    h.open_devices().await;
     assert!(!now_playing_visible(&*h.state.lock().await));
     h.press(Key::Esc).await;
     assert!(now_playing_visible(&*h.state.lock().await));
@@ -1729,6 +1924,7 @@ async fn ui_at_96x40_search_with_results_in_every_section() {
                     ),
                     owner: Some(crate::api::PlaylistOwner {
                         display_name: Some(format!("owner_with_a_long_username_{i}")),
+                        id: None,
                     }),
                 })
                 .collect(),
@@ -1767,12 +1963,15 @@ async fn ui_at_96x40_search_recents() {
 }
 
 #[tokio::test]
-async fn ui_at_96x40_help_overlay() {
+async fn ui_at_96x40_question_mark_opens_menu() {
     let h = Harness::new();
+    // `?` is an alias for `:` now — both open the unified menu/help palette.
     h.press_and_run(Key::Char('?')).await;
+    assert_eq!(h.mode_name().await, "command");
     let screen = h.snapshot_sized(96, 40).await;
-    print_snapshot("help overlay", &screen);
-    assert_border_closes("help overlay", &screen);
+    print_snapshot("menu via ?", &screen);
+    assert_border_closes("menu via ?", &screen);
+    assert!(screen.contains("keys"), "cheat-sheet block present");
 }
 
 #[tokio::test]
@@ -1923,7 +2122,7 @@ async fn ui_at_96x40_library_playlists() {
             "a_friend",
         ),
     ]));
-    h.press_and_run(Key::Char('l')).await;
+    h.open_library().await;
     h.press_and_run(Key::Right).await; // -> Playlists
     h.settle().await;
     let screen = h.snapshot_sized(96, 40).await;
@@ -1973,7 +2172,7 @@ async fn ui_at_96x40_devices_overlay() {
             is_active: false,
         },
     ]));
-    h.press_and_run(Key::Char('d')).await;
+    h.open_devices().await;
     h.settle().await;
     let screen = h.snapshot_sized(96, 40).await;
     print_snapshot("devices overlay", &screen);
@@ -2047,7 +2246,11 @@ async fn stale_poll_naming_another_device_keeps_offline_verdict() {
     apply_playback(&state, Some(pb)).await;
 
     let s = state.lock().await;
-    assert_eq!(s.device_present, Some(false), "someone else's device proves nothing");
+    assert_eq!(
+        s.device_present,
+        Some(false),
+        "someone else's device proves nothing"
+    );
 }
 
 #[tokio::test]
@@ -2060,7 +2263,8 @@ async fn search_is_not_loading_after_browse_opens_and_closes() {
             ..Default::default()
         }),
     );
-    h.fake.set_album_tracks("al9", Ok(vec![track("spotify:track:t1", "T1")]));
+    h.fake
+        .set_album_tracks("al9", Ok(vec![track("spotify:track:t1", "T1")]));
 
     h.press_and_run(Key::Char('/')).await;
     h.type_str("test").await;

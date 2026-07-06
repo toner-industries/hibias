@@ -136,6 +136,19 @@ pub struct Playlist {
 pub struct PlaylistOwner {
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Spotify user id of the playlist owner (e.g. "spotify" for editorial
+    /// playlists, or your own id for ones you created). Compared against the
+    /// current user's id so the browse view can tell "your own playlist" from
+    /// a followed/editorial one when the tracks endpoint 403s.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// `GET /me` → the current user's profile. We only need the id, used to mark
+/// which playlists the user owns.
+#[derive(Debug, Clone, Deserialize)]
+struct CurrentUser {
+    id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,11 +246,17 @@ struct QueueResponse {
 struct PlaylistTracksPage {
     #[serde(default = "Vec::new")]
     items: Vec<PlaylistTrackItem>,
+    // Absolute URL of the next page, or null on the last page. The `/items`
+    // endpoint caps a page at 100 rows, so large playlists need it followed.
+    #[serde(default)]
+    next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlaylistTrackItem {
-    #[serde(default)]
+    // `/playlists/{id}/tracks` nests the track under `track`; the newer
+    // `/playlists/{id}/items` nests it under `item`. Accept either.
+    #[serde(default, alias = "item")]
     track: Option<Track>,
 }
 
@@ -314,6 +333,8 @@ pub trait SpotifyApi: Send + Sync {
     async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>>;
     async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>>;
     async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>>;
+    /// The current user's Spotify id, used to mark owned playlists.
+    async fn get_current_user(&self) -> Result<String>;
 }
 
 #[async_trait]
@@ -392,6 +413,9 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
         SpotifyClient::get_followed_artists(self, limit).await
+    }
+    async fn get_current_user(&self) -> Result<String> {
+        SpotifyClient::get_current_user(self).await
     }
 }
 
@@ -709,18 +733,44 @@ impl SpotifyClient {
     }
 
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
-        let fields = urlencoding::encode(
-            "items(track(name,uri,id,artists(name),album(name,images)))",
-        );
-        let url = format!("{BASE}/playlists/{playlist_id}/tracks?limit=100&fields={fields}");
+        // Use `/playlists/{id}/items`, NOT the legacy `/playlists/{id}/tracks`.
+        // As of late 2024 Spotify hard-403's `/tracks` for apps without
+        // extended quota — even for the user's OWN playlists (verified live).
+        // The newer `/items` endpoint is not restricted and returns the same
+        // rows (the track nests under `item`; `PlaylistTrackItem` aliases it).
+        //
+        // `additional_types=track` keeps episode rows from deserializing as
+        // null tracks. We follow `next` so playlists over 100 tracks come back
+        // whole rather than truncated to the first page.
+        let mut out: Vec<Track> = Vec::new();
+        let mut url =
+            format!("{BASE}/playlists/{playlist_id}/items?limit=100&additional_types=track");
+        loop {
+            let req = self
+                .http
+                .get(&url)
+                .header("Authorization", self.bearer().await?);
+            let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+            let page: PlaylistTracksPage =
+                serde_json::from_str(&body).context("parse playlist items")?;
+            out.extend(page.items.into_iter().filter_map(|i| i.track));
+            match page.next {
+                Some(next) if !next.is_empty() => url = next,
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_current_user(&self) -> Result<String> {
+        let url = format!("{BASE}/me");
         let req = self
             .http
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: PlaylistTracksPage =
-            serde_json::from_str(&body).context("parse playlist tracks")?;
-        Ok(page.items.into_iter().filter_map(|i| i.track).collect())
+        let user: CurrentUser = serde_json::from_str(&body).context("parse /me")?;
+        Ok(user.id)
     }
 
     pub async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
@@ -974,6 +1024,7 @@ fn cassette_key(method: &str, url: &str) -> Option<String> {
         None => (path, None),
     };
     let key = match (method, path) {
+        ("GET", "/me") => "current_user".to_string(),
         ("GET", "/me/player") => "playback".to_string(),
         ("GET", "/me/player/devices") => "devices".to_string(),
         ("GET", "/me/player/queue") => "queue".to_string(),
@@ -989,9 +1040,14 @@ fn cassette_key(method: &str, url: &str) -> Option<String> {
                 .trim_end_matches("/tracks");
             format!("album_tracks:{id}")
         }
-        ("GET", p) if p.starts_with("/playlists/") && p.ends_with("/tracks") => {
+        // Live fetch uses `/items`; keep `/tracks` mapping for older cassettes.
+        ("GET", p)
+            if p.starts_with("/playlists/")
+                && (p.ends_with("/items") || p.ends_with("/tracks")) =>
+        {
             let id = p
                 .trim_start_matches("/playlists/")
+                .trim_end_matches("/items")
                 .trim_end_matches("/tracks");
             format!("playlist_tracks:{id}")
         }
@@ -1359,6 +1415,13 @@ impl SpotifyApi for ReplaySpotify {
             .map(Page::into_items)
             .unwrap_or_default())
     }
+
+    async fn get_current_user(&self) -> Result<String> {
+        Ok(self
+            .parsed::<CurrentUser>("current_user")
+            .map(|u| u.id)
+            .unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -1653,6 +1716,11 @@ mod tests {
         );
         assert_eq!(
             k("GET", &format!("{b}/playlists/p9/tracks?limit=100")).as_deref(),
+            Some("playlist_tracks:p9")
+        );
+        // Live fetch now uses `/items`; it maps to the same cassette key.
+        assert_eq!(
+            k("GET", &format!("{b}/playlists/p9/items?limit=100&additional_types=track")).as_deref(),
             Some("playlist_tracks:p9")
         );
         // Mutations and unknown endpoints are not replayed.

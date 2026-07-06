@@ -6,6 +6,8 @@
 //   cargo run --bin hibias-diag                  -> show /me/player + devices
 //   cargo run --bin hibias-diag play <track_uri> -> play on the "hibias" device,
 //                                                 then poll /me/player for 10s
+//   cargo run --bin hibias-diag playlist <id|uri> -> fetch a playlist's tracks
+//                                                 (tests the late-2024 403 fix)
 //
 // Logging goes to hibias.log.sqlite (same DB the main app uses).
 
@@ -40,17 +42,25 @@ async fn diag_main() -> Result<()> {
     let a = auth::Auth::init().await.context("authenticate")?;
     let client = Arc::new(SpotifyClient::new(a)?);
 
+    // Playlist mode is self-contained — skip the player/devices dump so the
+    // only requests on the wire are /me and the playlist fetch we're testing.
+    if let DiagMode::Playlist(id) = &mode {
+        return fetch_playlist(&client, id).await;
+    }
+
     print_state(&client).await?;
 
     match mode {
         DiagMode::Inspect => Ok(()),
         DiagMode::Play(uri) => play_and_poll(&client, &uri).await,
+        DiagMode::Playlist(_) => unreachable!(),
     }
 }
 
 enum DiagMode {
     Inspect,
     Play(String),
+    Playlist(String),
 }
 
 fn parse_args(args: Vec<String>) -> DiagMode {
@@ -63,8 +73,71 @@ fn parse_args(args: Vec<String>) -> DiagMode {
             });
             DiagMode::Play(uri)
         }
+        Some("playlist") => {
+            let arg = it.next().unwrap_or_else(|| {
+                eprintln!("usage: hibias-diag playlist <id | spotify:playlist:...>");
+                std::process::exit(2);
+            });
+            DiagMode::Playlist(arg)
+        }
         _ => DiagMode::Inspect,
     }
+}
+
+/// Fetch a playlist's tracks the same way the app does, printing whether it
+/// 200s and whether the current user owns it — the live check for the
+/// late-2024 `/tracks` 403 (worked around by fetching `/items` instead).
+async fn fetch_playlist(client: &SpotifyClient, arg: &str) -> Result<()> {
+    let id = arg
+        .strip_prefix("spotify:playlist:")
+        .unwrap_or(arg)
+        .to_string();
+
+    println!("\n=== current user (/me) ===");
+    let me = match client.get_current_user().await {
+        Ok(id) => {
+            println!("id: {id}");
+            Some(id)
+        }
+        Err(e) => {
+            println!("error: {e:#}");
+            None
+        }
+    };
+
+    println!("\n=== ownership (/me/playlists) ===");
+    match client.get_saved_playlists(50).await {
+        Ok(pls) => match pls.iter().find(|p| p.uri.ends_with(&id)) {
+            Some(p) => {
+                let owner = p.owner.as_ref().and_then(|o| o.id.clone());
+                let owned = owner.as_deref() == me.as_deref();
+                println!(
+                    "found in saved playlists: name={:?} owner_id={:?} -> owned_by_me={owned}",
+                    p.name, owner
+                );
+            }
+            None => println!("(not in your first 50 saved playlists — likely followed/editorial)"),
+        },
+        Err(e) => println!("error: {e:#}"),
+    }
+
+    println!("\n=== playlist tracks (/playlists/{id}/items) ===");
+    match client.get_playlist_tracks(&id).await {
+        Ok(tracks) => {
+            println!("OK — {} tracks", tracks.len());
+            for t in tracks.iter().take(5) {
+                let artists = t
+                    .artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  - {} — {artists}", t.name);
+            }
+        }
+        Err(e) => println!("FAILED: {e:#}\n(me_id={me:?} — owned check needs owner.id from /me/playlists)"),
+    }
+    Ok(())
 }
 
 async fn print_state(client: &SpotifyClient) -> Result<()> {

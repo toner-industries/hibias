@@ -860,6 +860,121 @@ async fn like_command_calls_save_track_for_current_track() {
     assert!(s.error.is_none());
 }
 
+/// Build a playback whose current track carries an album (uri/name/artists),
+/// for the queue/save-album/go-to-album commands.
+async fn set_playing_with_album(h: &Harness) {
+    let mut s = h.state.lock().await;
+    s.playback = Some(Playback {
+        is_playing: true,
+        progress_ms: Some(0),
+        item: Some(Track {
+            id: Some("track42".into()),
+            uri: Some("spotify:track:track42".into()),
+            name: "Heart It Races".into(),
+            duration_ms: 200_000,
+            artists: vec![Artist {
+                uri: None,
+                name: "Architecture in Helsinki".into(),
+            }],
+            album: Album {
+                uri: Some("spotify:album:alb1".into()),
+                name: "In Case We Die".into(),
+                artists: vec![Artist {
+                    uri: None,
+                    name: "Architecture in Helsinki".into(),
+                }],
+                images: vec![],
+            },
+        }),
+        context: None,
+        timestamp: None,
+        device: None,
+    });
+}
+
+#[tokio::test]
+async fn queue_command_adds_current_track_to_queue() {
+    let h = Harness::new();
+    set_playing_with_album(&h).await;
+
+    // `:e` runs the queue command from the palette.
+    h.press_and_run(Key::Char(':')).await;
+    h.press_and_run(Key::Char('e')).await;
+    let action = h.press(Key::Enter).await;
+    assert!(matches!(action, KeyAction::QueueCurrent), "got {action:?}");
+    h.run(action).await;
+
+    let calls = h.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, Call::AddToQueue(u) if u == "spotify:track:track42")),
+        "expected AddToQueue, got: {calls:?}"
+    );
+    let s = h.state.lock().await;
+    let (msg, _) = s.notice.as_ref().expect("notice on success");
+    assert!(msg.contains("Heart It Races"), "got: {msg}");
+    assert!(s.error.is_none());
+}
+
+#[tokio::test]
+async fn save_album_command_saves_current_album() {
+    let h = Harness::new();
+    set_playing_with_album(&h).await;
+
+    h.run(KeyAction::SaveAlbumCurrent).await;
+
+    let calls = h.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, Call::SaveAlbum(id) if id == "alb1")),
+        "expected SaveAlbum(alb1), got: {calls:?}"
+    );
+    let s = h.state.lock().await;
+    let (msg, _) = s.notice.as_ref().expect("notice on success");
+    assert!(msg.contains("In Case We Die"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn go_to_album_opens_browse_for_current_album() {
+    let h = Harness::new();
+    set_playing_with_album(&h).await;
+    h.fake
+        .set_album_tracks("alb1", Ok(vec![track("spotify:track:x", "X")]));
+
+    h.run(KeyAction::GoToAlbum).await;
+    h.settle().await;
+
+    let s = h.state.lock().await;
+    let Some(Overlay::Browse(b)) = &s.overlay else {
+        panic!("expected a Browse overlay");
+    };
+    assert_eq!(b.collection.kind, CollectionKind::Album);
+    assert_eq!(b.collection.uri, "spotify:album:alb1");
+    assert_eq!(b.collection.name, "In Case We Die");
+}
+
+#[tokio::test]
+async fn queue_and_save_album_skip_when_nothing_playing() {
+    let h = Harness::new();
+    // No playback set.
+    h.run(KeyAction::QueueCurrent).await;
+    h.run(KeyAction::SaveAlbumCurrent).await;
+    h.run(KeyAction::GoToAlbum).await;
+
+    let calls = h.fake.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            Call::AddToQueue(_) | Call::SaveAlbum(_) | Call::GetAlbumTracks(_)
+        )),
+        "expected no write/browse calls, got: {calls:?}"
+    );
+    let s = h.state.lock().await;
+    assert!(s.overlay.is_none());
+}
+
 #[tokio::test]
 async fn like_command_skips_when_nothing_playing() {
     let h = Harness::new();

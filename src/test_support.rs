@@ -53,6 +53,8 @@ pub enum Call {
     GetRecentlyPlayed(u32),
     GetQueue,
     SaveTrack(String),
+    SaveAlbum(String),
+    AddToQueue(String),
     GetSavedTracks(u32),
     GetSavedPlaylists(u32),
     GetSavedAlbums(u32),
@@ -357,6 +359,16 @@ impl SpotifyApi for FakeSpotify {
         Ok(())
     }
 
+    async fn save_album(&self, album_id: &str) -> Result<()> {
+        self.record(Call::SaveAlbum(album_id.to_string()));
+        Ok(())
+    }
+
+    async fn add_to_queue(&self, uri: &str) -> Result<()> {
+        self.record(Call::AddToQueue(uri.to_string()));
+        Ok(())
+    }
+
     async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
         self.record(Call::GetSavedTracks(limit));
         match self.with(|s| s.saved_tracks.clone()) {
@@ -483,6 +495,13 @@ impl Harness {
                 play_browse_collection(&self.client, &self.state).await
             }
             KeyAction::LikeCurrent => like_current_track(&self.client, &self.state).await,
+            KeyAction::QueueCurrent => {
+                crate::app::queue_current_track(&self.client, &self.state).await
+            }
+            KeyAction::GoToAlbum => crate::app::go_to_album(&self.client, &self.state).await,
+            KeyAction::SaveAlbumCurrent => {
+                crate::app::save_current_album(&self.client, &self.state).await
+            }
             KeyAction::OpenLibrary => enter_library(&self.client, &self.state).await,
             KeyAction::PlayLibrarySelection => {
                 play_library_selection(&self.client, &self.state).await

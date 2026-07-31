@@ -456,6 +456,9 @@ pub enum Cmd {
     Library,
     Devices,
     Like,
+    Queue,
+    GoAlbum,
+    SaveAlbum,
     Next,
     Previous,
     PlayPause,
@@ -469,6 +472,9 @@ impl Cmd {
         Cmd::Library,
         Cmd::Devices,
         Cmd::Like,
+        Cmd::Queue,
+        Cmd::GoAlbum,
+        Cmd::SaveAlbum,
         Cmd::Next,
         Cmd::Previous,
         Cmd::PlayPause,
@@ -482,6 +488,9 @@ impl Cmd {
             Cmd::Library => "library",
             Cmd::Devices => "devices",
             Cmd::Like => "like",
+            Cmd::Queue => "queue track",
+            Cmd::GoAlbum => "go to album",
+            Cmd::SaveAlbum => "save album",
             Cmd::Next => "next",
             Cmd::Previous => "previous",
             Cmd::PlayPause => "play / pause",
@@ -499,6 +508,9 @@ impl Cmd {
             Cmd::Library => "l",
             Cmd::Devices => "d",
             Cmd::Like => "k",
+            Cmd::Queue => "e",
+            Cmd::GoAlbum => "b",
+            Cmd::SaveAlbum => "sa",
             Cmd::Next => "n",
             Cmd::Previous => "p",
             Cmd::PlayPause => "pp",
@@ -513,6 +525,9 @@ impl Cmd {
             Cmd::Library => "liked songs, playlists, albums",
             Cmd::Devices => "pick the Connect device to play on",
             Cmd::Like => "save the current track to Liked Songs",
+            Cmd::Queue => "add the current track to the play queue",
+            Cmd::GoAlbum => "browse the current track's album",
+            Cmd::SaveAlbum => "save the current track's album to your library",
             Cmd::Next => "skip to the next track",
             Cmd::Previous => "skip back (or restart current track)",
             Cmd::PlayPause => "toggle playback on the current device",
@@ -1907,6 +1922,128 @@ pub async fn like_current_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<
             });
         }
     }
+}
+
+/// Append the currently-playing track to the active device's play queue.
+pub async fn queue_current_track(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let (uri, label) = {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("queue: skipped (rate-limited)", None);
+            return;
+        }
+        let Some(track) = s.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            log::note("queue: skipped (no current track)", None);
+            return;
+        };
+        let Some(uri) = track
+            .uri
+            .clone()
+            .or_else(|| track.id.as_ref().map(|id| format!("spotify:track:{id}")))
+        else {
+            log::note("queue: skipped (track has no uri/id)", None);
+            return;
+        };
+        (uri, track.name.clone())
+    };
+    log::note("queue", Some(&format!("uri={uri} track={label}")));
+    match client.add_to_queue(&uri).await {
+        Ok(()) => {
+            let mut s = state.lock().await;
+            s.error = None;
+            s.notice = Some((
+                format!("+ queued: {label}"),
+                Instant::now() + std::time::Duration::from_secs(3),
+            ));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("queue", &msg);
+            let mut s = state.lock().await;
+            s.error = Some(msg);
+        }
+    }
+}
+
+/// Save the currently-playing track's album to the user's library.
+pub async fn save_current_album(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let (album_id, label) = {
+        let s = state.lock().await;
+        if s.rate_limited_until
+            .map(|t| t > Instant::now())
+            .unwrap_or(false)
+        {
+            log::note("save album: skipped (rate-limited)", None);
+            return;
+        }
+        let Some(track) = s.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            log::note("save album: skipped (no current track)", None);
+            return;
+        };
+        let Some(id) = track.album.uri.as_deref().and_then(album_id_from_uri) else {
+            log::note("save album: skipped (no album uri)", None);
+            return;
+        };
+        (id, track.album.name.clone())
+    };
+    log::note("save album", Some(&format!("id={album_id} album={label}")));
+    match client.save_album(&album_id).await {
+        Ok(()) => {
+            let mut s = state.lock().await;
+            s.error = None;
+            s.notice = Some((
+                format!("♥ saved album: {label}"),
+                Instant::now() + std::time::Duration::from_secs(3),
+            ));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            log::error("save album", &msg);
+            let mut s = state.lock().await;
+            s.error = Some(if msg.contains("403") {
+                "save album failed: missing scope — delete hibias-auth.json and re-auth".into()
+            } else {
+                msg
+            });
+        }
+    }
+}
+
+/// Open Browse loaded with the currently-playing track's album.
+pub async fn go_to_album(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let collection = {
+        let s = state.lock().await;
+        let Some(track) = s.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            log::note("go album: skipped (no current track)", None);
+            return;
+        };
+        let Some(uri) = track.album.uri.clone() else {
+            log::note("go album: skipped (no album uri)", None);
+            return;
+        };
+        let subtitle = track
+            .album
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Collection {
+            kind: CollectionKind::Album,
+            uri,
+            name: track.album.name.clone(),
+            subtitle: if subtitle.is_empty() {
+                "album".to_string()
+            } else {
+                format!("album · {subtitle}")
+            },
+            owner_id: None,
+        }
+    };
+    enter_browse(client, state, collection).await;
 }
 
 pub async fn toggle_playback(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {

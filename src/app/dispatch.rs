@@ -31,6 +31,12 @@ pub enum KeyAction {
     PrevTrack,
     Reconnect,
     LikeCurrent,
+    /// Append the currently-playing track to the play queue.
+    QueueCurrent,
+    /// Open Browse loaded with the currently-playing track's album.
+    GoToAlbum,
+    /// Save the currently-playing track's album to the user's library.
+    SaveAlbumCurrent,
     /// Focus the Library tab and lazily load its active sub-tab.
     OpenLibrary,
     /// Play the selected track in the Library "Liked" sub-tab.
@@ -490,6 +496,9 @@ fn dispatch_command(s: &mut AppState, input: Input) -> KeyAction {
                 Cmd::Library => KeyAction::OpenLibrary,
                 Cmd::Devices => KeyAction::OpenDevices,
                 Cmd::Like => KeyAction::LikeCurrent,
+                Cmd::Queue => KeyAction::QueueCurrent,
+                Cmd::GoAlbum => KeyAction::GoToAlbum,
+                Cmd::SaveAlbum => KeyAction::SaveAlbumCurrent,
                 Cmd::Next => KeyAction::NextTrack,
                 Cmd::Previous => KeyAction::PrevTrack,
                 Cmd::PlayPause => KeyAction::TogglePlayback,

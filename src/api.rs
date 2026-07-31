@@ -327,6 +327,9 @@ pub trait SpotifyApi: Send + Sync {
     /// volume low.
     async fn get_queue(&self) -> Result<Vec<Track>>;
     async fn save_track(&self, track_id: &str) -> Result<()>;
+    async fn save_album(&self, album_id: &str) -> Result<()>;
+    /// Append a playable uri to the active device's queue.
+    async fn add_to_queue(&self, uri: &str) -> Result<()>;
     /// The user's saved/library collections, for the Library tab. Each is
     /// fetched lazily, on first focus of its sub-tab.
     async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>>;
@@ -401,6 +404,12 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn save_track(&self, track_id: &str) -> Result<()> {
         SpotifyClient::save_track(self, track_id).await
+    }
+    async fn save_album(&self, album_id: &str) -> Result<()> {
+        SpotifyClient::save_album(self, album_id).await
+    }
+    async fn add_to_queue(&self, uri: &str) -> Result<()> {
+        SpotifyClient::add_to_queue(self, uri).await
     }
     async fn get_saved_tracks(&self, limit: u32) -> Result<Vec<Track>> {
         SpotifyClient::get_saved_tracks(self, limit).await
@@ -657,6 +666,33 @@ impl SpotifyClient {
             .header("Authorization", self.bearer().await?)
             .header("Content-Length", "0");
         self.send_logged(req, "PUT", &url, None).await.map(|_| ())
+    }
+
+    /// Save a whole album to the user's library. Same `user-library-modify`
+    /// scope as [`save_track`](Self::save_track).
+    pub async fn save_album(&self, album_id: &str) -> Result<()> {
+        let url = format!("{BASE}/me/albums?ids={}", urlencoding::encode(album_id));
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        self.send_logged(req, "PUT", &url, None).await.map(|_| ())
+    }
+
+    /// Append a track (or any playable uri) to the active device's play queue.
+    /// Requires `user-modify-playback-state` (already held). Targets our device
+    /// explicitly via `with_device` so it lands on the librespot output.
+    pub async fn add_to_queue(&self, uri: &str) -> Result<()> {
+        let did = self.device_id();
+        let base = format!("{BASE}/me/player/queue?uri={}", urlencoding::encode(uri));
+        let url = with_device(&base, did.as_deref());
+        let req = self
+            .http
+            .post(&url)
+            .header("Authorization", self.bearer().await?)
+            .header("Content-Length", "0");
+        self.send_logged(req, "POST", &url, None).await.map(|_| ())
     }
 
     pub async fn search(&self, q: &str) -> Result<SearchResults> {
@@ -1384,6 +1420,14 @@ impl SpotifyApi for ReplaySpotify {
     }
 
     async fn save_track(&self, _track_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn save_album(&self, _album_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn add_to_queue(&self, _uri: &str) -> Result<()> {
         Ok(())
     }
 

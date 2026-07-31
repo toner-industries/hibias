@@ -376,6 +376,13 @@ async fn run(
                             spawn_reconnect(&client, &state, "user: :reconnect");
                         }
                         KeyAction::LikeCurrent => like_current_track(&client, &state).await,
+                        KeyAction::QueueCurrent => {
+                            app::queue_current_track(&client, &state).await
+                        }
+                        KeyAction::GoToAlbum => app::go_to_album(&client, &state).await,
+                        KeyAction::SaveAlbumCurrent => {
+                            app::save_current_album(&client, &state).await
+                        }
                         KeyAction::OpenLibrary => app::enter_library(&client, &state).await,
                         KeyAction::PlayLibrarySelection => {
                             app::play_library_selection(&client, &state).await

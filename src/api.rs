@@ -122,6 +122,13 @@ pub struct Album {
     pub artists: Vec<Artist>,
     #[serde(default)]
     pub images: Vec<Image>,
+    /// `"album"`, `"single"`, `"compilation"` — present on the
+    /// `/artists/{id}/albums` list, used to label rows on the artist page.
+    #[serde(default)]
+    pub album_type: Option<String>,
+    /// `"2023"` or `"2023-05-01"` — only the leading year is shown.
+    #[serde(default)]
+    pub release_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +293,14 @@ struct SavedAlbumItem {
     album: Option<Album>,
 }
 
+/// `GET /artists/{id}/albums` → `{ items: [Album] }` (albums are top-level
+/// here, not wrapped like saved albums).
+#[derive(Debug, Deserialize)]
+struct ArtistAlbumsPage {
+    #[serde(default = "Vec::new")]
+    items: Vec<Album>,
+}
+
 /// `GET /me/following?type=artist` → `{ artists: { items: [Artist] } }`.
 #[derive(Debug, Deserialize)]
 struct FollowedArtistsPayload {
@@ -336,6 +351,8 @@ pub trait SpotifyApi: Send + Sync {
     async fn get_saved_playlists(&self, limit: u32) -> Result<Vec<Playlist>>;
     async fn get_saved_albums(&self, limit: u32) -> Result<Vec<Album>>;
     async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>>;
+    /// The artist's albums + singles (for the artist page).
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>>;
     /// The current user's Spotify id, used to mark owned playlists.
     async fn get_current_user(&self) -> Result<String>;
 }
@@ -422,6 +439,9 @@ impl SpotifyApi for SpotifyClient {
     }
     async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
         SpotifyClient::get_followed_artists(self, limit).await
+    }
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        SpotifyClient::get_artist_albums(self, artist_id).await
     }
     async fn get_current_user(&self) -> Result<String> {
         SpotifyClient::get_current_user(self).await
@@ -845,6 +865,23 @@ impl SpotifyClient {
         Ok(page.items.into_iter().filter_map(|i| i.album).collect())
     }
 
+    /// The artist's albums + singles, for the artist page. Unlike top-tracks
+    /// and related-artists (both 403 for our app tier), this endpoint is not
+    /// restricted. `album_group` dupes are common; the UI dedups by name.
+    pub async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        // No `limit=` param: this endpoint 400s ("Invalid limit") for anything
+        // above ~10 under our app quota (verified live), even though the
+        // documented max is 50. The default page is plenty for browsing.
+        let url = format!("{BASE}/artists/{artist_id}/albums?include_groups=album,single");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer().await?);
+        let (_, body) = self.send_logged(req, "GET", &url, None).await?;
+        let page: ArtistAlbumsPage = serde_json::from_str(&body).context("parse artist albums")?;
+        Ok(page.items)
+    }
+
     pub async fn get_followed_artists(&self, limit: u32) -> Result<Vec<Artist>> {
         let url = format!("{BASE}/me/following?type=artist&limit={limit}");
         let req = self
@@ -1075,6 +1112,12 @@ fn cassette_key(method: &str, url: &str) -> Option<String> {
                 .trim_start_matches("/albums/")
                 .trim_end_matches("/tracks");
             format!("album_tracks:{id}")
+        }
+        ("GET", p) if p.starts_with("/artists/") && p.ends_with("/albums") => {
+            let id = p
+                .trim_start_matches("/artists/")
+                .trim_end_matches("/albums");
+            format!("artist_albums:{id}")
         }
         // Live fetch uses `/items`; keep `/tracks` mapping for older cassettes.
         ("GET", p)
@@ -1460,6 +1503,13 @@ impl SpotifyApi for ReplaySpotify {
             .unwrap_or_default())
     }
 
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        Ok(self
+            .parsed::<ArtistAlbumsPage>(&format!("artist_albums:{artist_id}"))
+            .map(|p| p.items)
+            .unwrap_or_default())
+    }
+
     async fn get_current_user(&self) -> Result<String> {
         Ok(self
             .parsed::<CurrentUser>("current_user")
@@ -1757,6 +1807,14 @@ mod tests {
         assert_eq!(
             k("GET", &format!("{b}/albums/abc123/tracks?limit=50")).as_deref(),
             Some("album_tracks:abc123")
+        );
+        assert_eq!(
+            k(
+                "GET",
+                &format!("{b}/artists/art9/albums?include_groups=album,single")
+            )
+            .as_deref(),
+            Some("artist_albums:art9")
         );
         assert_eq!(
             k("GET", &format!("{b}/playlists/p9/tracks?limit=100")).as_deref(),

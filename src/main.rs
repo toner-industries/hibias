@@ -380,6 +380,7 @@ async fn run(
                             app::queue_current_track(&client, &state).await
                         }
                         KeyAction::GoToAlbum => app::go_to_album(&client, &state).await,
+                        KeyAction::GoToArtist => app::go_to_artist(&client, &state).await,
                         KeyAction::SaveAlbumCurrent => {
                             app::save_current_album(&client, &state).await
                         }

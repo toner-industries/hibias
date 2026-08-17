@@ -9,8 +9,8 @@ use ratatui_image::StatefulImage;
 use std::time::Instant;
 
 use crate::app::{
-    AppState, BrowseState, Cmd, CommandState, DevicesState, Focus, LibraryState, LibraryTab,
-    Overlay, SearchState, Tab,
+    AppState, ArtistState, BrowseState, Cmd, CommandState, DevicesState, Focus, LibraryState,
+    LibraryTab, Overlay, SearchState, Tab,
 };
 use crate::art::ArtCache;
 use crate::keys::{self, ModeMask};
@@ -109,6 +109,7 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         Some(Overlay::Command(cmd)) => render_command_overlay(f, area, cmd),
         Some(Overlay::Devices(dev)) => render_devices_overlay(f, area, dev),
         Some(Overlay::Browse(browse)) => render_browse_overlay(f, area, browse),
+        Some(Overlay::Artist(art)) => render_artist_overlay(f, area, art),
     }
 }
 
@@ -994,6 +995,85 @@ fn render_browse_overlay(f: &mut Frame, area: Rect, browse: &BrowseState) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), layout[3]);
+}
+
+fn render_artist_overlay(f: &mut Frame, area: Rect, art: &ArtistState) {
+    let rect = centered(area, 70, 80);
+    f.render_widget(Clear, rect);
+    let block = Block::default().title(" artist ").borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // name
+            Constraint::Length(1), // hint
+            Constraint::Min(0),    // list
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(art.artist_name.clone())
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        layout[0],
+    );
+
+    let (hint, hint_color) = if art.loading {
+        ("loading...".to_string(), Color::DarkGray)
+    } else if let Some(e) = &art.error {
+        let short = truncate_for_hint(e, 50);
+        (format!("error: {short}"), Color::Red)
+    } else {
+        (format!("{} releases", art.albums.len()), Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(hint)
+            .style(Style::default().fg(hint_color))
+            .wrap(Wrap { trim: true }),
+        layout[1],
+    );
+
+    let list_h = layout[2].height as usize;
+    if list_h == 0 || art.albums.is_empty() {
+        return;
+    }
+    let scroll = compute_scroll(art.selected, art.albums.len(), list_h);
+    let end = (scroll + list_h).min(art.albums.len());
+
+    let lines: Vec<Line> = art.albums[scroll..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, a)| {
+            let idx = scroll + offset;
+            // "Name  ·  2023 · single" — year taken from the leading 4 chars
+            // of release_date, type from album_type. Both optional.
+            let year = a
+                .release_date
+                .as_deref()
+                .map(|d| d.chars().take(4).collect::<String>())
+                .filter(|y| !y.is_empty());
+            let kind = a.album_type.as_deref();
+            let meta = match (year, kind) {
+                (Some(y), Some(k)) => format!("  ·  {y} · {k}"),
+                (Some(y), None) => format!("  ·  {y}"),
+                (None, Some(k)) => format!("  ·  {k}"),
+                (None, None) => String::new(),
+            };
+            let label = format!("  {}{}", a.name, meta);
+            if idx == art.selected {
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(label)
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), layout[2]);
 }
 
 /// Heuristic: was this Browse fetch error a Spotify access restriction?

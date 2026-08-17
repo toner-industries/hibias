@@ -49,6 +49,7 @@ pub enum Call {
     PlayContext { uri: String, offset: Option<String> },
     Search(String),
     GetAlbumTracks(String),
+    GetArtistAlbums(String),
     GetPlaylistTracks(String),
     GetRecentlyPlayed(u32),
     GetQueue,
@@ -73,6 +74,8 @@ struct FakeState {
     search: HashMap<String, Result<SearchResults, String>>,
     /// Per-id programmable response.
     album_tracks: HashMap<String, Result<Vec<Track>, String>>,
+    /// Per-id programmable response.
+    artist_albums: HashMap<String, Result<Vec<Album>, String>>,
     /// Per-id programmable response.
     playlist_tracks: HashMap<String, Result<Vec<Track>, String>>,
     saved_tracks: Option<Result<Vec<Track>, String>>,
@@ -155,6 +158,12 @@ impl FakeSpotify {
     pub fn set_album_tracks(&self, id: &str, r: Result<Vec<Track>, String>) {
         self.with(|s| {
             s.album_tracks.insert(id.to_string(), r);
+        });
+    }
+
+    pub fn set_artist_albums(&self, id: &str, r: Result<Vec<Album>, String>) {
+        self.with(|s| {
+            s.artist_albums.insert(id.to_string(), r);
         });
     }
 
@@ -320,6 +329,16 @@ impl SpotifyApi for FakeSpotify {
         let resp = self.with(|s| s.album_tracks.get(album_id).cloned());
         match resp {
             Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        self.record(Call::GetArtistAlbums(artist_id.to_string()));
+        let resp = self.with(|s| s.artist_albums.get(artist_id).cloned());
+        match resp {
+            Some(Ok(a)) => Ok(a),
             Some(Err(e)) => Err(anyhow!(e)),
             None => Ok(Vec::new()),
         }
@@ -499,6 +518,7 @@ impl Harness {
                 crate::app::queue_current_track(&self.client, &self.state).await
             }
             KeyAction::GoToAlbum => crate::app::go_to_album(&self.client, &self.state).await,
+            KeyAction::GoToArtist => crate::app::go_to_artist(&self.client, &self.state).await,
             KeyAction::SaveAlbumCurrent => {
                 crate::app::save_current_album(&self.client, &self.state).await
             }

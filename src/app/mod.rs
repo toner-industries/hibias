@@ -223,6 +223,9 @@ pub enum Overlay {
     Command(CommandState),
     Devices(DevicesState),
     Browse(BrowseState),
+    /// The artist page — a list of the artist's albums/singles. Enter on a row
+    /// opens that album in Browse.
+    Artist(ArtistState),
 }
 
 impl Overlay {
@@ -232,6 +235,7 @@ impl Overlay {
             Overlay::Command(_) => "command",
             Overlay::Devices(_) => "devices",
             Overlay::Browse(_) => "browse",
+            Overlay::Artist(_) => "artist",
         }
     }
 
@@ -241,6 +245,7 @@ impl Overlay {
             Overlay::Command(_) => ModeMask::COMMAND,
             Overlay::Devices(_) => ModeMask::DEVICES,
             Overlay::Browse(_) => ModeMask::BROWSE,
+            Overlay::Artist(_) => ModeMask::ARTIST,
         }
     }
 }
@@ -348,6 +353,19 @@ pub struct BrowseState {
     /// row). On Esc we then reopen Search instead of dropping to the bare tab,
     /// so the user lands back on their results.
     pub from_search: bool,
+}
+
+/// The artist-page overlay: the artist's albums/singles, fetched lazily.
+/// Enter on a row opens that album in Browse. Mirrors `BrowseState`'s
+/// loading/error/fetch_id discipline.
+pub struct ArtistState {
+    pub artist_id: String,
+    pub artist_name: String,
+    pub albums: Vec<Album>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub selected: usize,
+    pub fetch_id: u64,
 }
 
 /// One lazily-loaded list in the Library tab. `loaded` distinguishes "never
@@ -458,6 +476,7 @@ pub enum Cmd {
     Like,
     Queue,
     GoAlbum,
+    GoArtist,
     SaveAlbum,
     Next,
     Previous,
@@ -474,6 +493,7 @@ impl Cmd {
         Cmd::Like,
         Cmd::Queue,
         Cmd::GoAlbum,
+        Cmd::GoArtist,
         Cmd::SaveAlbum,
         Cmd::Next,
         Cmd::Previous,
@@ -490,6 +510,7 @@ impl Cmd {
             Cmd::Like => "like",
             Cmd::Queue => "queue track",
             Cmd::GoAlbum => "go to album",
+            Cmd::GoArtist => "go to artist",
             Cmd::SaveAlbum => "save album",
             Cmd::Next => "next",
             Cmd::Previous => "previous",
@@ -510,6 +531,7 @@ impl Cmd {
             Cmd::Like => "k",
             Cmd::Queue => "e",
             Cmd::GoAlbum => "b",
+            Cmd::GoArtist => "a",
             Cmd::SaveAlbum => "sa",
             Cmd::Next => "n",
             Cmd::Previous => "p",
@@ -527,6 +549,7 @@ impl Cmd {
             Cmd::Like => "save the current track to Liked Songs",
             Cmd::Queue => "add the current track to the play queue",
             Cmd::GoAlbum => "browse the current track's album",
+            Cmd::GoArtist => "open the current track's artist page",
             Cmd::SaveAlbum => "save the current track's album to your library",
             Cmd::Next => "skip to the next track",
             Cmd::Previous => "skip back (or restart current track)",
@@ -2044,6 +2067,99 @@ pub async fn go_to_album(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppStat
         }
     };
     enter_browse(client, state, collection).await;
+}
+
+/// Open the artist page for the currently-playing track's primary artist.
+pub async fn go_to_artist(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {
+    let (artist_id, artist_name) = {
+        let s = state.lock().await;
+        let Some(track) = s.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            log::note("go artist: skipped (no current track)", None);
+            return;
+        };
+        let Some(artist) = track.artists.first() else {
+            log::note("go artist: skipped (track has no artist)", None);
+            return;
+        };
+        let Some(id) = artist.uri.as_deref().and_then(artist_id_from_uri) else {
+            log::note("go artist: skipped (artist has no uri)", None);
+            return;
+        };
+        (id, artist.name.clone())
+    };
+    enter_artist(client, state, artist_id, artist_name).await;
+}
+
+/// Open the artist page for a specific artist and lazily fetch its albums.
+/// Mirrors [`enter_browse`]'s fetch-id discipline so a stale fetch can't
+/// clobber a newer overlay.
+pub async fn enter_artist(
+    client: &Arc<dyn SpotifyApi>,
+    state: &Arc<Mutex<AppState>>,
+    artist_id: String,
+    artist_name: String,
+) {
+    log::note(
+        "enter_artist",
+        Some(&format!("id={artist_id} name={artist_name:?}")),
+    );
+    let fetch_id = {
+        let mut s = state.lock().await;
+        let fetch_id = s.search.request_id.wrapping_add(1);
+        s.search.request_id = fetch_id;
+        s.search.applied_id = fetch_id;
+        if let Some(h) = s.search.debounce.take() {
+            h.abort();
+        }
+        s.overlay = Some(Overlay::Artist(ArtistState {
+            artist_id: artist_id.clone(),
+            artist_name,
+            albums: Vec::new(),
+            loading: true,
+            error: None,
+            selected: 0,
+            fetch_id,
+        }));
+        fetch_id
+    };
+
+    let client = client.clone();
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        let result = client.get_artist_albums(&artist_id).await;
+        let mut s = state_bg.lock().await;
+        let Some(Overlay::Artist(art)) = s.overlay.as_mut() else {
+            log::note(
+                "artist fetch arrived but not in Artist mode",
+                Some(&artist_id),
+            );
+            return;
+        };
+        if art.fetch_id != fetch_id || art.artist_id != artist_id {
+            log::note("artist fetch stale", Some(&artist_id));
+            return;
+        }
+        art.loading = false;
+        match result {
+            Ok(mut albums) => {
+                // `include_groups=album,single` frequently repeats a title
+                // across markets / album_group; dedup by name so the page
+                // doesn't show the same record three times.
+                let mut seen = std::collections::HashSet::new();
+                albums.retain(|a| seen.insert(a.name.to_lowercase()));
+                log::note(
+                    "artist loaded",
+                    Some(&format!("id={artist_id} count={}", albums.len())),
+                );
+                art.albums = albums;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                log::error("artist fetch", &msg);
+                art.error = Some(msg);
+            }
+        }
+    });
 }
 
 pub async fn toggle_playback(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppState>>) {

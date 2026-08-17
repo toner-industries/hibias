@@ -10,6 +10,8 @@ impl ModeMask {
     pub const COMMAND: ModeMask = ModeMask(1 << 4);
     pub const BROWSE: ModeMask = ModeMask(1 << 5);
     pub const DEVICES: ModeMask = ModeMask(1 << 6);
+    // Bit 3 was free (NOW_PLAYING=0, SEARCH=1, LIBRARY=2, COMMAND=4, …).
+    pub const ARTIST: ModeMask = ModeMask(1 << 3);
     pub const ANY: ModeMask = ModeMask(0b1111111);
 
     pub const fn or(self, other: ModeMask) -> ModeMask {
@@ -48,14 +50,16 @@ pub const HOTKEYS: &[Hotkey] = &[
     Hotkey { key: "p",      action: "play all",    modes: ModeMask::BROWSE },
     // Devices
     Hotkey { key: "enter",  action: "transfer",    modes: ModeMask::DEVICES },
+    // Artist page
+    Hotkey { key: "enter",  action: "open album",  modes: ModeMask::ARTIST },
     // Command palette
     Hotkey { key: "enter",  action: "run",         modes: ModeMask::COMMAND },
     // Movement, shared by the list-based surfaces
-    Hotkey { key: "↑/↓",    action: "move",        modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE).or(ModeMask::LIBRARY).or(ModeMask::DEVICES) },
+    Hotkey { key: "↑/↓",    action: "move",        modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE).or(ModeMask::LIBRARY).or(ModeMask::DEVICES).or(ModeMask::ARTIST) },
     // Search / menu reachable from the tabs
     Hotkey { key: "/",      action: "search",      modes: ModeMask::NOW_PLAYING.or(ModeMask::LIBRARY) },
     Hotkey { key: ":",      action: "menu",        modes: ModeMask::NOW_PLAYING.or(ModeMask::LIBRARY) },
-    Hotkey { key: "esc",    action: "back",        modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE).or(ModeMask::LIBRARY).or(ModeMask::DEVICES) },
+    Hotkey { key: "esc",    action: "back",        modes: ModeMask::SEARCH.or(ModeMask::COMMAND).or(ModeMask::BROWSE).or(ModeMask::LIBRARY).or(ModeMask::DEVICES).or(ModeMask::ARTIST) },
     Hotkey { key: "ctrl-c", action: "quit",        modes: ModeMask::ANY },
 ];
 

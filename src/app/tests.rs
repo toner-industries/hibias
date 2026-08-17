@@ -16,6 +16,8 @@ fn track(uri: &str, name: &str) -> Track {
             name: "Alb".into(),
             artists: vec![],
             images: vec![],
+            album_type: None,
+            release_date: None,
         },
     }
 }
@@ -199,6 +201,8 @@ fn resolve_album_returns_context_no_offset() {
             name: "A".into(),
             artists: vec![],
             images: vec![],
+            album_type: None,
+            release_date: None,
         }],
         ..Default::default()
     });
@@ -224,6 +228,8 @@ fn resolve_walks_across_sections() {
             name: "Al".into(),
             artists: vec![],
             images: vec![],
+            album_type: None,
+            release_date: None,
         }],
         artists: vec![Artist {
             uri: Some("spotify:artist:ar".into()),
@@ -432,6 +438,8 @@ fn resolve_album_row_returns_browse_action() {
                 name: "Artist X".into(),
             }],
             images: vec![],
+            album_type: None,
+            release_date: None,
         }],
         ..Default::default()
     });
@@ -577,6 +585,8 @@ fn dummy_album(uri: &str, name: &str, artist: &str) -> Album {
             name: artist.into(),
         }],
         images: vec![],
+        album_type: None,
+        release_date: None,
     }
 }
 
@@ -884,6 +894,8 @@ async fn set_playing_with_album(h: &Harness) {
                     name: "Architecture in Helsinki".into(),
                 }],
                 images: vec![],
+                album_type: None,
+                release_date: None,
             },
         }),
         context: None,
@@ -973,6 +985,129 @@ async fn queue_and_save_album_skip_when_nothing_playing() {
     );
     let s = h.state.lock().await;
     assert!(s.overlay.is_none());
+}
+
+#[tokio::test]
+async fn slash_clears_the_search_query() {
+    let h = Harness::new();
+    h.press_and_run(Key::Char('/')).await; // open search
+    h.type_str("abc").await;
+    h.settle().await;
+    assert_eq!(h.state.lock().await.search.input, "abc");
+
+    // `/` while already in search clears the query rather than appending a
+    // literal slash, and keeps the overlay up.
+    h.press_and_run(Key::Char('/')).await;
+    h.settle().await;
+
+    let s = h.state.lock().await;
+    assert_eq!(s.search.input, "");
+    assert_eq!(s.search.cursor, 0);
+    assert!(matches!(s.overlay, Some(Overlay::Search)));
+}
+
+/// Playback with a current track whose primary artist carries a uri, for the
+/// go-to-artist command.
+async fn set_playing_with_artist(h: &Harness) {
+    let mut s = h.state.lock().await;
+    s.playback = Some(Playback {
+        is_playing: true,
+        progress_ms: Some(0),
+        item: Some(Track {
+            id: Some("t1".into()),
+            uri: Some("spotify:track:t1".into()),
+            name: "Song".into(),
+            duration_ms: 0,
+            artists: vec![Artist {
+                uri: Some("spotify:artist:art1".into()),
+                name: "The Artist".into(),
+            }],
+            album: Album::default(),
+        }),
+        context: None,
+        timestamp: None,
+        device: None,
+    });
+}
+
+#[tokio::test]
+async fn go_to_artist_opens_artist_page_with_albums() {
+    let h = Harness::new();
+    set_playing_with_artist(&h).await;
+    h.fake.set_artist_albums(
+        "art1",
+        Ok(vec![
+            dummy_album("spotify:album:al1", "First", "The Artist"),
+            dummy_album("spotify:album:al2", "Second", "The Artist"),
+        ]),
+    );
+
+    h.run(KeyAction::GoToArtist).await;
+    h.settle().await;
+
+    let s = h.state.lock().await;
+    let Some(Overlay::Artist(art)) = &s.overlay else {
+        panic!("expected an Artist overlay");
+    };
+    assert_eq!(art.artist_name, "The Artist");
+    assert_eq!(art.albums.len(), 2);
+    assert!(!art.loading);
+    assert!(art.error.is_none());
+}
+
+#[tokio::test]
+async fn artist_page_enter_opens_selected_album_in_browse() {
+    let h = Harness::new();
+    set_playing_with_artist(&h).await;
+    h.fake.set_artist_albums(
+        "art1",
+        Ok(vec![
+            dummy_album("spotify:album:al1", "First", "The Artist"),
+            dummy_album("spotify:album:al2", "Second", "The Artist"),
+        ]),
+    );
+    h.fake
+        .set_album_tracks("al2", Ok(vec![track("spotify:track:x", "X")]));
+
+    h.run(KeyAction::GoToArtist).await;
+    h.settle().await;
+    h.press_and_run(Key::Down).await; // move to the second album
+
+    let action = h.press(Key::Enter).await;
+    assert!(
+        matches!(&action, KeyAction::OpenBrowse(c) if c.uri == "spotify:album:al2"),
+        "got {action:?}"
+    );
+    h.run(action).await;
+    h.settle().await;
+    assert_eq!(h.mode_name().await, "browse");
+}
+
+#[tokio::test]
+async fn go_to_artist_skips_when_artist_has_no_uri() {
+    let h = Harness::new();
+    // The default track helper gives artists without a uri.
+    {
+        let mut s = h.state.lock().await;
+        s.playback = Some(Playback {
+            is_playing: true,
+            progress_ms: Some(0),
+            item: Some(track("spotify:track:t1", "Song")),
+            context: None,
+            timestamp: None,
+            device: None,
+        });
+    }
+    h.run(KeyAction::GoToArtist).await;
+    h.settle().await;
+
+    let s = h.state.lock().await;
+    assert!(s.overlay.is_none());
+    assert!(!h
+        .fake
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::GetArtistAlbums(_))));
 }
 
 #[tokio::test]
@@ -1669,6 +1804,8 @@ fn long_track() -> Track {
             name: "Hot Fuss: 10th Anniversary Deluxe Edition (Remastered)".into(),
             artists: vec![],
             images: vec![],
+            album_type: None,
+            release_date: None,
         },
     }
 }
@@ -2023,6 +2160,8 @@ async fn ui_at_96x40_search_with_results_in_every_section() {
                         name: "Some Artist".into(),
                     }],
                     images: vec![],
+                    album_type: None,
+                    release_date: None,
                 })
                 .collect(),
             artists: (0..3)

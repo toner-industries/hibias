@@ -35,6 +35,8 @@ pub enum KeyAction {
     QueueCurrent,
     /// Open Browse loaded with the currently-playing track's album.
     GoToAlbum,
+    /// Open the artist page for the currently-playing track's artist.
+    GoToArtist,
     /// Save the currently-playing track's album to the user's library.
     SaveAlbumCurrent,
     /// Focus the Library tab and lazily load its active sub-tab.
@@ -260,6 +262,19 @@ fn dispatch_search(s: &mut AppState, input: Input) -> KeyAction {
             }
             KeyAction::Stay
         }
+        // `/` re-opens/resets search: clear the current query instead of
+        // appending a literal slash (which you'd never usefully search for).
+        // Leaves the overlay up, showing recents until you type again.
+        Key::Char('/') => {
+            if let Some(h) = search.debounce.take() {
+                h.abort();
+            }
+            search.input.clear();
+            search.cursor = 0;
+            search.selected = 0;
+            refilter_in_context(search);
+            KeyAction::SearchInputChanged
+        }
         Key::Char(c) => {
             let byte = char_idx_to_byte(&search.input, search.cursor);
             search.input.insert(byte, c);
@@ -429,6 +444,53 @@ fn dispatch_overlay(s: &mut AppState, input: Input) -> KeyAction {
             Key::Char('p') => KeyAction::PlayBrowseCollection,
             _ => KeyAction::Stay,
         },
+        Some(Overlay::Artist(art)) => match input.key {
+            Key::Esc => {
+                s.overlay = None;
+                KeyAction::Stay
+            }
+            Key::Up => {
+                if art.selected > 0 {
+                    art.selected -= 1;
+                }
+                KeyAction::Stay
+            }
+            Key::Down => {
+                let max = art.albums.len().saturating_sub(1);
+                if art.selected < max {
+                    art.selected += 1;
+                }
+                KeyAction::Stay
+            }
+            // Enter opens the selected album in Browse (which replaces this
+            // overlay). Reuses the whole album-browse path.
+            Key::Enter => match art.albums.get(art.selected) {
+                Some(album) => match album.uri.clone() {
+                    Some(uri) => {
+                        let subtitle = album
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        KeyAction::OpenBrowse(Collection {
+                            kind: CollectionKind::Album,
+                            uri,
+                            name: album.name.clone(),
+                            subtitle: if subtitle.is_empty() {
+                                "album".to_string()
+                            } else {
+                                format!("album · {subtitle}")
+                            },
+                            owner_id: None,
+                        })
+                    }
+                    None => KeyAction::Stay,
+                },
+                None => KeyAction::Stay,
+            },
+            _ => KeyAction::Stay,
+        },
         // Search is handled by the early return above; None is the no-overlay
         // case. Both fall through to a no-op.
         Some(Overlay::Search) | None => KeyAction::Stay,
@@ -498,6 +560,7 @@ fn dispatch_command(s: &mut AppState, input: Input) -> KeyAction {
                 Cmd::Like => KeyAction::LikeCurrent,
                 Cmd::Queue => KeyAction::QueueCurrent,
                 Cmd::GoAlbum => KeyAction::GoToAlbum,
+                Cmd::GoArtist => KeyAction::GoToArtist,
                 Cmd::SaveAlbum => KeyAction::SaveAlbumCurrent,
                 Cmd::Next => KeyAction::NextTrack,
                 Cmd::Previous => KeyAction::PrevTrack,
@@ -691,4 +754,8 @@ pub fn playlist_id_from_uri(uri: &str) -> Option<String> {
 
 pub fn album_id_from_uri(uri: &str) -> Option<String> {
     uri.strip_prefix("spotify:album:").map(|s| s.to_string())
+}
+
+pub fn artist_id_from_uri(uri: &str) -> Option<String> {
+    uri.strip_prefix("spotify:artist:").map(|s| s.to_string())
 }

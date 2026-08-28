@@ -2589,3 +2589,92 @@ async fn wait_then_transfer_gives_up_on_permanent_error() {
         .count();
     assert_eq!(transfers, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Reconnect policy: what an *automatic* reconnect is and isn't allowed to do
+// ---------------------------------------------------------------------------
+
+fn state_with_active_device(mine: Option<&str>, active: Option<&str>, playing: bool) -> AppState {
+    let mut s = AppState {
+        device_id: mine.map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(active) = active {
+        let mut pb = pb_with_ts(Some(1), "t");
+        pb.is_playing = playing;
+        pb.device = Some(Device {
+            id: Some(active.to_string()),
+            name: "somewhere".into(),
+            is_active: true,
+        });
+        s.playback = Some(pb);
+    }
+    s
+}
+
+#[test]
+fn only_a_manual_reconnect_may_clear_the_rate_limit_gate() {
+    // The 429 deadline is persisted across restarts on purpose. Boot and the
+    // watchdog must leave it alone or the back-off never actually happens.
+    assert!(ReconnectKind::Manual.may_clear_rate_limit());
+    assert!(!ReconnectKind::Foreground.may_clear_rate_limit());
+    assert!(!ReconnectKind::Background.may_clear_rate_limit());
+}
+
+#[test]
+fn background_reconnect_reclaims_playback_when_nothing_else_has_it() {
+    // Idle account: taking the device back interrupts nobody.
+    assert!(nothing_else_is_active(&state_with_active_device(
+        Some("mine"),
+        None,
+        false
+    )));
+    // We were the one playing — this is the mid-song drop we want to resume.
+    assert!(nothing_else_is_active(&state_with_active_device(
+        Some("mine"),
+        Some("mine"),
+        true
+    )));
+    // Another device holds it but is paused — nothing to interrupt.
+    assert!(nothing_else_is_active(&state_with_active_device(
+        Some("mine"),
+        Some("phone"),
+        false
+    )));
+}
+
+#[test]
+fn background_reconnect_leaves_another_playing_device_alone() {
+    // Music is playing on the user's phone. A watchdog reconnect must
+    // register the device and stop there, not yank the track over.
+    assert!(!nothing_else_is_active(&state_with_active_device(
+        Some("mine"),
+        Some("phone"),
+        true
+    )));
+    // Same, when we don't even know our own id yet.
+    assert!(!nothing_else_is_active(&state_with_active_device(
+        None,
+        Some("phone"),
+        true
+    )));
+}
+
+#[test]
+fn device_probe_schedule_stays_within_a_modest_request_budget() {
+    // Each entry is one /me/player/devices request, and a reconnect can now
+    // fire on its own — so this loop's worst case is a rate-limit concern,
+    // not just a latency one.
+    assert!(
+        DEVICE_PROBE_DELAYS.len() <= 8,
+        "probe budget grew to {} requests per reconnect",
+        DEVICE_PROBE_DELAYS.len()
+    );
+    let total: Duration = DEVICE_PROBE_DELAYS.iter().sum();
+    assert!(
+        total >= Duration::from_secs(12),
+        "gave up after only {total:?} — librespot registration can be slow"
+    );
+    // Front-loaded: the common case (device visible immediately) stays fast.
+    assert!(DEVICE_PROBE_DELAYS[0] <= Duration::from_secs(1));
+}

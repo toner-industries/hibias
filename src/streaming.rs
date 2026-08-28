@@ -9,10 +9,29 @@ use librespot_playback::{
     mixer::{softmixer::SoftMixer, Mixer, MixerConfig},
     player,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 pub struct Streaming {
     spirc: Spirc,
+    /// A handle on the same session Spirc is driving, purely so we can ask
+    /// whether it's still alive (see [`Streaming::is_dead`]).
+    session: Session,
+    /// Set when the Spirc background task returns. librespot's Spirc loop
+    /// exits as soon as its session goes invalid — a network drop, a laptop
+    /// suspend, or Spotify's access point hanging up on an idle connection —
+    /// and it does so *silently*: the device just disappears from Spotify
+    /// Connect while hibias keeps believing it's registered. This flag is how
+    /// the watchdog notices, and it costs zero Web API requests to check.
+    task_done: Arc<AtomicBool>,
+    /// Set by [`Streaming::shutdown`] so the watchdog can tell our own
+    /// teardown (reconnect, quit) from a session that died under us.
+    intentional: Arc<AtomicBool>,
     pub device_name: String,
     pub device_id: String,
 }
@@ -23,7 +42,18 @@ impl Streaming {
     /// session is already broken this may error but we don't care —
     /// we're tearing it down either way.
     pub fn shutdown(&self) -> Result<()> {
+        self.intentional.store(true, Ordering::SeqCst);
         self.spirc.shutdown().map_err(|e| anyhow!("{e}"))
+    }
+
+    /// True when this Connect device is gone from Spotify's point of view but
+    /// we never asked for that — the state the watchdog exists to repair.
+    /// Deliberately local-only (an atomic plus librespot's own session flag):
+    /// health checks must never cost a request, or the watchdog becomes its
+    /// own rate-limit problem.
+    pub fn is_dead(&self) -> bool {
+        !self.intentional.load(Ordering::SeqCst)
+            && (self.task_done.load(Ordering::SeqCst) || self.session.is_invalid())
     }
 }
 
@@ -121,14 +151,32 @@ pub async fn start(device_name: &str) -> Result<Streaming> {
         move || backend(None, AudioFormat::default()),
     );
 
-    let (spirc, spirc_task) = Spirc::new(connect_config, session, creds, player, mixer)
+    let (spirc, spirc_task) = Spirc::new(connect_config, session.clone(), creds, player, mixer)
         .await
         .context("spirc init")?;
 
-    tokio::spawn(spirc_task);
+    // Wrap the Spirc task so its exit is observable. Bare `tokio::spawn` here
+    // meant a dead session was indistinguishable from a healthy one until the
+    // user pressed a key and got a 404 back from Spotify.
+    let task_done = Arc::new(AtomicBool::new(false));
+    let intentional = Arc::new(AtomicBool::new(false));
+    {
+        let task_done = task_done.clone();
+        let intentional = intentional.clone();
+        tokio::spawn(async move {
+            spirc_task.await;
+            task_done.store(true, Ordering::SeqCst);
+            if !intentional.load(Ordering::SeqCst) {
+                crate::log::note("spirc task exited (session died)", None);
+            }
+        });
+    }
 
     Ok(Streaming {
         spirc,
+        session,
+        task_done,
+        intentional,
         device_name: device_name.to_string(),
         device_id,
     })

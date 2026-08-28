@@ -37,7 +37,8 @@ the core free of ratatui types — the seam that lets a non-TUI head reuse it).
 
 Supporting modules: `auth` (OAuth/PKCE), `log` (async SQLite event log),
 `input` (frontend-neutral key type), `keys` (hotkey/footer tables + `ModeMask`),
-`recent` (recent-search persistence), `streaming` (librespot Connect device —
+`recent` (recent-search persistence), `streaming` (librespot Connect device +
+session-liveness flags —
 mints its own credentials via librespot OAuth into `~/.cache/hibias`; falls back
 to spotify-player's legacy cache at `~/.cache/spotify-player` if that's the
 only one with credentials),
@@ -49,10 +50,34 @@ only one with credentials),
 auth-vs-replay branch → `streaming::ensure_credentials` (first-run librespot
 OAuth, pre-TUI, skipped under replay) → `spawn_reconnect` (skipped under
 replay) →
-`spawn_boot_seed` → `run()` spawns `spawn_playback_poll` + an event-reader task
+`spawn_boot_seed` → `run()` spawns `spawn_playback_poll` +
+`spawn_session_watchdog` + an event-reader task
 → `select!(redraw tick 100ms, event channel)`. Keypresses arrive over an
 `mpsc` channel (cancellation-safe) rather than a raw `EventStream`, so none are
 lost to a redraw tick.
+
+## Connect-device liveness
+
+librespot's Spirc loop exits *silently* when its session goes invalid (laptop
+suspend, network blip, Spotify's AP dropping an idle connection) — the device
+vanishes from Connect while the app still believes it's registered.
+`Streaming::is_dead()` makes that observable (an `AtomicBool` set when the
+Spirc task returns, plus `Session::is_invalid`), and `spawn_session_watchdog`
+rebuilds the session on a 5s tick with 15s→5min backoff. **The health check is
+local by design** — polling Spotify to ask "am I still there?" would make the
+watchdog its own rate-limit problem.
+
+`ReconnectKind` decides what a reconnect may do, and exists entirely to keep
+automatic reconnects from amplifying rate limits:
+
+| Kind | Clears the 429 gate | Transfers playback back |
+|------|---------------------|-------------------------|
+| `Manual` (`:reconnect`) | yes — the user's escape hatch | always |
+| `Foreground` (boot, user action hitting an offline device) | **no** | always |
+| `Background` (watchdog) | **no** | only if no other device is playing |
+
+Only `Manual` clears the gate: the 429 deadline is persisted in
+`hibias-ratelimit.json` precisely so a restart doesn't walk back into one.
 
 ## The three orthogonal modes
 

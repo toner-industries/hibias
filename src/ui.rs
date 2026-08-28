@@ -291,11 +291,19 @@ fn status_line(state: &AppState) -> Option<(String, Color)> {
             ));
         }
     }
+    // The watchdog rebuilds a dead session on its own, so say so rather than
+    // leaving the user staring at a warning with no visible progress.
+    if state.reconnecting {
+        return Some((
+            "⟳ reconnecting Connect device 'hibias'...".to_string(),
+            Color::Yellow,
+        ));
+    }
     // Surface a persistent warning when the librespot device has dropped off
     // Spotify Connect — without it the user just sees mysterious 404s.
     if state.device_present == Some(false) {
         return Some((
-            "⚠ Connect device 'hibias' is offline — auto-reconnects on your next action".to_string(),
+            "⚠ Connect device 'hibias' is offline — reconnecting automatically".to_string(),
             Color::Yellow,
         ));
     }

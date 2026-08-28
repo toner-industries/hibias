@@ -676,20 +676,127 @@ pub struct InContext {
 // Reconnect / device lifecycle
 // ---------------------------------------------------------------------------
 
+/// Who asked for this reconnect. The distinction matters because an
+/// *automatic* reconnect can fire while nobody is watching, so it must not
+/// take the two liberties a hand-typed `:reconnect` is allowed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReconnectKind {
+    /// Explicit `:reconnect` — the user's "get me unstuck" lever. Clears the
+    /// rate-limit gate and always transfers playback back to us.
+    Manual,
+    /// Boot, or a user action that ran into an offline device. Transfers
+    /// playback back, but never clears a live 429 gate: that deadline is
+    /// deliberately persisted across restarts (`hibias-ratelimit.json`), and
+    /// wiping it on every launch is exactly how a 30s back-off snowballs into
+    /// a multi-hour one.
+    Foreground,
+    /// Watchdog-driven, with nobody necessarily at the keyboard. Never clears
+    /// the gate, and only takes playback back if we were the device that had
+    /// it — silently yanking a track off the user's phone is worse than
+    /// sitting idle until they ask.
+    Background,
+}
+
+impl ReconnectKind {
+    /// Only a hand-typed `:reconnect` may wipe the 429 gate.
+    fn may_clear_rate_limit(self) -> bool {
+        matches!(self, ReconnectKind::Manual)
+    }
+}
+
 /// Kick off a reconnect on a background task. Safe to call multiple times
 /// — the in-flight guard inside `reconnect_now` collapses concurrent
-/// triggers (e.g., auto-watchdog firing while a manual `:reconnect` is
+/// triggers (e.g., the watchdog firing while a manual `:reconnect` is
 /// already running).
 pub fn spawn_reconnect(
     client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     reason: &'static str,
+    kind: ReconnectKind,
 ) {
     let client = client.clone();
     let state = state.clone();
     tokio::spawn(async move {
-        reconnect_now(&client, &state, reason).await;
+        reconnect_now(&client, &state, reason, kind).await;
     });
+}
+
+/// Cadence of the local session-health check. The check itself is an atomic
+/// read — it never touches the Spotify API — so a tight-ish tick is free;
+/// only an actual reconnect costs requests, and that is backed off below.
+const WATCHDOG_TICK: Duration = Duration::from_secs(5);
+/// Minimum spacing between watchdog-driven reconnect attempts, doubling up to
+/// [`WATCHDOG_BACKOFF_MAX`] while they keep failing. Without this, a Spotify-
+/// side outage would turn into a reconnect loop, and every attempt spends
+/// device probes against the rate limiter.
+const WATCHDOG_BACKOFF_MIN: Duration = Duration::from_secs(15);
+const WATCHDOG_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Watch the librespot session and rebuild it when it dies.
+///
+/// librespot's Spirc loop exits silently the moment its session goes invalid
+/// — a laptop suspend, a network blip, or Spotify's access point closing an
+/// idle connection. Before this existed, hibias only found out by getting a
+/// 404 back from a control call, which is why coming back to the app after a
+/// while reliably greeted the user with "Connect device 'hibias' is offline".
+///
+/// The health check is deliberately local (see [`streaming::Streaming::is_dead`])
+/// so idling in this loop costs nothing at all against the rate limiter.
+pub fn spawn_session_watchdog(
+    client: Arc<dyn SpotifyApi>,
+    state: Arc<Mutex<AppState>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = WATCHDOG_BACKOFF_MIN;
+        let mut next_attempt: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(WATCHDOG_TICK).await;
+
+            let down = {
+                let mut s = state.lock().await;
+                if s.reconnecting {
+                    continue;
+                }
+                match s.streaming.as_ref() {
+                    Some(st) if st.is_dead() => {
+                        // Surface it immediately rather than waiting for the
+                        // user's next keypress to 404.
+                        s.device_present = Some(false);
+                        true
+                    }
+                    Some(_) => false,
+                    // No session at all: only worth retrying if a start was
+                    // attempted and failed (otherwise we're pre-boot, or
+                    // running as a pure remote control).
+                    None => s.streaming_failed.is_some(),
+                }
+            };
+
+            if !down {
+                // Healthy — forget any accumulated backoff.
+                backoff = WATCHDOG_BACKOFF_MIN;
+                next_attempt = None;
+                continue;
+            }
+            if next_attempt.is_some_and(|t| Instant::now() < t) {
+                continue;
+            }
+
+            log::note(
+                "watchdog: connect device down, reconnecting",
+                Some(&format!("next retry no sooner than {}s", backoff.as_secs())),
+            );
+            reconnect_now(
+                &client,
+                &state,
+                "watchdog: session died",
+                ReconnectKind::Background,
+            )
+            .await;
+            next_attempt = Some(Instant::now() + backoff);
+            backoff = (backoff * 2).min(WATCHDOG_BACKOFF_MAX);
+        }
+    })
 }
 
 /// Tear down the current librespot session (if any) and start a fresh one.
@@ -699,27 +806,40 @@ pub async fn reconnect_now(
     client: &Arc<dyn SpotifyApi>,
     state: &Arc<Mutex<AppState>>,
     reason: &'static str,
+    kind: ReconnectKind,
 ) {
     // Skip if a reconnect is already underway.
-    {
+    let should_transfer = {
         let mut s = state.lock().await;
         if s.reconnecting {
             log::note("reconnect: already in flight, skipping", Some(reason));
             return;
         }
+        // Decide the transfer question *before* wiping our device id below.
+        // A background reconnect only reclaims playback if no other device
+        // has it; a user-driven one always does, because the user is right
+        // there asking for hibias to be the thing that plays.
+        let should_transfer = kind != ReconnectKind::Background || nothing_else_is_active(&s);
         s.reconnecting = true;
-        // Reset visible state for the "starting" indicator. Also clear
-        // any lingering rate-limit and error state — Spotify sometimes
-        // hands out absurdly long Retry-After headers after a bad probe
-        // loop, and a manual reconnect is the user's "get me unstuck" lever.
+        // Reset visible state for the "starting" indicator.
         s.streaming_failed = None;
         s.device_name = None;
         s.device_id = None;
         s.device_present = None;
-        s.rate_limited_until = None;
         s.error = None;
+        // Clearing the rate-limit gate is a manual-only escape hatch: Spotify
+        // sometimes hands out absurdly long Retry-After headers after a bad
+        // probe loop, and `:reconnect` is how the user says "let me try
+        // anyway". An automatic reconnect doing the same would defeat the
+        // whole back-off, so it leaves the gate alone.
+        if kind.may_clear_rate_limit() {
+            s.rate_limited_until = None;
+        }
+        should_transfer
+    };
+    if kind.may_clear_rate_limit() {
+        client.clear_rate_limit();
     }
-    client.clear_rate_limit();
     log::note("reconnect: starting", Some(reason));
 
     // Shut down the existing session (if any). This is fire-and-forget;
@@ -760,7 +880,12 @@ pub async fn reconnect_now(
             // The periodic poll wouldn't pick that up for up to 30s, so the
             // now-playing view would sit at the stale seed (often 0:00) until
             // then. Re-poll immediately so the real position lands within ~1.5s.
-            if wait_then_transfer(client.as_ref(), &device_id_for_transfer).await {
+            if !should_transfer {
+                log::note(
+                    "reconnect: device registered, leaving playback where it is",
+                    Some("another device is active"),
+                );
+            } else if wait_then_transfer(client.as_ref(), &device_id_for_transfer).await {
                 spawn_post_play_poll(client.clone(), state.clone());
             }
         }
@@ -792,17 +917,55 @@ pub async fn reconnect_if_device_offline(
             "device offline — auto-reconnecting on user action",
             Some(caller),
         );
-        spawn_reconnect(client, state, "user action while offline");
+        spawn_reconnect(
+            client,
+            state,
+            "user action while offline",
+            ReconnectKind::Foreground,
+        );
     }
     offline
+}
+
+/// Sleep-before-probe schedule for "has our device shown up on Spotify
+/// Connect yet?". Front-loaded then backing off, because the device is
+/// normally visible on the first or second probe. The previous flat
+/// 500ms × 24 loop could spend 24 `/me/player/devices` requests in 12s — by
+/// far the app's heaviest burst, and precisely the one an automatic reconnect
+/// would otherwise repeat on every attempt.
+const DEVICE_PROBE_DELAYS: [Duration; 7] = [
+    Duration::from_millis(750),
+    Duration::from_millis(1000),
+    Duration::from_millis(1500),
+    Duration::from_millis(2000),
+    Duration::from_millis(3000),
+    Duration::from_millis(4000),
+    Duration::from_millis(5000),
+];
+
+/// True when no *other* Connect device currently holds playback, i.e. taking
+/// it back can't interrupt anything the user is listening to elsewhere.
+fn nothing_else_is_active(s: &AppState) -> bool {
+    let active = s
+        .playback
+        .as_ref()
+        .filter(|p| p.is_playing)
+        .and_then(|p| p.device.as_ref())
+        .and_then(|d| d.id.as_deref());
+    match (active, s.device_id.as_deref()) {
+        // Nothing playing anywhere, or we don't know — nothing to steal.
+        (None, _) => true,
+        (Some(active), Some(mine)) => active == mine,
+        (Some(_), None) => false,
+    }
 }
 
 /// Returns `true` once playback has been transferred to our device — the
 /// caller uses this to know the server-side position is now authoritative for
 /// us and worth re-polling immediately.
 pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) -> bool {
-    for attempt in 0..24 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    for (attempt, delay) in DEVICE_PROBE_DELAYS.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
         // Bail the whole loop if the rate-limit gate trips mid-probe; we
         // don't want to keep poking /me/player/devices every 500ms while
         // we're meant to be backing off.
@@ -858,7 +1021,7 @@ pub async fn wait_then_transfer(client: &dyn SpotifyApi, device_id: &str) -> boo
     }
     log::error(
         "wait_then_transfer",
-        "device never appeared in /me/player/devices after 12s",
+        "device never appeared in /me/player/devices",
     );
     false
 }
@@ -2373,6 +2536,7 @@ pub async fn refresh_queue(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppSt
 pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
     tokio::spawn(async move {
         let mut queue_refreshed = false;
+        let mut empty_polls = 0;
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             // The client's send_logged would short-circuit anyway, but
@@ -2388,6 +2552,7 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
             // (last_local_action_ms == 0) it wouldn't, so filter explicitly.
             if let Ok(Some(pb)) = client.get_playback().await {
                 if pb.item.is_some() {
+                    let incoming_id = pb.item.as_ref().and_then(|t| t.id.clone());
                     apply_playback(&state, Some(pb)).await;
                     // First real post-play state: the regular poll won't
                     // refresh Up Next for this play (the track id it compares
@@ -2397,7 +2562,36 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
                         queue_refreshed = true;
                         refresh_queue(&client, &state).await;
                     }
+                    // Spotify has caught up: the track it reports is the one
+                    // now on screen, so its position is authoritative and the
+                    // rest of the burst would re-learn nothing. Stopping here
+                    // matters because this is the app's densest run of
+                    // requests (6 in 1.5s) and it fires on every play *and*
+                    // every reconnect — a real contributor to the sustained
+                    // load that trips 429s.
+                    let confirmed = {
+                        let s = state.lock().await;
+                        incoming_id.is_some() && s.current_track_id == incoming_id
+                    };
+                    if confirmed {
+                        break;
+                    }
+                    empty_polls = 0;
+                    continue;
                 }
+            }
+            // Spotify reported nothing playing. Right after a play *action*
+            // that's the well-known "hasn't caught up yet" race and riding it
+            // out is the entire point of this burst — but at boot with an
+            // idle account there is nothing to catch up to, and the remaining
+            // polls are pure waste (six requests on every single launch).
+            let awaiting_local_play = {
+                let s = state.lock().await;
+                now_unix_ms().saturating_sub(s.last_local_action_ms) < 5_000
+            };
+            empty_polls += 1;
+            if !awaiting_local_play && empty_polls >= 2 {
+                break;
             }
         }
     });

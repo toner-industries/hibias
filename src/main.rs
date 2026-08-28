@@ -31,7 +31,7 @@ use api::{Playback, RateLimited, SpotifyApi, SpotifyClient};
 use app::{
     apply_playback_force, dispatch_input, like_current_track, mode_name, play_browse_collection,
     play_browse_selection, play_selection, seek_relative, skip_track, spawn_post_play_poll,
-    spawn_reconnect, toggle_playback, AppState, KeyAction,
+    spawn_reconnect, spawn_session_watchdog, toggle_playback, AppState, KeyAction, ReconnectKind,
 };
 use input::{Input, Key, Mods};
 
@@ -109,7 +109,7 @@ async fn hibias_main() -> Result<()> {
     // seconds and we don't want to block the screen on it. Skipped in replay
     // mode: there is no real session to bring up offline.
     if replay_path.is_none() {
-        spawn_reconnect(&client, &state, "boot");
+        spawn_reconnect(&client, &state, "boot", ReconnectKind::Foreground);
     }
 
     // Kick off a recently-played fetch in the background. Doubles as:
@@ -120,7 +120,14 @@ async fn hibias_main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     install_panic_hook();
-    let result = run(&mut terminal, client, state, art_loader).await;
+    let result = run(
+        &mut terminal,
+        client,
+        state,
+        art_loader,
+        replay_path.is_some(),
+    )
+    .await;
     teardown_terminal(&mut terminal).ok();
     result
 }
@@ -263,8 +270,17 @@ async fn run(
     client: Arc<dyn SpotifyApi>,
     state: Arc<Mutex<AppState>>,
     art_loader: Arc<art::ArtLoader>,
+    replay: bool,
 ) -> Result<()> {
     let poll_handle = spawn_playback_poll(client.clone(), state.clone());
+    // Rebuilds the Connect device whenever librespot's session dies under us
+    // (suspend, network blip, idle disconnect). Costs no Spotify requests
+    // while everything is healthy — see `spawn_session_watchdog`.
+    let watchdog_handle = if replay {
+        None
+    } else {
+        Some(spawn_session_watchdog(client.clone(), state.clone()))
+    };
 
     // The decoded album-art cache lives here in the head, not in AppState —
     // the core only signals what to show via `state.art_request`. Behind its
@@ -373,7 +389,12 @@ async fn run(
                             app::refresh_queue(&client, &state).await;
                         }
                         KeyAction::Reconnect => {
-                            spawn_reconnect(&client, &state, "user: :reconnect");
+                            spawn_reconnect(
+                                &client,
+                                &state,
+                                "user: :reconnect",
+                                ReconnectKind::Manual,
+                            );
                         }
                         KeyAction::LikeCurrent => like_current_track(&client, &state).await,
                         KeyAction::QueueCurrent => {
@@ -427,7 +448,17 @@ async fn run(
     }
 
     poll_handle.abort();
+    if let Some(h) = watchdog_handle {
+        h.abort();
+    }
     event_reader.abort();
+    // Deregister the Connect device on the way out so Spotify doesn't keep a
+    // zombie 'hibias' in the device list.
+    if let Some(st) = state.lock().await.streaming.take() {
+        if let Err(e) = st.shutdown() {
+            log::note("shutdown: spirc shutdown err", Some(&format!("{e:#}")));
+        }
+    }
     Ok(())
 }
 

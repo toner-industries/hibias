@@ -223,8 +223,7 @@ fn render_up_next(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-    for idx in scroll..end {
-        let t = upcoming[idx];
+    for (idx, t) in upcoming.iter().enumerate().take(end).skip(scroll) {
         let artists = t
             .artists
             .iter()

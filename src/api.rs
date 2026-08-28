@@ -1793,8 +1793,6 @@ mod tests {
              "artists":[{"name":"A"}],"album":{"name":"Alb","images":[]}}
         ]}
     }"#;
-    const DEVICES_JSON: &str = r#"{"devices":[{"id":"d1","name":"hibias","is_active":true}]}"#;
-
     #[test]
     fn cassette_key_maps_read_endpoints() {
         let k = |m, u: &str| cassette_key(m, u);
@@ -1940,12 +1938,12 @@ mod tests {
                     latency_ms INTEGER, body TEXT, detail TEXT);",
             )
             .unwrap();
-            let mut ins = |kind: &str,
-                           rid: i64,
-                           method: Option<&str>,
-                           url: Option<&str>,
-                           status: Option<i64>,
-                           body: Option<&str>| {
+            let ins = |kind: &str,
+                       rid: i64,
+                       method: Option<&str>,
+                       url: Option<&str>,
+                       status: Option<i64>,
+                       body: Option<&str>| {
                 conn.execute(
                     "INSERT INTO events (ts, ts_unix_ms, kind, request_id, method, url, status, latency_ms, body, detail)
                      VALUES ('t', 0, ?1, ?2, ?3, ?4, ?5, 0, ?6, NULL)",

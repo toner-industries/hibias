@@ -570,20 +570,11 @@ impl Cmd {
     }
 }
 
+#[derive(Default)]
 pub struct CommandState {
     pub input: String,
     pub cursor: usize,
     pub selected: usize,
-}
-
-impl Default for CommandState {
-    fn default() -> Self {
-        Self {
-            input: String::new(),
-            cursor: 0,
-            selected: 0,
-        }
-    }
 }
 
 impl CommandState {
@@ -1862,7 +1853,7 @@ pub async fn play_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mutex<AppS
     log::note("play_selection", Some(&action_desc));
 
     let result = match &action {
-        PlayAction::Track(uri) => client.play_uris(&[uri.clone()]).await,
+        PlayAction::Track(uri) => client.play_uris(std::slice::from_ref(uri)).await,
         PlayAction::Context { uri, offset } => client.play_context(uri, offset.as_deref()).await,
     };
 

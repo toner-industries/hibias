@@ -174,8 +174,10 @@ fn synth_template_for_context_without_offset_is_none() {
 #[test]
 fn synth_with_matching_timestamp_is_accepted() {
     let ts = now_unix_ms();
-    let mut s = AppState::default();
-    s.last_local_action_ms = ts;
+    let s = AppState {
+        last_local_action_ms: ts,
+        ..Default::default()
+    };
     let mut synth = pb_with_ts(Some(ts), "POWER");
     synth.is_playing = true;
     assert!(should_accept(&s, Some(&synth)));
@@ -422,7 +424,7 @@ fn displayed_progress_for_toggle_paused_returns_stored() {
 fn displayed_progress_for_toggle_playing_adds_elapsed() {
     let s = state_with_playback(45_000, true);
     let got = displayed_progress_for_toggle(&s);
-    assert!(got >= 45_000 && got < 45_500, "got {got}");
+    assert!((45_000..45_500).contains(&got), "got {got}");
 }
 
 // --- browse routing -------------------------------------------------
@@ -535,17 +537,21 @@ fn cmd_filtered_empty_input_returns_all() {
 
 #[test]
 fn cmd_filtered_case_insensitive_substring() {
-    let mut s = CommandState::default();
-    s.input = "PaUs".into();
+    let s = CommandState {
+        input: "PaUs".into(),
+        ..Default::default()
+    };
     let got: Vec<&'static str> = s.filtered().iter().map(|c| c.name()).collect();
     assert!(got.contains(&"play / pause"), "got: {got:?}");
 }
 
 #[test]
 fn cmd_selected_indexes_into_filtered() {
-    let mut s = CommandState::default();
-    s.input = "re".into();
-    s.selected = 1;
+    let s = CommandState {
+        input: "re".into(),
+        selected: 1,
+        ..Default::default()
+    };
     let chosen = s.selected_cmd().expect("must select");
     let names: Vec<&'static str> = s.filtered().iter().map(|c| c.name()).collect();
     assert_eq!(chosen.name(), names[1]);
@@ -553,8 +559,10 @@ fn cmd_selected_indexes_into_filtered() {
 
 #[test]
 fn cmd_selected_out_of_range_returns_none() {
-    let mut s = CommandState::default();
-    s.selected = 999;
+    let s = CommandState {
+        selected: 999,
+        ..Default::default()
+    };
     assert!(s.selected_cmd().is_none());
 }
 

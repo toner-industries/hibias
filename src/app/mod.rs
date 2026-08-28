@@ -112,6 +112,14 @@ pub struct AppState {
     /// owned playlist from a followed/editorial one when the tracks endpoint
     /// 403s, so we only show the "locked" warning for ones we can't fix.
     pub me_id: Option<String>,
+    /// True when what's on screen is the boot *placeholder* — the recently
+    /// played seed seen when `/me/player` had nothing to report — rather than
+    /// state Spotify actually confirmed. That seed is the most recently
+    /// *finished* track, so it is almost never the one a boot transfer
+    /// resumes: leaving it up means showing the wrong title and artist over
+    /// the right audio. Anything real replaces it, and until something does,
+    /// the poll runs at the fast cadence to keep the window short.
+    pub placeholder: bool,
 }
 
 impl Default for AppState {
@@ -142,6 +150,7 @@ impl Default for AppState {
             reconnecting: false,
             notice: None,
             me_id: None,
+            placeholder: false,
         }
     }
 }
@@ -1358,6 +1367,22 @@ pub async fn play_library_selection(client: &Arc<dyn SpotifyApi>, state: &Arc<Mu
     }
 }
 
+/// Sleep-before-poll schedule for confirming a play (or a reconnect transfer)
+/// against Spotify's own view, stopping as soon as it agrees. Backed off
+/// rather than six polls in a flat 1.5s: the answer usually lands on the first
+/// or second, but a track resumed by a Connect transfer can take several
+/// seconds to surface, and giving up early strands the boot placeholder — the
+/// *previous* track — on screen over the right audio.
+const POST_PLAY_POLL_DELAYS: [Duration; 7] = [
+    Duration::from_millis(250),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+    Duration::from_millis(3000),
+    Duration::from_millis(4000),
+];
+
 /// Possible result payloads for a library section fetch, so one spawn site can
 /// handle all four sub-tabs.
 enum LibraryItems {
@@ -1940,7 +1965,7 @@ pub fn find_track_by_uri(search: &SearchState, uri: &str) -> Option<Track> {
 }
 
 pub async fn apply_playback(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) {
-    apply_playback_inner(state, pb, false).await
+    apply_playback_inner(state, pb, false, false).await
 }
 
 /// Apply a polled playback result and, if it advanced to a new track while the
@@ -1969,10 +1994,23 @@ pub async fn apply_polled_playback(
 /// synthesized seed (e.g. the recently-played track shown at startup),
 /// which would otherwise be filtered out by the boot guard.
 pub async fn apply_playback_force(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) {
-    apply_playback_inner(state, pb, true).await
+    apply_playback_inner(state, pb, true, false).await
 }
 
-async fn apply_playback_inner(state: &Arc<Mutex<AppState>>, pb: Option<Playback>, force: bool) {
+/// Apply the boot placeholder — the recently-played seed shown when Spotify
+/// reported nothing. Same as [`apply_playback_force`] but flags the result as
+/// unconfirmed, so the poll loop hurries to replace it (see
+/// [`AppState::placeholder`]).
+pub async fn apply_playback_placeholder(state: &Arc<Mutex<AppState>>, pb: Option<Playback>) {
+    apply_playback_inner(state, pb, true, true).await
+}
+
+async fn apply_playback_inner(
+    state: &Arc<Mutex<AppState>>,
+    pb: Option<Playback>,
+    force: bool,
+    placeholder: bool,
+) {
     // Device-presence recovery, ahead of the freshness gate: even a *stale*
     // playback snapshot names the currently-active device, so seeing our own
     // device id there proves the Connect registration is alive. Without this,
@@ -2035,6 +2073,9 @@ async fn apply_playback_inner(state: &Arc<Mutex<AppState>>, pb: Option<Playback>
     let has_track = pb.as_ref().and_then(|p| p.item.as_ref()).is_some();
     let mut s = state.lock().await;
     let prev = s.current_track_id.clone();
+    // Whatever we're applying now is the new truth: a real poll clears the
+    // placeholder flag, a fresh placeholder re-raises it.
+    s.placeholder = placeholder;
     s.playback = pb;
     s.last_poll = Some(Instant::now());
     s.error = None;
@@ -2537,8 +2578,8 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
     tokio::spawn(async move {
         let mut queue_refreshed = false;
         let mut empty_polls = 0;
-        for _ in 0..6 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        for delay in POST_PLAY_POLL_DELAYS {
+            tokio::time::sleep(delay).await;
             // The client's send_logged would short-circuit anyway, but
             // bailing the whole burst is cleaner — no point chewing through
             // six instant-fail RateLimited errors.
@@ -2580,17 +2621,18 @@ pub fn spawn_post_play_poll(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppSta
                     continue;
                 }
             }
-            // Spotify reported nothing playing. Right after a play *action*
-            // that's the well-known "hasn't caught up yet" race and riding it
-            // out is the entire point of this burst — but at boot with an
-            // idle account there is nothing to catch up to, and the remaining
-            // polls are pure waste (six requests on every single launch).
-            let awaiting_local_play = {
+            // Spotify reported nothing playing. Right after a play *action*,
+            // or while a boot placeholder is still on screen awaiting the
+            // track a transfer is resuming, that's the well-known "hasn't
+            // caught up yet" race and riding it out is the entire point of
+            // this burst. With nothing pending there is nothing to catch up
+            // to, and the remaining polls would be pure waste.
+            let pending = {
                 let s = state.lock().await;
-                now_unix_ms().saturating_sub(s.last_local_action_ms) < 5_000
+                s.placeholder || now_unix_ms().saturating_sub(s.last_local_action_ms) < 5_000
             };
             empty_polls += 1;
-            if !awaiting_local_play && empty_polls >= 2 {
+            if !pending && empty_polls >= 2 {
                 break;
             }
         }

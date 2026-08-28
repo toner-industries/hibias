@@ -29,9 +29,10 @@ mod ui;
 
 use api::{Playback, RateLimited, SpotifyApi, SpotifyClient};
 use app::{
-    apply_playback_force, dispatch_input, like_current_track, mode_name, play_browse_collection,
-    play_browse_selection, play_selection, seek_relative, skip_track, spawn_post_play_poll,
-    spawn_reconnect, spawn_session_watchdog, toggle_playback, AppState, KeyAction, ReconnectKind,
+    apply_playback_force, apply_playback_placeholder, dispatch_input, like_current_track,
+    mode_name, play_browse_collection, play_browse_selection, play_selection, seek_relative,
+    skip_track, spawn_post_play_poll, spawn_reconnect, spawn_session_watchdog, toggle_playback,
+    AppState, KeyAction, ReconnectKind,
 };
 use input::{Input, Key, Mods};
 
@@ -195,7 +196,11 @@ fn spawn_boot_seed(client: Arc<dyn SpotifyApi>, state: Arc<Mutex<AppState>>) {
                             timestamp: None,
                             device: None,
                         };
-                        apply_playback_force(&state, Some(synth)).await;
+                        // Flagged as a placeholder, not confirmed state: this
+                        // is the most recently *finished* track, so once the
+                        // boot transfer resumes something it will be the wrong
+                        // title over the right audio until a real poll lands.
+                        apply_playback_placeholder(&state, Some(synth)).await;
                     }
                 }
             }
@@ -486,7 +491,11 @@ fn spawn_playback_poll(
             let (delay, gated) = {
                 let s = state.lock().await;
                 let is_playing = s.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
-                let delay = if is_playing {
+                // An unconfirmed placeholder gets the fast cadence too: it's
+                // showing a track Spotify never reported, so the sooner a real
+                // poll replaces it the better. Self-limiting — the very next
+                // applied result clears the flag either way.
+                let delay = if is_playing || s.placeholder {
                     PLAYBACK_POLL_PLAYING
                 } else {
                     PLAYBACK_POLL_PAUSED

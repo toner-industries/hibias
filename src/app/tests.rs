@@ -1632,8 +1632,7 @@ async fn esc_on_tab_strip_returns_to_content() {
 #[tokio::test]
 async fn library_loads_active_subtab_once() {
     let h = Harness::new();
-    h.fake
-        .set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
+    h.fake.set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
 
     // Enter Library — Liked is the default sub-tab and should fetch once.
     h.open_library().await;
@@ -2677,4 +2676,86 @@ fn device_probe_schedule_stays_within_a_modest_request_budget() {
     );
     // Front-loaded: the common case (device visible immediately) stays fast.
     assert!(DEVICE_PROBE_DELAYS[0] <= Duration::from_secs(1));
+}
+
+// ---------------------------------------------------------------------------
+// Boot placeholder: the recently-played seed must never outlive real state
+// ---------------------------------------------------------------------------
+
+/// The recently-played seed is the most recently *finished* track — a
+/// different song from whatever a boot transfer resumes. This is the "wrong
+/// title over the right audio" case.
+#[tokio::test]
+async fn a_real_poll_replaces_the_boot_placeholder() {
+    let state = Arc::new(Mutex::new(AppState::default()));
+    let seed = Playback {
+        is_playing: false,
+        progress_ms: Some(0),
+        item: Some(track("spotify:track:toadies", "Possum Kingdom")),
+        context: None,
+        timestamp: None,
+        device: None,
+    };
+    apply_playback_placeholder(&state, Some(seed)).await;
+    {
+        let s = state.lock().await;
+        assert!(s.placeholder, "the seed is unconfirmed state");
+        assert_eq!(s.current_track_id.as_deref(), Some("toadies"));
+    }
+
+    // The transfer resumed a different track and Spotify finally reports it.
+    let real = Playback {
+        is_playing: true,
+        progress_ms: Some(42_000),
+        item: Some(track("spotify:track:creep", "Creep")),
+        context: None,
+        timestamp: Some(1),
+        device: None,
+    };
+    apply_playback(&state, Some(real)).await;
+
+    let s = state.lock().await;
+    assert_eq!(
+        s.current_track_id.as_deref(),
+        Some("creep"),
+        "a real poll must win over the placeholder"
+    );
+    assert!(!s.placeholder, "and the state is confirmed afterwards");
+}
+
+#[tokio::test]
+async fn an_empty_poll_also_clears_the_placeholder_flag() {
+    // Otherwise "nothing is playing after all" would leave the flag raised
+    // and pin the poll loop to the fast cadence forever.
+    let state = Arc::new(Mutex::new(AppState::default()));
+    let seed = Playback {
+        is_playing: false,
+        progress_ms: Some(0),
+        item: Some(track("spotify:track:toadies", "Possum Kingdom")),
+        context: None,
+        timestamp: None,
+        device: None,
+    };
+    apply_playback_placeholder(&state, Some(seed)).await;
+    // last_local_action_ms is 0, so should_accept believes a bare 204.
+    apply_playback(&state, None).await;
+    let s = state.lock().await;
+    assert!(!s.placeholder);
+    assert!(s.playback.is_none());
+}
+
+#[test]
+fn post_play_poll_waits_long_enough_for_a_resumed_transfer() {
+    // A Connect transfer can take seconds to surface in /me/player. The old
+    // flat 6 x 250ms gave up at 1.5s and stranded the placeholder on screen
+    // until the slow paused-cadence poll came round.
+    let total: Duration = POST_PLAY_POLL_DELAYS.iter().sum();
+    assert!(
+        total >= Duration::from_secs(10),
+        "burst covers only {total:?}"
+    );
+    // Still cheap: it stops as soon as Spotify agrees, and this is the cap.
+    assert!(POST_PLAY_POLL_DELAYS.len() <= 8);
+    // The common case (Spotify already agrees) still resolves fast.
+    assert!(POST_PLAY_POLL_DELAYS[0] <= Duration::from_millis(250));
 }

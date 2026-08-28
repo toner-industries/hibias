@@ -56,6 +56,17 @@ replay) →
 `mpsc` channel (cancellation-safe) rather than a raw `EventStream`, so none are
 lost to a redraw tick.
 
+## Boot display: the placeholder
+
+When `/me/player` has nothing to report at boot, `spawn_boot_seed` shows
+`recent_tracks[0]` so the first frame isn't an empty "Nothing playing". That
+seed is the most recently *finished* track — almost never the one the boot
+transfer resumes — so `AppState::placeholder` marks it as unconfirmed. Until
+something real replaces it the poll runs at the fast cadence, and
+`spawn_post_play_poll` won't give up on empty responses. Without both, the
+wrong title and artist sit over the right audio until the 30s paused-cadence
+poll comes round.
+
 ## Connect-device liveness
 
 librespot's Spirc loop exits *silently* when its session goes invalid (laptop

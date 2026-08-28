@@ -37,7 +37,14 @@ impl Input {
     // alternative frontend.
     #[allow(dead_code)]
     pub const fn new(key: Key) -> Self {
-        Self { key, mods: Mods { shift: false, ctrl: false, alt: false } }
+        Self {
+            key,
+            mods: Mods {
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+        }
     }
 
     #[allow(dead_code)]
@@ -96,14 +103,23 @@ mod tests {
     fn label_with_ctrl() {
         let s = label(Input::with_mods(
             Key::Char('c'),
-            Mods { ctrl: true, ..Default::default() },
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
         ));
         assert!(s.contains("CONTROL") && s.contains("'c'"), "got: {s}");
     }
 
     #[test]
     fn is_ctrl_c_detects_ctrl_c() {
-        let i = Input::with_mods(Key::Char('c'), Mods { ctrl: true, ..Default::default() });
+        let i = Input::with_mods(
+            Key::Char('c'),
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
         assert!(i.is_ctrl_c());
         assert!(!Input::new(Key::Char('c')).is_ctrl_c());
     }

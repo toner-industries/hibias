@@ -19,16 +19,19 @@
 use anyhow::Result;
 use std::env;
 
+#[path = "../api.rs"]
+mod api;
 #[path = "../auth.rs"]
 mod auth;
 #[path = "../log.rs"]
 mod log;
-#[path = "../api.rs"]
-mod api;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let db = args.get(1).map(String::as_str).unwrap_or("hibias.log.sqlite");
+    let db = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("hibias.log.sqlite");
     let out = args.get(2).map(String::as_str).unwrap_or("cassette.json");
 
     let cassette = api::Cassette::from_log(db)?;

@@ -88,7 +88,10 @@ impl ArtCache {
     /// True if this id is already decoded or mid-fetch — lets the run loop
     /// avoid respawning a fetch on every redraw tick.
     pub fn has_or_loading(&self, track_id: &str) -> bool {
-        self.current.as_ref().map(|(id, _)| id == track_id).unwrap_or(false)
+        self.current
+            .as_ref()
+            .map(|(id, _)| id == track_id)
+            .unwrap_or(false)
             || self.loading.as_deref() == Some(track_id)
     }
 

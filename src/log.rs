@@ -271,8 +271,10 @@ mod tests {
     // everything sent before it is on disk.
     #[test]
     fn flush_makes_queued_events_durable() {
-        let path =
-            std::env::temp_dir().join(format!("hibias-log-flush-test-{}.sqlite", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "hibias-log-flush-test-{}.sqlite",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         init(&path).expect("init logger");
 

@@ -60,7 +60,9 @@ async fn hibias_main() -> Result<()> {
     // Offline replay: when HIBIAS_REPLAY points at a cassette, serve recorded
     // responses instead of hitting Spotify — no auth, no librespot, no rate
     // limits. Build a cassette with `cargo run --bin hibias-cassette`.
-    let replay_path = std::env::var("HIBIAS_REPLAY").ok().filter(|s| !s.is_empty());
+    let replay_path = std::env::var("HIBIAS_REPLAY")
+        .ok()
+        .filter(|s| !s.is_empty());
     let client: Arc<dyn SpotifyApi> = if let Some(path) = replay_path.as_deref() {
         let cassette =
             api::Cassette::load(path).with_context(|| format!("load replay cassette {path}"))?;

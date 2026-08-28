@@ -66,10 +66,10 @@ pub fn render(f: &mut Frame, state: &mut AppState, art: &mut ArtCache) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1),         // tab strip
-            Constraint::Min(0),            // body
-            Constraint::Length(status_h),  // status line
-            Constraint::Length(1),         // footer
+            Constraint::Length(1),        // tab strip
+            Constraint::Min(0),           // body
+            Constraint::Length(status_h), // status line
+            Constraint::Length(1),        // footer
         ])
         .split(inner);
 
@@ -658,15 +658,15 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
         &mut lines,
         "Tracks",
         s.results.tracks.iter().map(|t| {
-        format!(
-            "  {} — {}",
-            t.name,
+            format!(
+                "  {} — {}",
+                t.name,
                 t.artists
                     .iter()
                     .map(|a| a.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-        )
+            )
         }),
         &mut row,
         s.selected,
@@ -683,11 +683,11 @@ fn render_search_results(f: &mut Frame, area: Rect, s: &SearchState) {
                 .map(|x| x.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-        if artists.is_empty() {
-            format!("  {}", a.name)
-        } else {
-            format!("  {} — {}", a.name, artists)
-        }
+            if artists.is_empty() {
+                format!("  {}", a.name)
+            } else {
+                format!("  {} — {}", a.name, artists)
+            }
         }),
         &mut row,
         s.selected,
@@ -806,8 +806,8 @@ const KEY_CHEATSHEET: &[(&str, &str)] = &[
 fn render_command_overlay(f: &mut Frame, area: Rect, cmd: &CommandState) {
     let filtered = cmd.filtered();
     let cheat_h = KEY_CHEATSHEET.len() as u16 + 1; // blank separator + rows
-    // Height: title + input + hint + a row per command + the key cheat-sheet,
-    // capped by viewport.
+                                                   // Height: title + input + hint + a row per command + the key cheat-sheet,
+                                                   // capped by viewport.
     let desired = 4 + filtered.len() as u16 + cheat_h;
     let height = desired.min(area.height.saturating_sub(2));
     let width = 64u16.min(area.width.saturating_sub(2));

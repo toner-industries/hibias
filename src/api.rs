@@ -483,7 +483,10 @@ impl SpotifyClient {
     /// `THROTTLE_WINDOW`. Called once per outbound wire request.
     fn record_request(&self) {
         let now = Instant::now();
-        let mut q = self.recent_requests.lock().expect("recent_requests poisoned");
+        let mut q = self
+            .recent_requests
+            .lock()
+            .expect("recent_requests poisoned");
         prune_window(&mut q, now);
         q.push_back(now);
     }
@@ -493,7 +496,10 @@ impl SpotifyClient {
     /// issued (e.g. while the rate-limit gate is engaged).
     fn recent_request_count(&self) -> usize {
         let now = Instant::now();
-        let mut q = self.recent_requests.lock().expect("recent_requests poisoned");
+        let mut q = self
+            .recent_requests
+            .lock()
+            .expect("recent_requests poisoned");
         prune_window(&mut q, now);
         q.len()
     }
@@ -578,7 +584,8 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: DevicesPayload = serde_json::from_str(&body).context("parse /me/player/devices")?;
+        let page: DevicesPayload =
+            serde_json::from_str(&body).context("parse /me/player/devices")?;
         Ok(page.devices)
     }
 
@@ -725,8 +732,7 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let payload: SearchPayload =
-            serde_json::from_str(&body).context("parse /search body")?;
+        let payload: SearchPayload = serde_json::from_str(&body).context("parse /search body")?;
         Ok(SearchResults {
             tracks: payload.tracks.map(Page::into_items).unwrap_or_default(),
             albums: payload.albums.map(Page::into_items).unwrap_or_default(),
@@ -768,8 +774,7 @@ impl SpotifyClient {
         if status == reqwest::StatusCode::NO_CONTENT || body.is_empty() {
             return Ok(Vec::new());
         }
-        let page: QueueResponse =
-            serde_json::from_str(&body).context("parse /me/player/queue")?;
+        let page: QueueResponse = serde_json::from_str(&body).context("parse /me/player/queue")?;
         Ok(page.queue)
     }
 
@@ -783,8 +788,7 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: AlbumTracksPage =
-            serde_json::from_str(&body).context("parse album tracks")?;
+        let page: AlbumTracksPage = serde_json::from_str(&body).context("parse album tracks")?;
         Ok(page.items)
     }
 
@@ -836,8 +840,7 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: SavedTracksPage =
-            serde_json::from_str(&body).context("parse saved tracks")?;
+        let page: SavedTracksPage = serde_json::from_str(&body).context("parse saved tracks")?;
         Ok(page.items.into_iter().filter_map(|i| i.track).collect())
     }
 
@@ -848,8 +851,7 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: Page<Playlist> =
-            serde_json::from_str(&body).context("parse saved playlists")?;
+        let page: Page<Playlist> = serde_json::from_str(&body).context("parse saved playlists")?;
         Ok(page.into_items())
     }
 
@@ -860,8 +862,7 @@ impl SpotifyClient {
             .get(&url)
             .header("Authorization", self.bearer().await?);
         let (_, body) = self.send_logged(req, "GET", &url, None).await?;
-        let page: SavedAlbumsPage =
-            serde_json::from_str(&body).context("parse saved albums")?;
+        let page: SavedAlbumsPage = serde_json::from_str(&body).context("parse saved albums")?;
         Ok(page.items.into_iter().filter_map(|i| i.album).collect())
     }
 
@@ -1108,9 +1109,7 @@ fn cassette_key(method: &str, url: &str) -> Option<String> {
         ("GET", "/me/following") => "followed_artists".to_string(),
         ("GET", "/search") => format!("search:{}", query.and_then(|q| query_param(q, "q"))?),
         ("GET", p) if p.starts_with("/albums/") && p.ends_with("/tracks") => {
-            let id = p
-                .trim_start_matches("/albums/")
-                .trim_end_matches("/tracks");
+            let id = p.trim_start_matches("/albums/").trim_end_matches("/tracks");
             format!("album_tracks:{id}")
         }
         ("GET", p) if p.starts_with("/artists/") && p.ends_with("/albums") => {
@@ -1368,7 +1367,10 @@ impl SpotifyApi for ReplaySpotify {
 
     async fn get_playback(&self) -> Result<Option<Playback>> {
         let mut pb: Option<Playback> = self.parsed("playback");
-        let over = *self.play_override.lock().expect("replay play_override poisoned");
+        let over = *self
+            .play_override
+            .lock()
+            .expect("replay play_override poisoned");
         if let (Some(p), Some(playing)) = (pb.as_mut(), over) {
             p.is_playing = playing;
         }
@@ -1376,11 +1378,17 @@ impl SpotifyApi for ReplaySpotify {
     }
 
     async fn play(&self) -> Result<()> {
-        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        *self
+            .play_override
+            .lock()
+            .expect("replay play_override poisoned") = Some(true);
         Ok(())
     }
     async fn pause(&self) -> Result<()> {
-        *self.play_override.lock().expect("replay play_override poisoned") = Some(false);
+        *self
+            .play_override
+            .lock()
+            .expect("replay play_override poisoned") = Some(false);
         Ok(())
     }
 
@@ -1404,11 +1412,17 @@ impl SpotifyApi for ReplaySpotify {
         Ok(())
     }
     async fn play_uris(&self, _uris: &[String]) -> Result<()> {
-        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        *self
+            .play_override
+            .lock()
+            .expect("replay play_override poisoned") = Some(true);
         Ok(())
     }
     async fn play_context(&self, _context_uri: &str, _offset_uri: Option<&str>) -> Result<()> {
-        *self.play_override.lock().expect("replay play_override poisoned") = Some(true);
+        *self
+            .play_override
+            .lock()
+            .expect("replay play_override poisoned") = Some(true);
         Ok(())
     }
 
@@ -1658,9 +1672,8 @@ mod tests {
 
     #[test]
     fn rate_limit_gate_holds_for_future_deadlines() {
-        let gate: Mutex<Option<Instant>> = Mutex::new(Some(
-            Instant::now() + std::time::Duration::from_secs(30),
-        ));
+        let gate: Mutex<Option<Instant>> =
+            Mutex::new(Some(Instant::now() + std::time::Duration::from_secs(30)));
         assert!(read_gate(&gate).is_some());
     }
 
@@ -1677,9 +1690,8 @@ mod tests {
 
     #[test]
     fn rate_limit_gate_clear_wipes_state() {
-        let gate: Mutex<Option<Instant>> = Mutex::new(Some(
-            Instant::now() + std::time::Duration::from_secs(3600),
-        ));
+        let gate: Mutex<Option<Instant>> =
+            Mutex::new(Some(Instant::now() + std::time::Duration::from_secs(3600)));
         *gate.lock().unwrap() = None; // mirrors clear_rate_limit
         assert!(read_gate(&gate).is_none());
     }
@@ -1728,10 +1740,8 @@ mod tests {
     /// runner.
     #[test]
     fn rate_limit_persistence_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "hibias-ratelimit-test-{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hibias-ratelimit-test-{}.json", std::process::id()));
         // SAFETY: env writes are unsafe in 2024 edition. Only this test
         // touches HIBIAS_RATELIMIT_FILE, so the access is effectively serial.
         unsafe {
@@ -1789,19 +1799,29 @@ mod tests {
     fn cassette_key_maps_read_endpoints() {
         let k = |m, u: &str| cassette_key(m, u);
         let b = "https://api.spotify.com/v1";
-        assert_eq!(k("GET", &format!("{b}/me/player")).as_deref(), Some("playback"));
+        assert_eq!(
+            k("GET", &format!("{b}/me/player")).as_deref(),
+            Some("playback")
+        );
         assert_eq!(
             k("GET", &format!("{b}/me/player/devices")).as_deref(),
             Some("devices")
         );
-        assert_eq!(k("GET", &format!("{b}/me/player/queue")).as_deref(), Some("queue"));
+        assert_eq!(
+            k("GET", &format!("{b}/me/player/queue")).as_deref(),
+            Some("queue")
+        );
         assert_eq!(
             k("GET", &format!("{b}/me/tracks?limit=50")).as_deref(),
             Some("saved_tracks")
         );
         // search q is percent-decoded so it matches what `search(q)` builds.
         assert_eq!(
-            k("GET", &format!("{b}/search?q=the%20beatles&type=track&limit=8")).as_deref(),
+            k(
+                "GET",
+                &format!("{b}/search?q=the%20beatles&type=track&limit=8")
+            )
+            .as_deref(),
             Some("search:the beatles")
         );
         assert_eq!(
@@ -1822,7 +1842,11 @@ mod tests {
         );
         // Live fetch now uses `/items`; it maps to the same cassette key.
         assert_eq!(
-            k("GET", &format!("{b}/playlists/p9/items?limit=100&additional_types=track")).as_deref(),
+            k(
+                "GET",
+                &format!("{b}/playlists/p9/items?limit=100&additional_types=track")
+            )
+            .as_deref(),
             Some("playlist_tracks:p9")
         );
         // Mutations and unknown endpoints are not replayed.
@@ -1884,7 +1908,12 @@ mod tests {
         assert!(replay.get_playback().await.unwrap().is_none());
         assert!(replay.get_devices().await.unwrap().is_empty());
         assert!(replay.get_queue().await.unwrap().is_empty());
-        assert!(replay.search("nothing recorded").await.unwrap().tracks.is_empty());
+        assert!(replay
+            .search("nothing recorded")
+            .await
+            .unwrap()
+            .tracks
+            .is_empty());
         assert!(replay.get_album_tracks("missing").await.unwrap().is_empty());
         // Never rate-limited — that's the whole point of offline replay.
         assert!(replay.rate_limited_until().is_none());
@@ -1911,7 +1940,12 @@ mod tests {
                     latency_ms INTEGER, body TEXT, detail TEXT);",
             )
             .unwrap();
-            let mut ins = |kind: &str, rid: i64, method: Option<&str>, url: Option<&str>, status: Option<i64>, body: Option<&str>| {
+            let mut ins = |kind: &str,
+                           rid: i64,
+                           method: Option<&str>,
+                           url: Option<&str>,
+                           status: Option<i64>,
+                           body: Option<&str>| {
                 conn.execute(
                     "INSERT INTO events (ts, ts_unix_ms, kind, request_id, method, url, status, latency_ms, body, detail)
                      VALUES ('t', 0, ?1, ?2, ?3, ?4, ?5, 0, ?6, NULL)",
@@ -1921,18 +1955,67 @@ mod tests {
             };
             let old_pb = PLAYBACK_JSON.replace("My Song", "Old Song");
             // run 1
-            ins("api_req", 1, Some("GET"), Some(&format!("{b}/me/player")), None, None);
+            ins(
+                "api_req",
+                1,
+                Some("GET"),
+                Some(&format!("{b}/me/player")),
+                None,
+                None,
+            );
             ins("api_resp", 1, None, None, Some(200), Some(&old_pb));
-            ins("api_req", 2, Some("GET"), Some(&format!("{b}/search?q=beatles&type=track&limit=8")), None, None);
+            ins(
+                "api_req",
+                2,
+                Some("GET"),
+                Some(&format!("{b}/search?q=beatles&type=track&limit=8")),
+                None,
+                None,
+            );
             ins("api_resp", 2, None, None, Some(200), Some(SEARCH_JSON));
-            ins("api_req", 3, Some("PUT"), Some(&format!("{b}/me/player/play")), None, None); // mutation
+            ins(
+                "api_req",
+                3,
+                Some("PUT"),
+                Some(&format!("{b}/me/player/play")),
+                None,
+                None,
+            ); // mutation
             ins("api_resp", 3, None, None, Some(204), Some(""));
-            ins("api_req", 4, Some("GET"), Some(&format!("{b}/me/player/devices")), None, None);
-            ins("api_resp", 4, None, None, Some(200), Some("{\"devices\":[]} …[truncated]")); // dropped
-            // run 2 (request_id resets to 1) — newer playback must win.
-            ins("api_req", 1, Some("GET"), Some(&format!("{b}/me/player")), None, None);
+            ins(
+                "api_req",
+                4,
+                Some("GET"),
+                Some(&format!("{b}/me/player/devices")),
+                None,
+                None,
+            );
+            ins(
+                "api_resp",
+                4,
+                None,
+                None,
+                Some(200),
+                Some("{\"devices\":[]} …[truncated]"),
+            ); // dropped
+               // run 2 (request_id resets to 1) — newer playback must win.
+            ins(
+                "api_req",
+                1,
+                Some("GET"),
+                Some(&format!("{b}/me/player")),
+                None,
+                None,
+            );
             ins("api_resp", 1, None, None, Some(200), Some(PLAYBACK_JSON));
-            ins("api_req", 2, Some("GET"), Some(&format!("{b}/me/player/devices")), None, None);
+            ins(
+                "api_req",
+                2,
+                Some("GET"),
+                Some(&format!("{b}/me/player/devices")),
+                None,
+                None,
+            );
             ins("api_resp", 2, None, None, Some(500), Some("server error")); // non-2xx dropped
         }
 
@@ -1959,7 +2042,12 @@ mod tests {
         {
             let rec = CassetteRecorder::new(&path);
             // A successful read is captured under its logical key...
-            rec.record("GET", &format!("{b}/search?q=beatles&type=track"), 200, SEARCH_JSON);
+            rec.record(
+                "GET",
+                &format!("{b}/search?q=beatles&type=track"),
+                200,
+                SEARCH_JSON,
+            );
             // ...mutations, non-2xx, and empty bodies are skipped.
             rec.record("PUT", &format!("{b}/me/player/play"), 200, "{}");
             rec.record("GET", &format!("{b}/me/player"), 500, "err");

@@ -371,7 +371,7 @@ fn render_callback_page(outcome: CallbackOutcome<'_>) -> String {
         .collect::<String>();
 
     format!(
-r#"<!doctype html>
+        r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">

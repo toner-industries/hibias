@@ -1467,7 +1467,11 @@ async fn up_next_arrows_navigate_the_queue_then_rise_to_tabs() {
         assert_eq!(s.focus, Focus::Content, "still in content at the top row");
     }
     h.press_and_run(Key::Up).await;
-    assert_eq!(h.state.lock().await.focus, Focus::Tabs, "Up past row 0 -> strip");
+    assert_eq!(
+        h.state.lock().await.focus,
+        Focus::Tabs,
+        "Up past row 0 -> strip"
+    );
 }
 
 #[tokio::test]
@@ -1492,7 +1496,10 @@ async fn up_next_shows_more_than_the_old_five_cap() {
     }
     let screen = h.snapshot_sized(96, 40).await;
     // The body's Up Next region fits well over five rows on the fixed canvas.
-    assert!(screen.contains("Next 0") && screen.contains("Next 9"), "fills the height, got:\n{screen}");
+    assert!(
+        screen.contains("Next 0") && screen.contains("Next 9"),
+        "fills the height, got:\n{screen}"
+    );
 }
 
 #[tokio::test]
@@ -1509,7 +1516,8 @@ async fn esc_on_now_playing_is_a_no_op_not_quit() {
 #[tokio::test]
 async fn colon_l_runs_library_from_the_palette() {
     let h = Harness::new();
-    h.fake.set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
+    h.fake
+        .set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
     h.press_and_run(Key::Char(':')).await;
     h.press_and_run(Key::Char('l')).await; // accelerator 'l' -> library on top
     let action = h.press(Key::Enter).await;
@@ -1632,7 +1640,8 @@ async fn esc_on_tab_strip_returns_to_content() {
 #[tokio::test]
 async fn library_loads_active_subtab_once() {
     let h = Harness::new();
-    h.fake.set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
+    h.fake
+        .set_saved_tracks(Ok(vec![track("spotify:track:a", "A")]));
 
     // Enter Library — Liked is the default sub-tab and should fetch once.
     h.open_library().await;

@@ -16,14 +16,12 @@ use async_trait::async_trait;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
-use crate::api::{
-    Album, Artist, Device, Playback, Playlist, SearchResults, SpotifyApi, Track,
-};
+use crate::api::{Album, Artist, Device, Playback, Playlist, SearchResults, SpotifyApi, Track};
 use crate::app::{
     apply_playback_force, dispatch_input, enter_browse, enter_library, enter_search, kick_search,
     like_current_track, open_devices, play_browse_collection, play_browse_selection,

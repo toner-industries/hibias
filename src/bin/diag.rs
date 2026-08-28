@@ -135,7 +135,9 @@ async fn fetch_playlist(client: &SpotifyClient, arg: &str) -> Result<()> {
                 println!("  - {} — {artists}", t.name);
             }
         }
-        Err(e) => println!("FAILED: {e:#}\n(me_id={me:?} — owned check needs owner.id from /me/playlists)"),
+        Err(e) => println!(
+            "FAILED: {e:#}\n(me_id={me:?} — owned check needs owner.id from /me/playlists)"
+        ),
     }
     Ok(())
 }
@@ -194,7 +196,10 @@ async fn play_and_poll(client: &SpotifyClient, track_uri: &str) -> Result<()> {
         eprintln!("\nhibias device has no id (?)");
         std::process::exit(1);
     };
-    println!("\nfound hibias device: id={device_id} active={}", d.is_active);
+    println!(
+        "\nfound hibias device: id={device_id} active={}",
+        d.is_active
+    );
 
     // Set the client's target device so play_uris appends ?device_id=.
     client.set_device_id(device_id.clone());
